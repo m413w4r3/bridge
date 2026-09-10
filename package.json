@@ -1,0 +1,11 @@
+{
+  "name": "chatgpt-bridge",
+  "private": true,
+  "description": "Test-only dependencies of the ChatGPT Bridge extension tests.",
+  "scripts": {
+    "test": "node --test tests/completion.test.js tests/content-dom.test.js tests/final-output.test.js tests/background-conversation.test.js tests/content-background-tab.test.js tests/serializer.test.js"
+  },
+  "devDependencies": {
+    "jsdom": "26.1.0"
+  }
+}

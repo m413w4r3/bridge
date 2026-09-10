@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python tests
+        run: |
+          uv run \
+            --python 3.12 \
+            --with-requirements requirements-test.txt \
+            python -m pytest tests/ -q --tb=short
+      - name: Python syntax
+        run: python -m compileall bridge server.py chat.py examples tools
+
+  javascript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install test dependencies
+        run: npm ci --no-audit --no-fund
+      - name: JavaScript tests
+        run: |
+          node --test \
+            tests/completion.test.js \
+            tests/content-dom.test.js \
+            tests/final-output.test.js \
+            tests/background-conversation.test.js \
+            tests/content-background-tab.test.js \
+            tests/serializer.test.js
+      - name: JavaScript syntax
+        run: |
+          node --check extension/background.js
+          node --check extension/content.js
+          node --check extension/completion.js
+          node --check extension/final-output.js
+          node --check extension/popup.js
+          node --check extension/serializer.js
+
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose file
+        run: docker compose config --quiet
+      - name: Build Bridge image
+        run: docker compose build chatgpt-bridge
+      # `--build` est obligatoire : sans lui, `run` réutilise une image existante
+      # et le soak validerait du code qui n'est pas celui du commit.
+      - name: Run Compose soak
+        run: |
+          docker compose \
+            -p chatgpt-bridge-ci \
+            --profile bridge-test \
+            run --rm --build bridge-soak
+      - name: Cleanup Compose
+        if: always()
+        run: |
+          docker compose \
+            -p chatgpt-bridge-ci \
+            --profile bridge-test \
+            down -v
+      - name: Compose lifecycle
+        run: ./scripts/test_bridge_compose_lifecycle.sh

@@ -1,0 +1,133 @@
+name: chatgpt-bridge
+
+services:
+  chatgpt-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    environment:
+      BRIDGE_HOST: 0.0.0.0
+      BRIDGE_PORT: 8001
+      # Écoute 0.0.0.0 dans le conteneur : le serveur refuse alors les
+      # endpoints HTTP tant que BRIDGE_API_KEY est vide.
+      BRIDGE_API_KEY: ${BRIDGE_API_KEY:-}
+      BRIDGE_WS_TOKEN: ${BRIDGE_WS_TOKEN:-}
+      BRIDGE_RUN_DB: /data/bridge-runs.sqlite3
+
+      # Une recherche approfondie ChatGPT dépasse couramment le quart d'heure :
+      # TOTAL borne une génération pourtant vivante, IDLE borne le silence de
+      # l'extension. Les deux ne se remplacent pas.
+      BRIDGE_TOTAL_TIMEOUT: ${BRIDGE_TOTAL_TIMEOUT:-3600}
+      BRIDGE_IDLE_TIMEOUT: ${BRIDGE_IDLE_TIMEOUT:-300}
+      BRIDGE_UI_TIMEOUT: ${BRIDGE_UI_TIMEOUT:-30}
+      BRIDGE_UI_PROBE_TTL: ${BRIDGE_UI_PROBE_TTL:-60}
+      BRIDGE_SHUTDOWN_GRACE_SECONDS: ${BRIDGE_SHUTDOWN_GRACE_SECONDS:-20}
+
+    ports:
+      # Loopback par défaut. Un client conteneurisé d'une autre stack ne peut
+      # pas joindre 127.0.0.1 sous Linux : voir « Topologie » dans
+      # docs/chatgpt_bridge_operations.md avant de changer cette adresse.
+      - "${BRIDGE_BIND_ADDRESS:-127.0.0.1}:${BRIDGE_PORT:-8001}:8001"
+
+    volumes:
+      - bridge_data:/data
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=2)",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 3s
+
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  # Bridge jetable aux échéances accélérées : seul moyen d'observer en quelques
+  # secondes des timeouts qui valent une demi-heure en production.
+  chatgpt-bridge-soak:
+    profiles: ["bridge-test"]
+
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    environment:
+      BRIDGE_HOST: 0.0.0.0
+      BRIDGE_PORT: 8001
+      # Identifiants de test, valables uniquement dans le réseau Compose.
+      BRIDGE_API_KEY: bridge-soak-key
+      BRIDGE_WS_TOKEN: bridge-soak-token
+      BRIDGE_RUN_DB: /tmp/bridge-soak.sqlite3
+      BRIDGE_TOTAL_TIMEOUT: "3"
+      BRIDGE_IDLE_TIMEOUT: "0.5"
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=2)",
+        ]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 2s
+
+    restart: "no"
+
+  bridge-soak:
+    profiles: ["bridge-test"]
+
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    command:
+      - python
+      - examples/timeout_soak.py
+
+    environment:
+      BRIDGE_HTTP: http://chatgpt-bridge-soak:8001/v1
+      BRIDGE_WS: ws://chatgpt-bridge-soak:8001/ws
+      BRIDGE_API_KEY: bridge-soak-key
+      BRIDGE_WS_TOKEN: bridge-soak-token
+
+    depends_on:
+      chatgpt-bridge-soak:
+        condition: service_healthy
+
+    restart: "no"
+
+  bridge-smoke:
+    profiles: ["bridge-test"]
+
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    command:
+      - python
+      - examples/compose_smoke.py
+
+    environment:
+      BRIDGE_HTTP: http://chatgpt-bridge:8001/v1
+      BRIDGE_WS: ws://chatgpt-bridge:8001/ws
+      BRIDGE_API_KEY: ${BRIDGE_API_KEY:-}
+      BRIDGE_WS_TOKEN: ${BRIDGE_WS_TOKEN:-}
+
+    depends_on:
+      chatgpt-bridge:
+        condition: service_healthy
+
+    restart: "no"
+
+volumes:
+  bridge_data:

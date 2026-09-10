@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body {
+        font: 13px/1.5 system-ui, sans-serif;
+        width: 260px;
+        margin: 0;
+        padding: 14px;
+        background: #1c1c1e;
+        color: #f2f2f7;
+      }
+      h1 { font-size: 13px; margin: 0 0 10px; font-weight: 600; }
+      .row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+      .dot { width: 9px; height: 9px; border-radius: 50%; background: #ff453a; flex: none; }
+      .dot.on { background: #32d74b; }
+      input {
+        width: 100%; box-sizing: border-box; padding: 6px 8px; border-radius: 6px;
+        border: 1px solid #3a3a3c; background: #2c2c2e; color: inherit; font: inherit;
+      }
+      button {
+        margin-top: 8px; width: 100%; padding: 7px; border: 0; border-radius: 6px;
+        background: #0a84ff; color: #fff; font: inherit; font-weight: 500; cursor: pointer;
+      }
+      .muted { color: #8e8e93; font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <h1>ChatGPT Mini-Bridge</h1>
+    <div class="row"><span class="dot" id="dot"></span><span id="state">…</span></div>
+    <div class="muted" id="detail"></div>
+    <div class="muted" id="ui"></div>
+    <label class="muted" for="url">Serveur WebSocket</label>
+    <input id="url" spellcheck="false" />
+    <label class="muted" for="token">Jeton d’appairage</label>
+    <input id="token" type="password" autocomplete="off" spellcheck="false" />
+    <button id="save">Enregistrer &amp; reconnecter</button>
+    <script src="popup.js"></script>
+  </body>
+</html>
