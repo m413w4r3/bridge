@@ -25,6 +25,7 @@ from bridge.config import (
     WS_TOKEN,
 )
 from bridge.registry import RunRegistry
+from bridge.run_service import DurableRunService
 from bridge.routes_bridge import BridgeRoutes
 from bridge.routes_conversations import ConversationRoutes
 from bridge.routes_openai import OpenAIRoutes
@@ -52,6 +53,7 @@ class BridgeApplication:
     ) -> None:
         self.bridge = bridge or Bridge()
         self.registry = registry or RunRegistry(RUN_DB_PATH)
+        self.run_service = DurableRunService(bridge=self.bridge, registry=self.registry)
 
         self.accepting_runs = True
 
@@ -68,6 +70,7 @@ class BridgeApplication:
         self.openai_routes = OpenAIRoutes(
             bridge=self.bridge,
             registry=self.registry,
+            run_service=self.run_service,
             auth_dependency=self.require_key,
             ensure_accepting_runs=self._ensure_accepting_runs,
         )
@@ -76,7 +79,7 @@ class BridgeApplication:
         self.bridge_routes = BridgeRoutes(
             bridge=self.bridge,
             registry=self.registry,
-            openai_routes=self.openai_routes,
+            run_service=self.run_service,
             auth_dependency=self.require_key,
             ensure_accepting_runs=self._ensure_accepting_runs,
         )
@@ -122,10 +125,7 @@ class BridgeApplication:
     async def shutdown_bridge(self, grace_seconds: float = SHUTDOWN_GRACE_SECONDS) -> None:
         """Draine les runs natifs, puis annule prudemment ce qui reste."""
         self.accepting_runs = False
-        tracked = (
-            set(self.bridge_routes.idempotent_tasks.values())
-            | set(self.openai_routes.background_tasks.values())
-        )
+        tracked = self.run_service.active_tasks
         logger.info(
             "bridge_shutdown_started grace_seconds=%s active_runs=%s extension=%s",
             grace_seconds,

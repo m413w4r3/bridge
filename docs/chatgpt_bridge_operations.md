@@ -232,6 +232,13 @@ dans les logs.
 
 ## Sémantique d’idempotence
 
+Les trois façades utilisent le même claim SQLite et les mêmes états
+`queued` → `running` → `completed|failed|needs_review`. `/v1/responses` et
+`/v1/chat/completions` acceptent `X-Idempotency-Key`; une clé réutilisée avec un
+payload différent est rejetée en `409 bridge_payload_conflict`. Sans clé, ces
+façades créent une clé `non_retryable_<uuid>` : le run reste durable, mais ne
+doit pas être implicitement rejoué.
+
 `POST /v1/bridge/runs` accepte `X-Idempotency-Key` et `request_id`. Lorsqu’ils
 sont tous deux présents, ils doivent être identiques. L’application emploie
 l’UUID du `ModelRun`, créé une seule fois avant l’appel réseau.
@@ -444,8 +451,12 @@ et vérifier health/capabilities. Les anciennes connexions WebSocket sont ainsi
 fermées. Ne mettez jamais les valeurs dans Git ou une commande conservée dans
 l’historique partagé.
 
-La génération reste synchrone côté HTTP dans cet incrément. Elle est détachée de
-la connexion cliente et son résultat est durable, mais une exécution en cours ne
-peut pas reprendre après l’arrêt du processus sans risquer un second clic. Le
-bridge choisit alors l’échec sûr. Le cache OpenAI-compatible `/v1/responses`
-historique reste mémoire seulement; l’application utilise `/v1/bridge/runs`.
+Les façades `/v1/responses`, `/v1/chat/completions` et `/v1/bridge/runs` partagent
+le même moteur de run détaché et le même registre SQLite. Une réponse Responses
+en background reste donc récupérable via `GET /v1/responses/{id}` après une
+reconstruction de l'application. Une exécution `queued`/`running` interrompue
+par un redémarrage devient `failed` lors de `recover_interrupted()` : elle n'est
+jamais rejouée implicitement, car le bridge ne peut pas prouver si le clic UI a
+déjà été envoyé. `model` reste une étiquette client ; la sélection réelle de
+l'UI est réservée aux contrôles Bridge explicites (`bridge_ui_model` ou
+`ui_model`).

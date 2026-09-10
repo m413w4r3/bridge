@@ -137,6 +137,31 @@ client.chat.completions.create(
 | `GET /health` | extension connectée ? qui la détient ? requête en cours ? |
 | `GET /ready` | configuration, SQLite et disponibilité fonctionnelle de l’extension |
 
+### Un moteur durable pour les trois façades
+
+Les trois endpoints de génération convergent vers le même moteur de run détaché :
+
+```text
+/v1/responses       ─┐
+/v1/chat/completions ├──> DurableRunService ──> SQLite
+/v1/bridge/runs     ─┘
+```
+
+La compatibilité OpenAI est émulée et limitée aux formats documentés ici. Le champ
+`model` envoyé par un client reste une étiquette de traçabilité : il ne sélectionne
+jamais le modèle de l'interface ChatGPT. Le contrôle UI explicite passe par
+`bridge_ui_model` sur `/responses` ou `ui_model` sur `/bridge/runs`.
+
+Les réponses Responses en background restent récupérables après redémarrage grâce à
+SQLite. Une exécution interrompue (`queued` ou `running`) devient `failed` au
+démarrage suivant et n'est jamais rejouée implicitement. `/v1/bridge/*` reste la
+surface native de contrôle, diagnostic et recovery.
+
+`X-Idempotency-Key` est accepté par `/v1/responses` et `/v1/chat/completions` :
+une même clé et un même payload rejoignent le run existant, tandis qu'un payload
+différent donne `409 bridge_payload_conflict`. Sans clé, le run reçoit une clé
+non-retryable mais reste récupérable par son identifiant Responses.
+
 ### Fichiers : format OpenAI standard
 
 Les blocs de contenu de l'API officielle sont compris tels quels et transformés en pièces
@@ -317,9 +342,9 @@ ajoute le nouveau sélecteur en première position, rien d'autre à toucher.
   sont estimés et les objets sources structurés de `web_search` ne peuvent pas être
   reconstruits. Le modèle rapporté est le **libellé affiché** par le sélecteur, pas le snapshot
   exact servi par OpenAI ; quand il n'est pas lisible, le bridge dit `chatgpt-web`.
-- La façade historique `/v1/responses` conserve ses réponses de fond en mémoire. Les runs natifs
-  `/v1/bridge/runs` terminés sont durables dans SQLite ; un run interrompu par un redémarrage
-  échoue sans resoumission implicite.
+- Les trois façades de génération partagent le même moteur durable SQLite ; les réponses
+  Responses en background survivent à la reconstruction du serveur. Un run interrompu par
+  un redémarrage échoue sans resoumission implicite.
 - Structured Outputs est demandé dans le prompt, puis doit impérativement être revalidé par le
   client contre son schéma.
 - Le contrat `/v1/bridge/*` est celui à privilégier dans l'application : il expose explicitement

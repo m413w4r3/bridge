@@ -29,8 +29,9 @@ from bridge.generation import (
     generation_progress,
 )
 from bridge.registry import RunRegistry
-from bridge.routes_openai import (
-    OpenAIRoutes,
+from bridge.run_service import (
+    DurableRunService,
+    DurableRunSpec,
     _browser_target_for_run,
     _release_browser_target,
 )
@@ -88,7 +89,9 @@ def _stored_error_body(record: dict[str, Any]) -> dict[str, Any] | None:
         return None
     if not isinstance(stored, dict):
         return None
-    body = stored.get("body")
+    # New durable results wrap the facade projection under `response`; accept
+    # the previous `body` wrapper as well for rows created before the refactor.
+    body = stored.get("body") or stored.get("response")
     return body if isinstance(body, dict) else stored
 
 
@@ -185,9 +188,8 @@ def _bounded_recovery_metadata(packet: dict[str, Any]) -> dict[str, Any]:
 class BridgeRoutes:
     """Propriétaire des huit endpoints natifs du bridge (runs, recovery, UI).
 
-    Dépend de `OpenAIRoutes` (pour déléguer la génération synchrone à
-    `create_response_internal`), jamais l'inverse. `bridge` et `registry` sont
-    des instances injectées par BridgeApplication.
+    La génération est déléguée au service durable commun aux façades. `bridge`
+    et `registry` sont des instances injectées par BridgeApplication.
     """
 
     def __init__(
@@ -195,23 +197,13 @@ class BridgeRoutes:
         *,
         bridge: Bridge,
         registry: RunRegistry,
-        openai_routes: OpenAIRoutes,
+        run_service: DurableRunService,
         auth_dependency: Callable[..., Any],
         ensure_accepting_runs: Callable[[], None],
     ) -> None:
         self.bridge = bridge
-        self.registry = registry
-        self.openai_routes = openai_routes
+        self.run_service = run_service
         self.ensure_accepting_runs = ensure_accepting_runs
-        self.idempotent_tasks: Dict[str, asyncio.Task] = {}
-        self.bridge_metrics: Dict[str, int] = {
-            "runs_started": 0,
-            "runs_completed": 0,
-            "runs_failed": 0,
-            "deduplication_hits": 0,
-            "payload_conflicts": 0,
-            "ui_timeouts": 0,
-        }
         self.router = APIRouter(dependencies=[Depends(auth_dependency)])
 
         self.router.add_api_route(
@@ -255,6 +247,23 @@ class BridgeRoutes:
             methods=["GET"],
         )
 
+    @property
+    def registry(self) -> RunRegistry:
+        return self.run_service.registry
+
+    @registry.setter
+    def registry(self, value: RunRegistry) -> None:
+        self.run_service.registry = value
+
+    @property
+    def idempotent_tasks(self):
+        """Compatibility view; task ownership remains exclusively in service."""
+        return self.run_service.task_map
+
+    @property
+    def bridge_metrics(self):
+        return self.run_service.metrics
+
     def _bridge_controls(self, req: BridgeRunRequest) -> RunControls:
         modele = (req.ui_model or "").strip()
         return RunControls(
@@ -276,79 +285,10 @@ class BridgeRoutes:
             background=req.background,
             conversation=req.conversation,
             bridge_recovery=req.recovery,
+            bridge_ui_model=req.ui_model,
+            bridge_profile=req.profile,
+            allow_unverified_model=req.allow_unverified_model,
         )
-
-    def _store_incomplete_preview(
-        self, req: BridgeRunRequest, run_id: str, exc: NeedsReviewError
-    ) -> bool:
-        """Rendre durable la réponse visible jointe à un `incomplete`.
-
-        Le candidat n'est jamais adopté ici : il devient seulement récupérable.
-        Sa provenance (`captured_incomplete`) le distingue explicitement d'une
-        relecture DOM ultérieure (`live_dom_capture`).
-
-        Renvoie `True` uniquement si l'aperçu est réellement écrit dans le
-        registre. Un échec de persistance ne casse pas le `needs_review` — il
-        ne doit simplement jamais être annoncé comme une récupération durable.
-        """
-        candidate = exc.candidate
-        if not candidate:
-            return False
-        conversation = req.conversation.model_dump(mode="json") if req.conversation else None
-        target = _browser_target_for_run(run_id, req.conversation)
-        preview = {
-            "bridge_run_id": run_id,
-            "target_id": target.id if target else None,
-            "conversation_id": conversation.get("id") if conversation else None,
-            # Identité externe vérifiée uniquement : un placeholder d'interface
-            # a déjà été rejeté en amont, et rien ne le remplace.
-            "turn_id": candidate["turn_id"],
-            "text": candidate["text"],
-            "provenance": CAPTURED_INCOMPLETE,
-            "metadata": {
-                "provenance": CAPTURED_INCOMPLETE,
-                "reason": exc.reason,
-                "output_chars": candidate["output_chars"],
-                "sha256": candidate["sha256"],
-                "visible_citations": candidate["visible_citations"],
-                "capture_confidence": CAPTURED_INCOMPLETE,
-                "external_turn_id_verified": candidate["turn_id"] is not None,
-                **{
-                    key: exc.details[key]
-                    for key in (
-                        "completion_signal",
-                        "completion_confidence",
-                        "stable_for_ms",
-                        "serializer_version",
-                        "content_script_version",
-                        "streaming_signal_sources",
-                        "submission_state",
-                    )
-                    if exc.details.get(key) is not None
-                },
-            },
-        }
-        try:
-            self.registry.store_preview(run_id, preview)
-        except Exception:  # noqa: BLE001 - l'état needs_review reste prioritaire
-            logger.exception("bridge_incomplete_preview_not_persisted bridge_run_id=%s", run_id)
-            return False
-        logger.info(
-            "bridge_incomplete_preview_persisted bridge_run_id=%s reason=%s output_chars=%s "
-            "external_turn_id_verified=%s",
-            run_id,
-            exc.reason,
-            candidate["output_chars"],
-            candidate["turn_id"] is not None,
-        )
-        return True
-
-    def _consume_task_exception(self, task: asyncio.Task) -> None:
-        """Observe detached failures; the typed result already lives in SQLite."""
-        try:
-            task.exception()
-        except asyncio.CancelledError:
-            pass
 
     async def create_bridge_run(self, req: BridgeRunRequest, http_req: Request):
         self.ensure_accepting_runs()
@@ -363,217 +303,57 @@ class BridgeRoutes:
                 },
             )
         key = header_key or req.request_id or f"non_retryable_{uuid.uuid4().hex}"
-        canonical = req.model_dump(mode="json", exclude={"request_id"})
-        request_hash = hashlib.sha256(
-            json.dumps(
-                canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-            ).encode()
-        ).hexdigest()
-        record, created = self.registry.claim(key, request_hash)
-        fingerprint = hashlib.sha256(key.encode()).hexdigest()[:12]
-        correlation_id = http_req.headers.get("X-Correlation-ID", "-")[:128]
-        run_id = str(record["bridge_run_id"])
-        if record["request_hash"] != request_hash:
-            self.bridge_metrics["payload_conflicts"] += 1
-            logger.warning(
-                "bridge_payload_conflict bridge_run_id=%s idempotency_fingerprint=%s",
-                run_id,
-                fingerprint,
-            )
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "bridge_payload_conflict",
-                    "message": "Cette clé d'idempotence désigne un autre payload.",
-                    "retryable": False,
-                },
-            )
-
-        if not created:
-            self.bridge_metrics["deduplication_hits"] += 1
-            logger.info(
-                "bridge_run_deduplicated bridge_run_id=%s idempotency_fingerprint=%s "
-                "state=%s deduplication_hit=true",
-                run_id,
-                fingerprint,
-                record["state"],
-            )
-            if record["state"] == "completed" and record["response_json"]:
-                return json.loads(record["response_json"])
-            if record["state"] == "needs_review" and record["error_json"]:
-                return json.loads(record["error_json"])
-            if record["state"] == "failed" and record["error_json"]:
-                stored = json.loads(record["error_json"])
-                return JSONResponse(status_code=stored["status_code"], content=stored["body"])
-
-        async def execute_once() -> dict:
-            started = time.monotonic()
-            self.bridge_metrics["runs_started"] += 1
-            self.registry.set_state(key, "running")
-            logger.info(
-                "bridge_run_started bridge_run_id=%s correlation_id=%s idempotency_fingerprint=%s phase=waiting_extension",
-                run_id,
-                correlation_id,
-                fingerprint,
-            )
-            try:
-                response = await self.openai_routes.create_response_internal(
-                    # Le mode background du contrat natif est géré par ce registre
-                    # SQLite. La façade Responses interne doit donc exécuter une
-                    # seule génération synchrone dans cette tâche détachée.
-                    self._bridge_response_request(req).model_copy(update={"background": False}),
-                    _BackgroundRequest(),
-                    self._bridge_controls(req),
-                    allow_unverified_model=req.allow_unverified_model,
-                    response_id=run_id,
+        response_request = self._bridge_response_request(req).model_copy(
+            update={"background": False}
+        )
+        spec = DurableRunSpec(
+            response_request=response_request,
+            chat_request=self.run_service._engine("_response_chat_request")(
+                response_request
+            ),
+            controls=self._bridge_controls(req),
+            allow_unverified_model=req.allow_unverified_model,
+            # Preserve the historical native canonicalization exactly.
+            hash_payload=req.model_dump(mode="json", exclude={"request_id"}),
+        )
+        snapshot = await self.run_service.submit(
+            spec,
+            idempotency_key=key,
+            background=req.background,
+            correlation_id=http_req.headers.get("X-Correlation-ID", "-")[:128],
+        )
+        if req.background and snapshot.state in {"queued", "running"}:
+            return {"id": snapshot.response_id, "object": "response", "status": snapshot.state}
+        body = snapshot.response_body()
+        if body is not None:
+            if snapshot.state == "failed":
+                detail = snapshot.error_detail() or {}
+                interrupted = (
+                    detail.get("code") == "bridge_server_error"
+                    and detail.get("phase") == "shutdown"
                 )
-                self.registry.set_state(key, "completed", response)
-                self.bridge_metrics["runs_completed"] += 1
-                logger.info(
-                    "bridge_run_completed bridge_run_id=%s correlation_id=%s idempotency_fingerprint=%s "
-                    "duration_ms=%s phase=completed",
-                    run_id,
-                    correlation_id,
-                    fingerprint,
-                    int((time.monotonic() - started) * 1000),
-                )
-                return response
-            except NeedsReviewError as exc:
-                # Ordre imposé : le candidat visible est rendu durable AVANT que
-                # le run passe en needs_review. L'onglet ChatGPT peut être fermé
-                # dans la seconde qui suit la réponse HTTP ; l'aperçu de
-                # récupération doit alors survivre sans aucun accès au DOM.
-                stored = self._store_incomplete_preview(req, run_id, exc)
-                # `recovery_preview_available` décrit la persistance, pas
-                # l'observation : il ne passe à True qu'après une écriture
-                # réussie dans le registre. `candidate_output_present` reste,
-                # lui, le fait brut « un texte était visible ».
-                exc.details["recovery_preview_available"] = stored
-                body = {
-                    "id": run_id,
-                    "object": "response",
-                    "status": "needs_review",
-                    "error": {
-                        "code": exc.reason,
-                        "message": "ChatGPT s'est arrêté sans réponse finale.",
-                        "retryable": False,
-                        "phase": "generation",
-                        "submission_state": "post_submission",
-                        "details": exc.details,
-                    },
-                    "metadata": {
-                        **exc.details,
-                        "reason": exc.reason,
-                        "submission_state": "post_submission",
-                    },
-                }
-                self.registry.set_state(key, "needs_review", body)
-                logger.warning(
-                    "bridge_run_needs_review bridge_run_id=%s correlation_id=%s reason=%s",
-                    run_id,
-                    correlation_id,
-                    exc.reason,
-                )
-                return body
-            except asyncio.CancelledError:
-                stored = {
-                    "status_code": 503,
-                    "body": {
-                        "id": run_id,
-                        "object": "response",
-                        "status": "failed",
-                        "error": {
-                            "code": "bridge_server_error",
-                            "message": "Le bridge a interrompu cette exécution pendant son arrêt.",
-                            "retryable": False,
-                            "phase": "shutdown",
-                            "submission_state": "submission_attempted",
-                        }
-                    },
-                }
-                self.registry.set_state(key, "failed", stored)
-                self.bridge_metrics["runs_failed"] += 1
-                logger.warning(
-                    "bridge_run_interrupted bridge_run_id=%s correlation_id=%s "
-                    "idempotency_fingerprint=%s phase=shutdown",
-                    run_id,
-                    correlation_id,
-                    fingerprint,
-                )
-                raise
-            except HTTPException as exc:
-                detail = exc.detail if isinstance(exc.detail, dict) else {
-                    "code": "bridge_server_error",
-                    "message": str(exc.detail),
-                    "retryable": exc.status_code in {408, 429, 502, 503, 504},
-                }
-                stored = {
-                    "status_code": exc.status_code,
-                    "body": {"id": run_id, "status": "failed", "error": detail},
-                }
-                self.registry.set_state(key, "failed", stored)
-                self.bridge_metrics["runs_failed"] += 1
-                raise
-            except Exception as exc:
-                logger.exception("bridge_run_unexpected_failure bridge_run_id=%s", run_id)
-                stored = {
-                    "status_code": 500,
-                    "body": {
-                        "id": run_id,
-                        "status": "failed",
-                        "error": {
-                            "code": "bridge_server_error",
-                            "message": "La génération via le bridge a échoué.",
-                            "retryable": True,
-                        }
-                    },
-                }
-                self.registry.set_state(key, "failed", stored)
-                self.bridge_metrics["runs_failed"] += 1
-                raise HTTPException(status_code=500, detail=stored["body"]["error"]) from exc
-            finally:
-                self.idempotent_tasks.pop(run_id, None)
-
-        task = self.idempotent_tasks.get(run_id)
-        if task is None:
-            # Une déconnexion HTTP ne doit ni annuler ni resoumettre un clic coûteux.
-            task = asyncio.create_task(execute_once())
-            self.idempotent_tasks[run_id] = task
-            task.add_done_callback(self._consume_task_exception)
-        if req.background:
-            # Le client reprend exclusivement par GET. Le résultat final sera écrit
-            # par execute_once dans SQLite, même si cette requête HTTP disparaît.
-            current = self.registry.get_by_run_id(run_id) or record
-            return {
-                "id": run_id,
-                "object": "response",
-                "status": current["state"],
-            }
-        return await asyncio.shield(task)
+                if not req.background and not interrupted:
+                    raise HTTPException(
+                        status_code=snapshot.status_code(),
+                        detail=detail,
+                    )
+                return JSONResponse(status_code=snapshot.status_code(), content=body)
+            return body
+        return {"id": snapshot.response_id, "object": "response", "status": snapshot.state}
 
     async def retrieve_bridge_run(self, response_id: str):
-        record = self.registry.get_by_run_id(response_id)
-        if record is None:
-            # A caller that lost the POST response only has the exact
-            # idempotency key (`<model-run-uuid>:aN`). Resolve that key in the
-            # same durable registry; never infer a run from UI state.
-            record = self.registry.get_by_idempotency_key(response_id)
-        if record is None:
-            raise HTTPException(status_code=404, detail="Run bridge inconnu ou expiré")
-        bridge_run_id = str(record["bridge_run_id"])
-        if record["state"] == "completed" and record["response_json"]:
-            return json.loads(record["response_json"])
-        if record["state"] == "needs_review" and record["error_json"]:
-            return json.loads(record["error_json"])
-        if record["state"] == "failed" and record["error_json"]:
-            stored = json.loads(record["error_json"])
-            return JSONResponse(status_code=stored["status_code"], content=stored["body"])
+        snapshot = self.run_service.retrieve(response_id)
+        body = snapshot.response_body()
+        if body is not None:
+            if snapshot.state == "failed":
+                return JSONResponse(status_code=snapshot.status_code(), content=body)
+            return body
         return {
-            "id": bridge_run_id,
+            "id": snapshot.response_id,
             "object": "response",
-            "status": record["state"],
+            "status": snapshot.state,
             "metadata": {
-                "bridge_progress": generation_progress(bridge_run_id),
+                "bridge_progress": generation_progress(snapshot.response_id),
             },
         }
 
@@ -685,7 +465,7 @@ class BridgeRoutes:
             # comme repli : la promotion ne détruit jamais ses octets.
             "fallback": incomplete,
         }
-        self.registry.store_preview(response_id, preview)
+        self.run_service.store_preview(response_id, preview)
         logger.info(
             "bridge_recovery_final_upgraded bridge_run_id=%s turn_id=%s sha256=%s",
             response_id,
@@ -695,7 +475,7 @@ class BridgeRoutes:
         return preview
 
     async def preview_visible_recovery(self, response_id: str):
-        record = self.registry.get_by_run_id(response_id)
+        record = self.run_service.get_record(response_id)
         if record is None:
             raise HTTPException(status_code=404, detail="Run bridge inconnu")
         # Une finale vérifiée déjà durable est définitive : elle est servie sans
@@ -774,7 +554,7 @@ class BridgeRoutes:
                 "provenance": "live_dom_capture",
                 "metadata": metadata,
             }
-            self.registry.store_preview(response_id, preview)
+            self.run_service.store_preview(response_id, preview)
             return preview
 
         if (
@@ -825,12 +605,12 @@ class BridgeRoutes:
             "provenance": "live_dom_capture",
             "metadata": live_metadata,
         }
-        self.registry.store_preview(response_id, preview)
+        self.run_service.store_preview(response_id, preview)
         return preview
 
     async def release_visible_recovery(self, response_id: str):
         """Explicitement abandonner une target stateless conservée."""
-        record = self.registry.get_by_run_id(response_id)
+        record = self.run_service.get_record(response_id)
         if record is None:
             raise HTTPException(status_code=404, detail="Run bridge inconnu")
         target = (
@@ -948,7 +728,7 @@ class BridgeRoutes:
         return {
             **self.bridge_metrics,
             "websocket_reconnections": self.bridge.reconnections,
-            "active_runs": len(self.idempotent_tasks),
+            "active_runs": len(self.run_service.active_tasks),
             "extension_connected": self.bridge.online,
             "busy": self.bridge.slot.locked(),
         }

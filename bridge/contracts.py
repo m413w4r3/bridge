@@ -92,6 +92,11 @@ class ResponseRequest(BaseModel):
     stream: bool = False
     conversation: Optional[BridgeConversationTarget] = None
     bridge_recovery: bool = False
+    # Explicit bridge extensions.  `model` remains an API/client label and is
+    # deliberately never translated into a UI model control.
+    bridge_ui_model: Optional[str] = None
+    bridge_profile: Optional[str] = None
+    allow_unverified_model: bool = False
 
     model_config = {"extra": "allow"}
 
