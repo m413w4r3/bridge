@@ -180,11 +180,8 @@ def request_with_key(key: str) -> Request:
 
 
 def isolated_registry(runtime: BridgeApplication, tmp_path: Path) -> None:
-    """`create_bridge_run`/`retrieve_bridge_run` read `self.registry`, bound
-    once at construction: every real owner of a registry reference needs
-    patching directly."""
+    """`DurableRunService` is the single registry owner behind every facade;
+    the application keeps its own reference for readiness and shutdown."""
     registry = RunRegistry(tmp_path / "runs.sqlite3")
     runtime.registry = registry
-    runtime.openai_routes.registry = registry
-    runtime.bridge_routes.registry = registry
-    runtime.conversation_routes.registry = registry
+    runtime.run_service.registry = registry

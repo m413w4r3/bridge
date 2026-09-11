@@ -29,7 +29,6 @@ from bridge.generation import (
     UpstreamError,
     _BackgroundRequest,
     _response_body,
-    _response_chat_request,
     _stable_external_turn_id,
     _visible_citations,
     run_generation,
@@ -199,10 +198,6 @@ class DurableRunService:
             "payload_conflicts": 0,
             "ui_timeouts": 0,
         }
-        # A small compatibility seam for tests written against the old route
-        # module. It never owns state or tasks; the service remains authoritative.
-        self._compat_globals: dict[str, Any] | None = None
-        self._compat_baseline: dict[str, Any] = {}
 
     @property
     def active_tasks(self) -> set[asyncio.Task[RunSnapshot]]:
@@ -211,20 +206,6 @@ class DurableRunService:
     @property
     def task_map(self) -> dict[str, asyncio.Task[RunSnapshot]]:
         return self._tasks
-
-    def bind_compat_globals(self, namespace: dict[str, Any]) -> None:
-        self._compat_globals = namespace
-        self._compat_baseline = {
-            name: namespace.get(name)
-            for name in ("prepare_run", "run_generation", "_BackgroundRequest")
-        }
-
-    def _engine(self, name: str) -> Any:
-        if self._compat_globals is not None:
-            candidate = self._compat_globals.get(name)
-            if candidate is not self._compat_baseline.get(name):
-                return candidate
-        return globals()[name]
 
     def _snapshot(self, record: dict[str, Any]) -> RunSnapshot:
         result: dict[str, Any] | None = None
@@ -415,11 +396,8 @@ class DurableRunService:
             hashlib.sha256(key.encode()).hexdigest()[:12],
         )
         try:
-            prepare = self._engine("prepare_run")
-            generator = self._engine("run_generation")
-            request_cls = self._engine("_BackgroundRequest")
             async with self.bridge.slot:
-                report = await prepare(
+                report = await prepare_run(
                     self.bridge,
                     spec.controls,
                     allow_unverified_model=spec.allow_unverified_model,
@@ -430,12 +408,12 @@ class DurableRunService:
                 extension_metadata: dict[str, Any] = {}
                 parts = [
                     text
-                    async for text in generator(
+                    async for text in run_generation(
                         self.bridge,
                         self.registry,
                         run_id,
                         spec.chat_request,
-                        request_cls(),
+                        _BackgroundRequest(),
                         conversation=spec.response_request.conversation,
                         browser_target=target,
                         expected_tab_id=report.tab_id,

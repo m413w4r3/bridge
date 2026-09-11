@@ -23,12 +23,11 @@ from bridge.contracts import (
 )
 from bridge.generation import (
     NeedsReviewError,
-    _BackgroundRequest,
+    _response_chat_request,
     _stable_external_turn_id,
     _visible_citations,
     generation_progress,
 )
-from bridge.registry import RunRegistry
 from bridge.run_service import (
     DurableRunService,
     DurableRunSpec,
@@ -196,7 +195,6 @@ class BridgeRoutes:
         self,
         *,
         bridge: Bridge,
-        registry: RunRegistry,
         run_service: DurableRunService,
         auth_dependency: Callable[..., Any],
         ensure_accepting_runs: Callable[[], None],
@@ -247,23 +245,6 @@ class BridgeRoutes:
             methods=["GET"],
         )
 
-    @property
-    def registry(self) -> RunRegistry:
-        return self.run_service.registry
-
-    @registry.setter
-    def registry(self, value: RunRegistry) -> None:
-        self.run_service.registry = value
-
-    @property
-    def idempotent_tasks(self):
-        """Compatibility view; task ownership remains exclusively in service."""
-        return self.run_service.task_map
-
-    @property
-    def bridge_metrics(self):
-        return self.run_service.metrics
-
     def _bridge_controls(self, req: BridgeRunRequest) -> RunControls:
         modele = (req.ui_model or "").strip()
         return RunControls(
@@ -308,9 +289,7 @@ class BridgeRoutes:
         )
         spec = DurableRunSpec(
             response_request=response_request,
-            chat_request=self.run_service._engine("_response_chat_request")(
-                response_request
-            ),
+            chat_request=_response_chat_request(response_request),
             controls=self._bridge_controls(req),
             allow_unverified_model=req.allow_unverified_model,
             # Preserve the historical native canonicalization exactly.
@@ -672,7 +651,7 @@ class BridgeRoutes:
                     "bridge_ui_timeout" if "après" in str(exc) else "bridge_extension_disconnected"
                 )
                 if code == "bridge_ui_timeout":
-                    self.bridge_metrics["ui_timeouts"] += 1
+                    self.run_service.metrics["ui_timeouts"] += 1
                 raise HTTPException(
                     status_code=504 if code == "bridge_ui_timeout" else 503,
                     detail={"code": code, "message": str(exc), "retryable": True},
@@ -726,7 +705,7 @@ class BridgeRoutes:
     async def bridge_operational_metrics(self):
         """Compteurs bornés, sans labels issus des prompts ou des secrets."""
         return {
-            **self.bridge_metrics,
+            **self.run_service.metrics,
             "websocket_reconnections": self.bridge.reconnections,
             "active_runs": len(self.run_service.active_tasks),
             "extension_connected": self.bridge.online,

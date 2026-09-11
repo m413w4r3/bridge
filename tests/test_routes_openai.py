@@ -14,6 +14,7 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 from starlette.requests import Request
 
+from bridge import run_service as run_service_module
 from bridge.app import BridgeApplication
 from bridge.contracts import ResponseRequest, RunControls
 from bridge.generation import (
@@ -130,16 +131,10 @@ async def test_responses_facade_completes_background_request_without_network(
     async def fake_generation(*_: object, **__: object) -> AsyncIterator[str]:
         yield "résultat simulé"
 
-    # `run_generation` is a module-level name inside `bridge.routes_openai`,
-    # looked up fresh on every call: patch it there, not the name imported
-    # into this test file. `monkeypatch` reverts it when this test ends,
-    # which matters because `bridge.routes_openai` is import-cached across
-    # every test in this process.
-    monkeypatch.setitem(
-        runtime.openai_routes._execute_background_response.__globals__,
-        "run_generation",
-        fake_generation,
-    )
+    # `DurableRunService` looks `run_generation` up in `bridge.run_service`'s
+    # module namespace on every run: patch it there. `monkeypatch` reverts it
+    # when this test ends (the module is import-cached across tests).
+    monkeypatch.setattr(run_service_module, "run_generation", fake_generation)
     runtime.bridge.ws = object()
     request = ResponseRequest(
         input="Recherche autorisée",
@@ -149,7 +144,7 @@ async def test_responses_facade_completes_background_request_without_network(
     http_request = Request({"type": "http", "method": "POST", "path": "/v1/responses"})
 
     queued = await runtime.openai_routes.create_response(request, http_request)
-    await runtime.openai_routes.background_tasks[queued["id"]]
+    await runtime.run_service.wait(queued["id"])
     completed = await runtime.openai_routes.retrieve_response(queued["id"])
 
     assert queued["status"] == "queued"
@@ -168,16 +163,12 @@ async def test_responses_background_preserves_needs_review_reason(
         )
         yield "unreachable"
 
-    monkeypatch.setitem(
-        runtime.openai_routes._execute_background_response.__globals__,
-        "run_generation",
-        needs_review_generation,
-    )
+    monkeypatch.setattr(run_service_module, "run_generation", needs_review_generation)
     runtime.bridge.ws = object()
     request = ResponseRequest(input="Recherche autorisée", background=True)
 
     queued = await runtime.openai_routes.create_response(request, _request())
-    await runtime.openai_routes.background_tasks[queued["id"]]
+    await runtime.run_service.wait(queued["id"])
     needs_review = await runtime.openai_routes.retrieve_response(queued["id"])
 
     assert needs_review["status"] == "needs_review"
@@ -209,16 +200,15 @@ async def test_responses_background_preserves_typed_timeout_and_retains_target(
         )
         yield "unreachable"
 
-    globals_ = runtime.openai_routes._execute_background_response.__globals__
-    monkeypatch.setitem(globals_, "prepare_run", fake_prepare)
-    monkeypatch.setitem(globals_, "run_generation", timed_out_generation)
+    monkeypatch.setattr(run_service_module, "prepare_run", fake_prepare)
+    monkeypatch.setattr(run_service_module, "run_generation", timed_out_generation)
     extension = RetentionSpy()
     runtime.bridge.ws = extension
 
     queued = await runtime.openai_routes.create_response(
         ResponseRequest(input="Recherche autorisée", background=True), _request()
     )
-    await runtime.openai_routes.background_tasks[queued["id"]]
+    await runtime.run_service.wait(queued["id"])
     failed = await runtime.openai_routes.retrieve_response(queued["id"])
 
     assert failed["status"] == "failed"
@@ -328,3 +318,63 @@ async def test_verified_ui_state_names_the_model_and_the_native_search_tool(
     ).messages[0].content
     assert "Recherche sur le Web" in prompt
     assert "interface" not in prompt
+
+
+async def test_chat_completions_rejects_response_format_before_any_run(
+    runtime: BridgeApplication,
+) -> None:
+    from bridge.contracts import ChatMessage, ChatRequest
+
+    request = ChatRequest(
+        messages=[ChatMessage(role="user", content="x")],
+        response_format={"type": "json_object"},
+    )
+
+    # The extension is offline: reaching submission would answer 503 instead.
+    with pytest.raises(HTTPException) as caught:
+        await runtime.openai_routes.chat_completions(request, _request())
+
+    assert caught.value.status_code == 422
+    assert caught.value.detail["code"] == "unsupported_parameter"
+    assert caught.value.detail["param"] == "response_format"
+    assert caught.value.detail["submission_state"] == "pre_submission"
+    assert runtime.run_service.task_map == {}
+
+
+async def test_models_list_only_the_neutral_label_and_report_ui_models_apart(
+    runtime: BridgeApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from bridge import routes_openai
+    from bridge.contracts import UiState
+    from bridge.ui import UiUnavailable
+
+    state = UiState.model_validate(
+        {
+            "model": {
+                "supported": True,
+                "selected_id": "gpt-5",
+                "available": [
+                    {"id": "gpt-5", "label": "GPT-5"},
+                    {"id": "gpt-4o", "label": "GPT-4o"},
+                ],
+            }
+        }
+    )
+
+    async def offline(*_: object, **__: object) -> UiState:
+        raise UiUnavailable("extension hors ligne")
+
+    monkeypatch.setattr(routes_openai, "cached_probe", lambda: state)
+    monkeypatch.setattr(routes_openai, "fetch_ui_state", offline)
+
+    observed = await runtime.openai_routes.list_models()
+
+    assert [model["id"] for model in observed["data"]] == ["chatgpt-web"]
+    assert [model["id"] for model in observed["ui_models"]] == ["gpt-5", "gpt-4o"]
+    assert observed["ui_models"][0]["selected"] is True
+
+    monkeypatch.setattr(routes_openai, "cached_probe", lambda: None)
+    unobserved = await runtime.openai_routes.list_models()
+
+    assert [model["id"] for model in unobserved["data"]] == ["chatgpt-web"]
+    assert unobserved["ui_models"] == []

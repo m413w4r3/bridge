@@ -72,7 +72,9 @@ class ChatRequest(BaseModel):
     new_chat: bool = Field(default=False, description="Repart d'une conversation vierge")
     files: List[FileAttachment] = Field(default_factory=list, description="Pièces jointes")
 
-    model_config = {"extra": "allow"}  # params OpenAI sans équivalent UI: acceptés, ignorés
+    # Params OpenAI sans équivalent UI : acceptés et ignorés, sauf
+    # response_format, refusé en 422 par la route faute d'implémentation.
+    model_config = {"extra": "allow"}
 
 
 class ResponseRequest(BaseModel):

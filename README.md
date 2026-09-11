@@ -133,7 +133,7 @@ client.chat.completions.create(
 | `GET /v1/bridge/metrics` | compteurs opérationnels sans contenu sensible |
 | `GET /v1/bridge/ui` | état pilotable de l'onglet (`?probe=true` énumère les choix) |
 | `POST /v1/bridge/ui/controls` | applique un réglage hors run (profil, modèle, recherche) |
-| `GET /v1/models` | modèles réellement offerts par l'UI si connus, liste factice sinon |
+| `GET /v1/models` | seulement le libellé neutre `chatgpt-web` ; les entrées connues du sélecteur UI sont listées à part dans `ui_models` (sélection via `bridge_ui_model`) |
 | `GET /health` | extension connectée ? qui la détient ? requête en cours ? |
 | `GET /ready` | configuration, SQLite et disponibilité fonctionnelle de l’extension |
 
@@ -247,6 +247,8 @@ active et ouvre les menus pour énumérer modèles et profils — c'est visible 
 fait après la génération en cours et mis en cache 60 s.
 
 `/v1/chat/completions` ne pilote rien : son champ `model` reste ignoré, comme avant.
+Il refuse `response_format` en 422 (`unsupported_parameter`, `pre_submission`)
+au lieu de l'ignorer : aucune sortie structurée n'y est implémentée.
 
 ## Configuration (variables d'environnement)
 

@@ -69,7 +69,6 @@ class BridgeApplication:
 
         self.openai_routes = OpenAIRoutes(
             bridge=self.bridge,
-            registry=self.registry,
             run_service=self.run_service,
             auth_dependency=self.require_key,
             ensure_accepting_runs=self._ensure_accepting_runs,
@@ -78,7 +77,6 @@ class BridgeApplication:
 
         self.bridge_routes = BridgeRoutes(
             bridge=self.bridge,
-            registry=self.registry,
             run_service=self.run_service,
             auth_dependency=self.require_key,
             ensure_accepting_runs=self._ensure_accepting_runs,

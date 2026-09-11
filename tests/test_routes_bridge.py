@@ -229,7 +229,7 @@ async def test_background_bridge_run_returns_immediately_and_is_polled_to_comple
     assert extension.prompt_count == 1
 
     release_generation.set()
-    await runtime.bridge_routes.idempotent_tasks[accepted["id"]]
+    await runtime.run_service.wait(accepted["id"])
     completed = await runtime.bridge_routes.retrieve_bridge_run(accepted["id"])
 
     assert completed["status"] == "completed"
@@ -366,7 +366,7 @@ async def test_visible_answer_survives_active_signal_stall_and_lost_tab(
     assert answer not in json.dumps(result, ensure_ascii=False)
 
     run_id = result["id"]
-    stored = runtime.bridge_routes.registry.get_by_run_id(run_id)
+    stored = runtime.run_service.registry.get_by_run_id(run_id)
     assert stored is not None
     persisted = json.loads(stored["preview_json"])
     assert persisted["provenance"] == "captured_incomplete"
@@ -482,7 +482,7 @@ async def _stalled_run_with_visible_candidate(
 
 
 def _durable_preview(runtime: BridgeApplication, run_id: str) -> dict[str, Any]:
-    record = runtime.bridge_routes.registry.get_by_run_id(run_id)
+    record = runtime.run_service.registry.get_by_run_id(run_id)
     assert record is not None and record["preview_json"]
     return json.loads(record["preview_json"])
 
@@ -626,7 +626,7 @@ async def test_durable_verified_final_never_regresses_to_the_incomplete_candidat
     # l'aperçu reste la finale vérifiée, à l'octet près.
     extension.live_turn_id = "assistant-43"
     extension.text_drifted = True
-    runtime.bridge_routes.registry = RunRegistry(database)
+    runtime.run_service.registry = RunRegistry(database)
     after_restart = await runtime.bridge_routes.preview_visible_recovery(run_id)
     runtime.bridge.ws = None
     without_browser = await runtime.bridge_routes.preview_visible_recovery(run_id)
@@ -681,7 +681,7 @@ async def test_failed_preview_persistence_never_claims_durable_recovery(
     def refuse(run_id: str, value: dict[str, Any]) -> None:
         raise RuntimeError("registre indisponible")
 
-    runtime.bridge_routes.registry.store_preview = refuse  # type: ignore[method-assign]
+    runtime.run_service.registry.store_preview = refuse  # type: ignore[method-assign]
 
     result = await runtime.bridge_routes.create_bridge_run(
         BridgeRunRequest(input="mission"), request_with_key("stalled-unpersisted")
@@ -709,7 +709,7 @@ async def test_empty_incomplete_stays_an_honest_no_final_answer(
         BridgeRunRequest(input="mission"), request_with_key("stalled-empty")
     )
     run_id = result["id"]
-    record = runtime.bridge_routes.registry.get_by_run_id(run_id)
+    record = runtime.run_service.registry.get_by_run_id(run_id)
 
     assert result["status"] == "needs_review"
     assert result["metadata"]["output_chars"] == 0
@@ -842,20 +842,20 @@ async def test_conversation_binding_precedes_incomplete_and_survives_restart(
     )
     await bound.wait()
 
-    persisted = runtime.bridge_routes.registry.get_by_run_id(accepted["id"])
+    persisted = runtime.run_service.registry.get_by_run_id(accepted["id"])
     assert persisted is not None
     binding = json.loads(persisted["conversation_json"])
     assert binding["external_locator"] == locator
     assert binding["assistant_turns_before"] == 2
 
     release.set()
-    await runtime.bridge_routes.idempotent_tasks[accepted["id"]]
+    await runtime.run_service.wait(accepted["id"])
     needs_review = await runtime.bridge_routes.retrieve_bridge_run(accepted["id"])
     assert needs_review["status"] == "needs_review"
     assert needs_review["error"]["code"] == "no_final_answer"
 
     restarted = RunRegistry(database)
-    runtime.bridge_routes.registry = restarted
+    runtime.run_service.registry = restarted
     preview = await runtime.bridge_routes.preview_visible_recovery(accepted["id"])
     assert preview["turn_id"] == "assistant-later"
     assert preview["text"].startswith("## SUBJECT S1")
@@ -991,10 +991,10 @@ async def test_interrupted_stateless_run_recovers_by_exact_run_target(
 ) -> None:
     isolated_registry(runtime, tmp_path)
     key = "interrupted-stateless"
-    record, created = runtime.bridge_routes.registry.claim(key, "request-hash")
+    record, created = runtime.run_service.registry.claim(key, "request-hash")
     assert created is True
-    runtime.bridge_routes.registry.set_state(key, "running")
-    runtime.bridge_routes.registry.recover_interrupted()
+    runtime.run_service.registry.set_state(key, "running")
+    runtime.run_service.registry.recover_interrupted()
 
     class RecoveryExtension:
         def __init__(self) -> None:
@@ -1119,7 +1119,7 @@ async def test_completed_run_survives_registry_restart_without_ui(
     req = BridgeRunRequest(input="once")
     first = await runtime.bridge_routes.create_bridge_run(req, request_with_key("restart"))
 
-    runtime.bridge_routes.registry = RunRegistry(database)
+    runtime.run_service.registry = RunRegistry(database)
     runtime.bridge.ws = None
     replay = await runtime.bridge_routes.create_bridge_run(req, request_with_key("restart"))
 
