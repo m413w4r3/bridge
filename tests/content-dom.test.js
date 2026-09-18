@@ -1374,7 +1374,7 @@ const PLACEHOLDER_ID =
       "l'identité doit venir du nœud courant, pas du placeholder détaché",
     );
     assert.equal(done.metadata?.initial_turn_id, "stable-assistant-42");
-    assert.equal(done.metadata?.content_script_version, "32");
+    assert.equal(done.metadata?.content_script_version, "33");
   }
 
   // Même remplacement, mais l'UI reste bloquée « en streaming » : le candidat
@@ -1848,8 +1848,13 @@ function forbidEditingCommand(window) {
 /**
  * Instrumente un composer contenteditable comme le ferait ProseMirror : le
  * paste est consommé par l'éditeur, qui met lui-même le contenu à jour.
+ *
+ * `mode` distingue les deux comportements réels de ChatGPT, tous deux valides :
+ *   - "text"       : l'éditeur insère le texte collé dans le contenteditable ;
+ *   - "attachment" : l'éditeur consomme le collage puis le convertit en pièce
+ *                    jointe, et le contenteditable reste vide.
  */
-function observeComposer(window) {
+function observeComposer(window, mode = "text") {
   const composer = window.document.querySelector("#prompt-textarea");
   const observed = { pasteCount: 0, inputCount: 0, pastedText: null };
   composer.addEventListener("input", () => {
@@ -1859,7 +1864,9 @@ function observeComposer(window) {
     event.preventDefault();
     observed.pasteCount += 1;
     observed.pastedText = event.clipboardData.getData("text/plain");
-    composer.textContent = observed.pastedText;
+    // En mode "attachment" aucun texte n'est ajouté : ChatGPT a transformé le
+    // collage en pièce jointe. Le composer reste légitimement vide.
+    if (mode === "text") composer.textContent = observed.pastedText;
   });
   return { composer, observed };
 }
@@ -2099,7 +2106,7 @@ async function runPromptInjection({ id, prompt, files = null }) {
     })()`);
     assert.equal(diagnostics.composer_was_non_empty, true);
     assert.equal(diagnostics.composer_still_has_text, true);
-    assert.equal(diagnostics.content_script_version, "32");
+    assert.equal(diagnostics.content_script_version, "33");
 
     // Le snapshot ne transporte plus le texte du composer, seulement un booléen.
     const snapshot = run(`captureSubmissionSnapshot(${SEL})`);
@@ -2139,6 +2146,296 @@ async function runPromptInjection({ id, prompt, files = null }) {
       return waitForSubmissionConfirmation(composer, send, before, "requestSubmit");
     })()`);
     assert.equal(signal, "composer_cleared");
+  }
+
+  // --- Régression : un paste consommé peut laisser le composer vide ------- //
+  // Au-delà d'une certaine taille, ChatGPT accepte le collage puis le convertit
+  // lui-même en pièce jointe : le contenteditable reste vide alors que tout
+  // s'est bien passé. `composerHasText()` ne peut donc plus servir de preuve.
+  {
+    const { window, run } = loadExtension(
+      `<div id="prompt-textarea" contenteditable="true"></div>`,
+    );
+    forbidEditingCommand(window);
+    const composer = window.document.querySelector("#prompt-textarea");
+
+    let pasteCount = 0;
+    composer.addEventListener("paste", (event) => {
+      event.preventDefault();
+      pasteCount += 1;
+      // Simule ChatGPT qui transforme le gros collage en pièce jointe :
+      // aucun texte n'est ajouté au contenteditable.
+    });
+
+    const method = await run(
+      `typePrompt(document.querySelector("#prompt-textarea"), "x".repeat(60000))`,
+    );
+
+    assert.equal(method, "synthetic_paste");
+    assert.equal(pasteCount, 1, "un seul ClipboardEvent('paste')");
+    assert.equal(
+      composer.textContent,
+      "",
+      "un paste consommé peut légitimement laisser le composer vide",
+    );
+  }
+
+  // Sémantique inverse : sans `preventDefault()`, l'éditeur n'a pas pris le
+  // collage en charge — c'est un vrai échec d'injection.
+  {
+    const { window, run } = loadExtension(
+      `<div id="prompt-textarea" contenteditable="true"></div>`,
+    );
+    forbidEditingCommand(window);
+
+    await assert.rejects(
+      () => run(`typePrompt(document.querySelector("#prompt-textarea"), "bonjour")`),
+      /paste synthétique n'a pas été pris en charge/,
+    );
+  }
+
+  // --- `composer_cleared` = uniquement la transition true → false --------- //
+  // Composer déjà vide avant Send (collage converti en pièce jointe) : rester
+  // vide après Send ne prouve rien. La confirmation doit attendre un vrai
+  // signal de soumission.
+  {
+    const body = `<form id="composer-form">
+      <div id="prompt-textarea" contenteditable="true"></div>
+      <button aria-disabled="false" data-testid="send-button">Send</button>
+    </form>`;
+    const { window, run } = loadExtension(
+      body,
+      "https://chatgpt.com/?temporary-chat=true",
+    );
+    const doc = window.document;
+    // Le vrai signal n'arrive qu'après plusieurs tours de boucle : si
+    // `false → false` valait `composer_cleared`, la confirmation serait rendue
+    // au tout premier tour, avant même l'apparition du tour utilisateur.
+    let clock = 0;
+    let polls = 0;
+    let userTurnAt = null;
+    window.Date.now = () => clock;
+    window.setTimeout = (fn, ms) => {
+      clock += ms || 0;
+      polls += 1;
+      if (userTurnAt !== null && clock >= userTurnAt) {
+        userTurnAt = null;
+        doc.body.insertAdjacentHTML(
+          "beforeend",
+          `<div data-message-author-role="user" data-message-id="u1">prompt</div>`,
+        );
+      }
+      queueMicrotask(fn);
+      return 0;
+    };
+    doc.querySelector("#composer-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      // Le composer était déjà vide et le reste : aucune transition à lire.
+      userTurnAt = clock + 500;
+    });
+
+    const signal = await run(`(async () => {
+      const composer = document.querySelector("#prompt-textarea");
+      const send = document.querySelector("button[data-testid='send-button']");
+      const before = captureSubmissionSnapshot(composer, send);
+      if (before.composerHasText) throw new Error("le composer doit être vide avant Send");
+      triggerComposerSubmission(composer, send);
+      return waitForSubmissionConfirmation(composer, send, before, "requestSubmit");
+    })()`);
+
+    assert.equal(
+      signal,
+      "user_turn",
+      "false → false ne doit jamais être interprété comme composer_cleared",
+    );
+    assert.ok(polls >= 1, "la confirmation doit avoir réellement attendu un signal");
+    assert.equal(
+      doc.querySelector("#prompt-textarea").textContent,
+      "",
+      "le composer est resté vide de bout en bout",
+    );
+  }
+
+  // --- Intégration : 60 KB collés, convertis en pièce jointe par ChatGPT -- //
+  {
+    const { window, run } = loadExtension(
+      INJECTION_PAGE,
+      "https://chatgpt.com/?temporary-chat=true",
+    );
+    forbidEditingCommand(window);
+    const doc = window.document;
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => {
+      sent.push(message);
+    };
+    // Send reste indisponible tant que ChatGPT « prépare » le contenu collé :
+    // c'est exactement le cas que seul le timeout d'upload couvre désormais.
+    const sendBtn = doc.querySelector("button[data-testid='send-button']");
+    sendBtn.setAttribute("aria-disabled", "true");
+
+    let clock = 0;
+    let sendReadyAt = null;
+    window.Date.now = () => clock;
+    window.setTimeout = (fn, ms) => {
+      clock += ms || 0;
+      if (sendReadyAt !== null && clock >= sendReadyAt) {
+        sendReadyAt = null;
+        sendBtn.setAttribute("aria-disabled", "false");
+      }
+      queueMicrotask(fn);
+      return 0;
+    };
+
+    // ChatGPT consomme le paste et crée une pièce jointe : le composer reste
+    // vide, et Send ne devient utilisable qu'un peu plus tard.
+    const { composer, observed } = observeComposer(window, "attachment");
+    composer.addEventListener("paste", () => {
+      sendReadyAt = clock + 30_000;
+    });
+
+    const fileInput = doc.querySelector("input[type=file]");
+    Object.defineProperty(fileInput, "files", {
+      writable: true,
+      configurable: true,
+      value: null,
+    });
+    let attachOperations = 0;
+    fileInput.addEventListener("change", () => {
+      attachOperations += 1;
+    });
+
+    let submitEvents = 0;
+    doc.querySelector("#composer-form").addEventListener("submit", (event) => {
+      submitEvents += 1;
+      event.preventDefault();
+      doc.body.insertAdjacentHTML(
+        "beforeend",
+        `<article data-testid="conversation-turn-1">
+           <div data-message-author-role="user" data-message-id="u1">pièce jointe</div>
+         </article>
+         <article data-testid="conversation-turn-2">
+           <div data-message-author-role="assistant" data-message-id="a1">
+             <div class="markdown"><p>réponse finale</p></div>
+           </div>
+           ${copyButton}
+         </article>`,
+      );
+    });
+
+    const phases = [];
+    window.console.log = (...args) => {
+      if (args[0] === "bridge_run_phase") phases.push({ ...args[1] });
+    };
+    window.console.warn = () => {};
+    window.console.error = () => {};
+
+    window.__promptArg = {
+      id: "req-paste-to-attachment",
+      prompt: "x".repeat(60_000),
+      conversation: { id: "conv-paste-to-attachment", mode: "fresh" },
+    };
+    await run("handlePrompt(globalThis.__promptArg)");
+
+    const errors = sent.filter((message) => message.type === "error");
+    assert.deepEqual(errors, [], "un paste converti en pièce jointe n'est pas une erreur");
+
+    const injected = phases.find((phase) => phase.phase === "prompt_injected");
+    assert.equal(injected.prompt_as_file, false, "60 KB reste sous le seuil de 200 KB");
+    assert.equal(injected.injection_method, "synthetic_paste");
+    assert.equal(injected.paste_consumed, true);
+    assert.equal(injected.attachment_count, 0);
+
+    assert.equal(observed.pasteCount, 1, "un seul paste, aucun découpage");
+    assert.equal(observed.inputCount, 0, "aucun input synthétique après le paste");
+    assert.equal(attachOperations, 0, "le bridge n'a déposé aucun fichier lui-même");
+    assert.equal(composer.textContent, "", "le composer peut rester vide");
+
+    assert.equal(submitEvents, 1, "un seul Send, aucun retry");
+    assert.equal(
+      phases.filter((phase) => phase.phase === "submission_attempted").length,
+      1,
+    );
+    const confirmed = phases.find((phase) => phase.phase === "submission_confirmed");
+    assert.ok(confirmed, "la soumission doit être confirmée normalement");
+    assert.equal(
+      confirmed.signal,
+      "user_turn",
+      "le signal vient du tour utilisateur, jamais d'un composer_cleared fictif",
+    );
+
+    const done = sent.find((message) => message.type === "done");
+    assert.ok(done, "le run doit aboutir");
+    assert.equal(done.text, "réponse finale");
+  }
+
+  // --- Le composer est re-résolu après `attachFiles()` -------------------- //
+  // ProseMirror/React peut remplacer le nœud pendant l'ajout d'une pièce
+  // jointe : le collage doit partir sur le nœud courant, jamais sur la
+  // référence capturée avant l'attachement.
+  {
+    const { window, run } = loadExtension(
+      INJECTION_PAGE,
+      "https://chatgpt.com/?temporary-chat=true",
+    );
+    useVirtualClock(window);
+    forbidEditingCommand(window);
+    const doc = window.document;
+    window.console.log = () => {};
+    window.console.warn = () => {};
+    window.console.error = () => {};
+
+    const oldComposer = doc.querySelector("#prompt-textarea");
+    let pastesOnOldComposer = 0;
+    oldComposer.addEventListener("paste", (event) => {
+      event.preventDefault();
+      pastesOnOldComposer += 1;
+    });
+
+    const replacement = doc.createElement("div");
+    replacement.id = "prompt-textarea";
+    replacement.contentEditable = "true";
+    let pastesOnReplacement = 0;
+    let pastedOnReplacement = null;
+    replacement.addEventListener("paste", (event) => {
+      event.preventDefault();
+      pastesOnReplacement += 1;
+      pastedOnReplacement = event.clipboardData.getData("text/plain");
+      replacement.textContent = pastedOnReplacement;
+    });
+
+    const fileInput = doc.querySelector("input[type=file]");
+    Object.defineProperty(fileInput, "files", {
+      writable: true,
+      configurable: true,
+      value: null,
+    });
+    fileInput.addEventListener("change", () => {
+      // Rerender du composer déclenché par l'ajout de la pièce jointe.
+      if (oldComposer.isConnected) oldComposer.replaceWith(replacement);
+    });
+
+    doc
+      .querySelector("#composer-form")
+      .addEventListener("submit", (event) => event.preventDefault());
+
+    window.__promptArg = {
+      id: "req-composer-rerender",
+      prompt: "bonjour",
+      files: [
+        {
+          name: "rapport.csv",
+          mime: "text/csv",
+          data: Buffer.from("a,b\n1,2").toString("base64"),
+        },
+      ],
+      conversation: { id: "conv-composer-rerender", mode: "fresh" },
+    };
+    await run("handlePrompt(globalThis.__promptArg)");
+
+    assert.equal(pastesOnOldComposer, 0, "aucun collage sur le nœud remplacé");
+    assert.equal(pastesOnReplacement, 1, "le collage part sur le composer courant");
+    assert.equal(pastedOnReplacement, "bonjour");
+    assert.equal(replacement.isConnected, true);
   }
 
   console.log("prompt injection contract: ok");

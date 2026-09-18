@@ -306,7 +306,7 @@ async function runHiddenGeneration({
     assert.equal(done.text, FINAL_TEXT);
     assert.equal(done.metadata.initial_turn_id, "msg-hidden-1");
     assert.equal(done.conversation.turn_id, "msg-hidden-1");
-    assert.equal(done.metadata.content_script_version, "32");
+    assert.equal(done.metadata.content_script_version, "33");
 
     // Exactement une soumission, jamais un clic de secours.
     assert.equal(result.submitEvents, 1, "exactement un prompt soumis");

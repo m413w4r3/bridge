@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "32";
+const VERSION = "33";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -152,9 +152,6 @@ const UPLOAD_TIMEOUT_MS = 120000; // upload des pièces jointes
 // en pièce jointe texte et le composer ne reçoit qu'une courte consigne.
 // Le seuil porte sur les octets UTF-8, pas sur `text.length`.
 const LARGE_PROMPT_FILE_THRESHOLD_BYTES = 200_000;
-// Borne d'attente après le paste synthétique : le composer doit contenir
-// quelque chose, sinon l'éditeur a refusé le collage.
-const PROMPT_INSERT_VERIFY_TIMEOUT_MS = 2000;
 
 function utf8ByteLength(text) {
   return new TextEncoder().encode(text).byteLength;
@@ -728,7 +725,11 @@ async function waitForSubmissionConfirmation(composer, sendBtn, snapshot, method
     const after = captureSubmissionSnapshot(composer, sendBtn);
     let signal = null;
     if (after.userTurns > snapshot.userTurns) signal = "user_turn";
-    else if (!after.composerHasText) signal = "composer_cleared";
+    // Uniquement la transition true → false. Un composer déjà vide avant Send
+    // (gros collage converti en pièce jointe par ChatGPT) reste vide après :
+    // `false → false` n'est aucune preuve de soumission.
+    else if (snapshot.composerHasText && !after.composerHasText)
+      signal = "composer_cleared";
     else if (newSubmissionGenerationSignal(snapshot)) signal = "generation_signal";
     else if (after.assistantTurns > snapshot.assistantTurns) signal = "assistant_turn";
     if (signal) {
@@ -906,6 +907,12 @@ function selectComposerContents(el) {
  *
  * Jamais `navigator.clipboard` — cela demanderait une permission, le focus de
  * l'onglet, et écraserait le presse-papiers réel de l'utilisateur.
+ *
+ * Retourne `event.defaultPrevented` : c'est la SEULE preuve que l'éditeur a
+ * pris le collage en charge. ProseMirror appelle `preventDefault()` puis
+ * applique sa propre transaction — dont le résultat peut être du texte dans le
+ * composer *ou* une pièce jointe créée par ChatGPT. L'état du composer ne dit
+ * donc rien sur la réussite du collage.
  */
 function dispatchPromptPaste(el, text) {
   const dataTransfer = new DataTransfer();
@@ -917,6 +924,8 @@ function dispatchPromptPaste(el, text) {
     composed: true,
   });
   el.dispatchEvent(event);
+
+  return event.defaultPrevented;
 }
 
 /**
@@ -928,6 +937,12 @@ function dispatchPromptPaste(el, text) {
  * avalanche de mutations DOM qui figeait le renderer sur les gros prompts —
  * elle est définitivement supprimée, y compris en repli. Aucun découpage, et aucun
  * second `input` émis à la main : l'éditeur émet le sien.
+ *
+ * Le succès se lit sur `event.defaultPrevented`, jamais sur le contenu du
+ * composer : au-delà d'une certaine taille, ChatGPT accepte le collage puis le
+ * convertit lui-même en pièce jointe et laisse le contenteditable vide. Un
+ * composer vide après un collage consommé est donc parfaitement valide ; la
+ * disponibilité réelle est ensuite vérifiée par le bouton Send.
  */
 async function typePrompt(el, text) {
   el.focus();
@@ -950,20 +965,12 @@ async function typePrompt(el, text) {
   }
 
   selectComposerContents(el);
-  dispatchPromptPaste(el, text);
 
-  const inserted = await waitFor(
-    () => composerHasText(el),
-    PROMPT_INSERT_VERIFY_TIMEOUT_MS,
-    "paste du prompt non appliqué",
-  )
-    .then(() => true)
-    .catch(() => false);
-
-  if (!inserted) {
+  const handled = dispatchPromptPaste(el, text);
+  if (!handled) {
     throw new BridgeError(
       "bridge_prompt_injection_failed",
-      "le composer ChatGPT n'a pas accepté le collage du prompt",
+      "le paste synthétique n'a pas été pris en charge par le composer ChatGPT",
     );
   }
 
@@ -2377,7 +2384,7 @@ async function handlePrompt({
       }
     }
 
-    const composer = await waitFor(
+    let composer = await waitFor(
       () => $(SELECTORS.composer),
       15000,
       "composer introuvable",
@@ -2406,14 +2413,21 @@ async function handlePrompt({
     }
 
     const hasAttachments = Boolean(files?.length) || extraFiles.length > 0;
-    if (hasAttachments) await attachFiles(files || [], extraFiles);
+    if (hasAttachments) {
+      await attachFiles(files || [], extraFiles);
+      // L'ajout d'une pièce jointe provoque un rerender du composer :
+      // ProseMirror/React peut avoir remplacé le nœud. On ne colle jamais dans
+      // une référence potentiellement détachée du document.
+      composer = await waitFor(
+        () => $(SELECTORS.composer),
+        5000,
+        "composer introuvable après ajout des pièces jointes",
+      );
+    }
 
     let injectionMethod = null;
     if (composerPrompt) {
       injectionMethod = await typePrompt(composer, composerPrompt);
-    }
-    if (!composerHasText(composer)) {
-      throw new BridgeError("bridge_ui_timeout", "composer vide avant la soumission");
     }
     // Volumétrie uniquement : ni le prompt, ni le contenu du fichier, ni le
     // DOM du composer ne doivent apparaître dans un log.
@@ -2422,19 +2436,28 @@ async function handlePrompt({
       prompt_bytes: promptBytes,
       prompt_as_file: promptAsFile,
       injection_method: injectionMethod,
+      paste_consumed: injectionMethod === "synthetic_paste",
       attachment_count: (files?.length || 0) + extraFiles.length,
     });
 
+    // Un collage consommé par ChatGPT peut être converti en pièce jointe : la
+    // préparation/upload qui suit prend le même temps qu'un fichier explicite,
+    // même quand aucune pièce jointe n'a été déposée par le bridge.
+    const mayUploadAfterPaste = injectionMethod === "synthetic_paste";
+    const waitsForUpload = hasAttachments || mayUploadAfterPaste;
+
     // Le bouton d'envoi ne devient actif qu'après le rendu de la saisie — et,
-    // s'il y a des pièces jointes, qu'une fois leur upload terminé (bien plus long).
+    // si un upload est possible, qu'une fois celui-ci terminé (bien plus long).
+    // Ce délai long n'ajoute aucune latence : `waitFor` rend la main dès que
+    // Send devient utilisable.
     const sendBtn = await waitFor(
       () => {
         const b = $(SELECTORS.send);
         return isSendButtonReady(b) ? b : null;
       },
-      hasAttachments ? UPLOAD_TIMEOUT_MS : 8000,
-      hasAttachments
-        ? "upload des pièces jointes non terminé"
+      waitsForUpload ? UPLOAD_TIMEOUT_MS : 8000,
+      waitsForUpload
+        ? "contenu collé ou pièce jointe non prêt pour l'envoi"
         : "bouton d'envoi jamais actif",
     );
     // Capture after typing/upload and immediately before the one allowed
