@@ -59,6 +59,9 @@ function loadHiddenTab(body, url = "https://chatgpt.com/?temporary-chat=true") {
   window.CSS = window.CSS || {
     escape: (value) => String(value).replace(/["\\]/g, "\\$&"),
   };
+  // jsdom ne fournit pas `TextEncoder`, natif dans Chrome : le content script
+  // s'en sert pour mesurer la taille UTF-8 du prompt.
+  window.TextEncoder = TextEncoder;
 
   // Onglet d'arrière-plan : masqué, sans focus, pour toute la durée du test.
   Object.defineProperty(window.Document.prototype, "visibilityState", {
@@ -303,7 +306,7 @@ async function runHiddenGeneration({
     assert.equal(done.text, FINAL_TEXT);
     assert.equal(done.metadata.initial_turn_id, "msg-hidden-1");
     assert.equal(done.conversation.turn_id, "msg-hidden-1");
-    assert.equal(done.metadata.content_script_version, "31");
+    assert.equal(done.metadata.content_script_version, "32");
 
     // Exactement une soumission, jamais un clic de secours.
     assert.equal(result.submitEvents, 1, "exactement un prompt soumis");

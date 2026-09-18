@@ -51,6 +51,46 @@ function loadExtension(body, url = "https://chatgpt.com/") {
   };
 
   const context = dom.getInternalVMContext();
+  // jsdom ne fournit ni `TextEncoder`, ni `DataTransfer`, ni `ClipboardEvent`,
+  // ni `DragEvent` — tous natifs dans Chrome. Shims minimaux, évalués DANS le
+  // contexte vm pour que les objets partagent le realm du document.
+  window.TextEncoder = TextEncoder;
+  vm.runInContext(
+    `
+    class DataTransfer {
+      constructor() {
+        this._data = new Map();
+        this._files = [];
+        const files = this._files;
+        this.items = {
+          add: (file) => { files.push(file); return file; },
+          get length() { return files.length; },
+        };
+      }
+      setData(type, value) { this._data.set(String(type), String(value)); }
+      getData(type) { return this._data.get(String(type)) ?? ""; }
+      get types() { return [...this._data.keys()]; }
+      get files() { return this._files; }
+    }
+    class ClipboardEvent extends Event {
+      constructor(type, init = {}) {
+        super(type, init);
+        this.clipboardData = init.clipboardData ?? null;
+      }
+    }
+    class DragEvent extends Event {
+      constructor(type, init = {}) {
+        super(type, init);
+        this.dataTransfer = init.dataTransfer ?? null;
+      }
+    }
+    globalThis.DataTransfer = DataTransfer;
+    globalThis.ClipboardEvent = ClipboardEvent;
+    globalThis.DragEvent = DragEvent;
+  `,
+    context,
+    { filename: "test-shims.js" },
+  );
   for (const file of [
     "serializer.js",
     "completion.js",
@@ -1334,7 +1374,7 @@ const PLACEHOLDER_ID =
       "l'identité doit venir du nœud courant, pas du placeholder détaché",
     );
     assert.equal(done.metadata?.initial_turn_id, "stable-assistant-42");
-    assert.equal(done.metadata?.content_script_version, "31");
+    assert.equal(done.metadata?.content_script_version, "32");
   }
 
   // Même remplacement, mais l'UI reste bloquée « en streaming » : le candidat
@@ -1770,6 +1810,338 @@ const RECHERCHE_FINALE = `# REFERENCES\n\n${RECHERCHE_FINALE_CORPS}`;
   }
 
   console.log("streaming-animation long research contract: ok");
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+
+// --------------------------------------------------------------------------- //
+// Injection du prompt : un seul paste synthétique, jamais de commande
+// d'édition, jamais de lecture répétée du composer, et bascule en pièce
+// jointe au-delà de 200 000 octets UTF-8.
+// --------------------------------------------------------------------------- //
+
+const INJECTION_PAGE = `
+  <form id="composer-form">
+    <div id="prompt-textarea" contenteditable="true"></div>
+    <input type="file" />
+    <button aria-disabled="false" data-testid="send-button">Send</button>
+  </form>`;
+
+/** jsdom n'implémente pas `Blob.prototype.text()` : on relit via FileReader. */
+function readFileText(window, file) {
+  return new Promise((resolve, reject) => {
+    const reader = new window.FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsText(file);
+  });
+}
+
+/** Interdit toute commande d'édition : la production ne doit plus en émettre. */
+function forbidEditingCommand(window) {
+  window.document.execCommand = () => {
+    throw new Error("execCommand ne doit jamais être appelé");
+  };
+}
+
+/**
+ * Instrumente un composer contenteditable comme le ferait ProseMirror : le
+ * paste est consommé par l'éditeur, qui met lui-même le contenu à jour.
+ */
+function observeComposer(window) {
+  const composer = window.document.querySelector("#prompt-textarea");
+  const observed = { pasteCount: 0, inputCount: 0, pastedText: null };
+  composer.addEventListener("input", () => {
+    observed.inputCount += 1;
+  });
+  composer.addEventListener("paste", (event) => {
+    event.preventDefault();
+    observed.pasteCount += 1;
+    observed.pastedText = event.clipboardData.getData("text/plain");
+    composer.textContent = observed.pastedText;
+  });
+  return { composer, observed };
+}
+
+/**
+ * Exécute `handlePrompt` sur une page minimale et rend compte de ce qui a
+ * réellement été collé dans le composer et attaché à l'input file.
+ */
+async function runPromptInjection({ id, prompt, files = null }) {
+  const { window, run } = loadExtension(
+    INJECTION_PAGE,
+    "https://chatgpt.com/?temporary-chat=true",
+  );
+  useVirtualClock(window);
+  forbidEditingCommand(window);
+  const { composer, observed } = observeComposer(window);
+
+  const fileInput = window.document.querySelector("input[type=file]");
+  // jsdom refuse l'affectation d'un FileList fabriqué : on rend la propriété
+  // inscriptible pour observer exactement ce que le bridge dépose.
+  Object.defineProperty(fileInput, "files", {
+    writable: true,
+    configurable: true,
+    value: null,
+  });
+  const attach = { operations: 0, files: [] };
+  fileInput.addEventListener("change", () => {
+    attach.operations += 1;
+    attach.files = [...(fileInput.files || [])];
+  });
+
+  window.document
+    .querySelector("#composer-form")
+    .addEventListener("submit", (event) => event.preventDefault());
+
+  const injected = [];
+  window.console.log = (...args) => {
+    if (args[0] === "bridge_run_phase" && args[1]?.phase === "prompt_injected") {
+      injected.push({ ...args[1] });
+    }
+  };
+  window.console.warn = () => {};
+  window.console.error = () => {};
+
+  window.__promptArg = {
+    id,
+    prompt,
+    files,
+    conversation: { id: `conv-${id}`, mode: "fresh" },
+  };
+  await run("handlePrompt(globalThis.__promptArg)");
+
+  return { window, run, composer, observed, attach, injected: injected[0] };
+}
+
+(async () => {
+  // A + B. Un contenteditable reçoit exactement un `paste` synthétique, aucune
+  // commande d'édition, et le bridge n'émet aucun `input` après le collage.
+  {
+    const { window, run } = loadExtension(
+      `<div id="prompt-textarea" contenteditable="true"></div>`,
+    );
+    forbidEditingCommand(window);
+    const { composer, observed } = observeComposer(window);
+
+    const method = await run(
+      `typePrompt(document.querySelector("#prompt-textarea"), "bonjour\\nmonde")`,
+    );
+
+    assert.equal(method, "synthetic_paste");
+    assert.equal(composer.textContent, "bonjour\nmonde");
+    assert.equal(observed.pastedText, "bonjour\nmonde");
+    assert.equal(observed.pasteCount, 1, "un seul ClipboardEvent('paste')");
+    assert.equal(observed.inputCount, 0, "aucun second `input` après le paste");
+  }
+
+  // I. Le chemin `<textarea>` reste le setter natif + son `input` normal.
+  {
+    const { window, run } = loadExtension(`<textarea data-id="prompt"></textarea>`);
+    forbidEditingCommand(window);
+    const textarea = window.document.querySelector("textarea[data-id='prompt']");
+    let inputs = 0;
+    textarea.addEventListener("input", () => {
+      inputs += 1;
+    });
+    const method = await run(
+      `typePrompt(document.querySelector("textarea[data-id='prompt']"), "bonjour")`,
+    );
+    assert.equal(method, "native_value");
+    assert.equal(textarea.value, "bonjour");
+    assert.equal(inputs, 1);
+  }
+
+  // D. Le seuil se mesure en octets UTF-8, pas en `text.length`.
+  {
+    const { run } = loadExtension(`<div id="prompt-textarea" contenteditable="true"></div>`);
+    assert.equal(run(`LARGE_PROMPT_FILE_THRESHOLD_BYTES`), 200_000);
+    assert.equal(run(`utf8ByteLength("a".repeat(200000))`), 200_000);
+    assert.equal(run(`utf8ByteLength("a".repeat(200001))`), 200_001);
+    // Deux octets par caractère : 150 000 caractères dépassent le seuil.
+    assert.equal(run(`utf8ByteLength("é".repeat(150000))`), 300_000);
+    assert.equal(run(`"é".repeat(150000).length`), 150_000);
+  }
+
+  // C. Un gros prompt sous le seuil reste un collage, en une seule fois.
+  {
+    const text = "x".repeat(150_000);
+    const { observed, attach, injected, run } = await runPromptInjection({
+      id: "req-under-threshold",
+      prompt: text,
+    });
+    assert.equal(run(`utf8ByteLength(globalThis.__promptArg.prompt)`) < 200_000, true);
+    assert.equal(injected.prompt_as_file, false);
+    assert.equal(injected.prompt_bytes, 150_000);
+    assert.equal(injected.injection_method, "synthetic_paste");
+    assert.equal(injected.attachment_count, 0);
+    assert.equal(observed.pasteCount, 1, "aucun découpage : un seul paste");
+    assert.equal(observed.pastedText, text);
+    assert.equal(observed.inputCount, 0);
+    assert.equal(attach.operations, 0);
+  }
+
+  // D-bis. 200 000 octets exactement : encore un collage.
+  {
+    const { observed, injected } = await runPromptInjection({
+      id: "req-exact-threshold",
+      prompt: "a".repeat(200_000),
+    });
+    assert.equal(injected.prompt_bytes, 200_000);
+    assert.equal(injected.prompt_as_file, false);
+    assert.equal(observed.pasteCount, 1);
+  }
+
+  // D-ter. 200 001 octets : bascule en fichier.
+  {
+    const { injected, attach } = await runPromptInjection({
+      id: "req-over-threshold",
+      prompt: "a".repeat(200_001),
+    });
+    assert.equal(injected.prompt_bytes, 200_001);
+    assert.equal(injected.prompt_as_file, true);
+    assert.equal(attach.files.length, 1);
+  }
+
+  // D-quater. Le seuil suit les octets UTF-8 : 150 000 caractères accentués
+  // (300 000 octets) partent en fichier bien que `length` soit sous le seuil.
+  {
+    const prompt = "é".repeat(150_000);
+    const { window, injected, attach } = await runPromptInjection({
+      id: "req-unicode-threshold",
+      prompt,
+    });
+    assert.equal(injected.prompt_bytes, 300_000);
+    assert.equal(injected.prompt_as_file, true);
+    assert.equal(attach.files.length, 1);
+    assert.equal(attach.files[0].size, 300_000);
+    assert.equal(await readFileText(window, attach.files[0]), prompt);
+  }
+
+  // E. Au-delà du seuil : le prompt part en fichier `.txt`, intact, et le
+  // composer ne reçoit que la consigne de lecture — jamais le prompt.
+  {
+    const prompt = `PROMPT-DEBUT\n${"z".repeat(210_000)}\nPROMPT-FIN`;
+    const { window, observed, attach, injected, run } = await runPromptInjection({
+      id: "req/large:prompt",
+      prompt,
+    });
+
+    assert.equal(injected.prompt_as_file, true);
+    assert.equal(injected.injection_method, "synthetic_paste");
+    assert.equal(injected.attachment_count, 1);
+
+    assert.equal(attach.operations, 1);
+    assert.equal(attach.files.length, 1);
+    const file = attach.files[0];
+    assert.match(file.name, /^bridge-prompt-.*\.txt$/);
+    assert.equal(file.name, "bridge-prompt-req_large_prompt.txt");
+    assert.match(file.type, /^text\/plain/);
+    assert.equal(file.size, prompt.length, "aucune troncature");
+    assert.equal(
+      await readFileText(window, file),
+      prompt,
+      "le fichier contient le prompt exact",
+    );
+
+    const expected = run(`largePromptInstruction(${JSON.stringify(file.name)})`);
+    assert.equal(observed.pastedText, expected);
+    assert.equal(observed.pasteCount, 1);
+    assert.equal(observed.inputCount, 0);
+    // Le gros prompt ne peut pas être à la fois joint ET collé.
+    assert.ok(observed.pastedText.length < 400);
+    assert.equal(observed.pastedText.includes("PROMPT-DEBUT"), false);
+    assert.equal(observed.pastedText.includes("zzzz"), false);
+  }
+
+  // F. Gros prompt + pièces jointes existantes : un seul DataTransfer, deux
+  // fichiers, aucune pièce jointe écrasée.
+  {
+    const prompt = "w".repeat(200_050);
+    const { window, attach, injected } = await runPromptInjection({
+      id: "req-mixed",
+      prompt,
+      files: [{ name: "rapport.csv", mime: "text/csv", data: Buffer.from("a,b\n1,2").toString("base64") }],
+    });
+
+    assert.equal(injected.prompt_as_file, true);
+    assert.equal(injected.attachment_count, 2);
+    assert.equal(attach.operations, 1, "une seule opération d'attachement");
+    assert.deepEqual(
+      attach.files.map((f) => f.name),
+      ["rapport.csv", "bridge-prompt-req-mixed.txt"],
+    );
+    assert.equal(await readFileText(window, attach.files[0]), "a,b\n1,2");
+    assert.equal(await readFileText(window, attach.files[1]), prompt);
+  }
+
+  // G. Plus aucune lecture d'`innerText` sur le composer.
+  {
+    const body = `<form>
+      <div id="prompt-textarea" contenteditable="true">bonjour</div>
+      <button aria-disabled="false" data-testid="send-button">Send</button>
+    </form>`;
+    const { window, run } = loadExtension(body);
+    const composer = window.document.querySelector("#prompt-textarea");
+    Object.defineProperty(composer, "innerText", {
+      get() {
+        throw new Error("innerText ne doit pas être lu");
+      },
+    });
+
+    const SEL = `document.querySelector("#prompt-textarea"), document.querySelector("button[data-testid='send-button']")`;
+    assert.equal(run(`composerHasText(document.querySelector("#prompt-textarea"))`), true);
+    const diagnostics = run(`(() => {
+      const snapshot = captureSubmissionSnapshot(${SEL});
+      const after = captureSubmissionSnapshot(${SEL});
+      return submissionDiagnostics(snapshot, "click", after);
+    })()`);
+    assert.equal(diagnostics.composer_was_non_empty, true);
+    assert.equal(diagnostics.composer_still_has_text, true);
+    assert.equal(diagnostics.content_script_version, "32");
+
+    // Le snapshot ne transporte plus le texte du composer, seulement un booléen.
+    const snapshot = run(`captureSubmissionSnapshot(${SEL})`);
+    assert.equal(snapshot.composerHasText, true);
+    assert.equal("composerText" in snapshot, false);
+
+    composer.textContent = "   \n  ";
+    assert.equal(run(`composerHasText(document.querySelector("#prompt-textarea"))`), false);
+  }
+
+  // H. `composer_cleared` reste détecté sans lire le texte du composer.
+  {
+    const body = `<form id="composer-form">
+      <div id="prompt-textarea" contenteditable="true">bonjour</div>
+      <button aria-disabled="false" data-testid="send-button">Send</button>
+    </form>`;
+    const { window, run } = loadExtension(body, "https://chatgpt.com/?temporary-chat=true");
+    useVirtualClock(window);
+    const composer = window.document.querySelector("#prompt-textarea");
+    Object.defineProperty(composer, "innerText", {
+      get() {
+        throw new Error("innerText ne doit pas être lu");
+      },
+    });
+    window.document
+      .querySelector("#composer-form")
+      .addEventListener("submit", (event) => {
+        event.preventDefault();
+        composer.textContent = "";
+      });
+
+    const signal = await run(`(async () => {
+      const composer = document.querySelector("#prompt-textarea");
+      const send = document.querySelector("button[data-testid='send-button']");
+      const before = captureSubmissionSnapshot(composer, send);
+      triggerComposerSubmission(composer, send);
+      return waitForSubmissionConfirmation(composer, send, before, "requestSubmit");
+    })()`);
+    assert.equal(signal, "composer_cleared");
+  }
+
+  console.log("prompt injection contract: ok");
 })().catch((err) => {
   console.error(err);
   process.exit(1);

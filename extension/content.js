@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "31";
+const VERSION = "32";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -145,6 +145,20 @@ const OBSERVED_ATTRIBUTES = [
 const SUBMISSION_CONFIRMATION_TIMEOUT_MS = 5000;
 const SUBMISSION_CONFIRMATION_FINAL_TIMEOUT_MS = 20000;
 const UPLOAD_TIMEOUT_MS = 120000; // upload des pièces jointes
+
+// Au-delà de ce volume, coller le prompt dans le contenteditable de ChatGPT
+// fait exploser l'activité ProseMirror/React : l'onglet monte à plusieurs Go,
+// le renderer ne répond plus et aucun heartbeat ne repart. Le prompt part donc
+// en pièce jointe texte et le composer ne reçoit qu'une courte consigne.
+// Le seuil porte sur les octets UTF-8, pas sur `text.length`.
+const LARGE_PROMPT_FILE_THRESHOLD_BYTES = 200_000;
+// Borne d'attente après le paste synthétique : le composer doit contenir
+// quelque chose, sinon l'éditeur a refusé le collage.
+const PROMPT_INSERT_VERIFY_TIMEOUT_MS = 2000;
+
+function utf8ByteLength(text) {
+  return new TextEncoder().encode(text).byteLength;
+}
 
 const SETTLE_MS = 2000; // fin UI confirmée
 const SETTLE_UNKNOWN_MS = 15000; // pas de signal UI fiable : prudence
@@ -462,10 +476,26 @@ function handleObservationTick(msg) {
   return woken;
 }
 
-function composerText(el) {
-  if (!el) return "";
-  if (el.tagName === "TEXTAREA" || el.tagName === "INPUT") return el.value || "";
-  return el.innerText || el.textContent || "";
+/**
+ * Le composer contient-il au moins un caractère non blanc ?
+ *
+ * Volontairement booléen : les boucles de confirmation n'ont besoin que de
+ * cette information, et lire `innerText` (ou même `textContent`) sur un
+ * contenteditable de plusieurs dizaines de kilo-octets déclenche un layout et
+ * reconstruit une chaîne énorme à chaque poll. Le TreeWalker s'arrête au
+ * premier nœud texte non vide et n'alloue rien.
+ */
+function composerHasText(el) {
+  if (!el) return false;
+  if (el.tagName === "TEXTAREA" || el.tagName === "INPUT") {
+    return /\S/.test(el.value || "");
+  }
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  let node;
+  while ((node = walker.nextNode())) {
+    if (/\S/.test(node.nodeValue || "")) return true;
+  }
+  return false;
 }
 
 function isSendButtonReady(button) {
@@ -621,7 +651,7 @@ function captureSubmissionSnapshot(composer, sendBtn) {
   return {
     userTurns: document.querySelectorAll(SELECTORS.user).length,
     assistantTurns: document.querySelectorAll(SELECTORS.assistant).length,
-    composerText: composerText(composer),
+    composerHasText: composerHasText(composer),
     sendState: {
       disabled: sendBtn?.disabled ?? null,
       ariaDisabled: sendBtn?.getAttribute("aria-disabled") ?? null,
@@ -671,8 +701,8 @@ function submissionDiagnostics(snapshot, method, after) {
     assistant_turns_after: after.assistantTurns,
     user_turns_before: snapshot.userTurns,
     user_turns_after: after.userTurns,
-    composer_was_non_empty: Boolean(snapshot.composerText.trim()),
-    composer_still_has_text: Boolean(after.composerText.trim()),
+    composer_was_non_empty: snapshot.composerHasText,
+    composer_still_has_text: after.composerHasText,
     send_before: snapshot.sendState,
     send_after: after.sendState,
     generation_before: {
@@ -698,7 +728,7 @@ async function waitForSubmissionConfirmation(composer, sendBtn, snapshot, method
     const after = captureSubmissionSnapshot(composer, sendBtn);
     let signal = null;
     if (after.userTurns > snapshot.userTurns) signal = "user_turn";
-    else if (!after.composerText.trim()) signal = "composer_cleared";
+    else if (!after.composerHasText) signal = "composer_cleared";
     else if (newSubmissionGenerationSignal(snapshot)) signal = "generation_signal";
     else if (after.assistantTurns > snapshot.assistantTurns) signal = "assistant_turn";
     if (signal) {
@@ -745,7 +775,7 @@ function firstAssistantWaitDiagnostics(
     assistant_turns_after: after.assistantTurns,
     user_turns_before: snapshot.userTurns,
     user_turns_after: after.userTurns,
-    composer_has_text: Boolean(after.composerText.trim()),
+    composer_has_text: after.composerHasText,
     send_enabled: after.sendState.ready,
     send_disabled: !after.sendState.ready,
     stop_visible: after.generation.stop,
@@ -862,41 +892,121 @@ async function waitForFirstAssistantTurn(
   }
 }
 
-/**
- * Écrit `text` dans le composer.
- * ProseMirror ignore les mutations directes du DOM : on passe par
- * `insertText`, qui produit la même séquence d'évènements qu'une vraie frappe.
- */
-function typePrompt(el, text) {
-  el.focus();
-  if (el.tagName === "TEXTAREA") {
-    const setter = Object.getOwnPropertyDescriptor(
-      HTMLTextAreaElement.prototype,
-      "value",
-    ).set;
-    setter.call(el, text);
-    el.dispatchEvent(new Event("input", { bubbles: true }));
-    return;
-  }
+/** Sélectionne tout le contenu du composer, cible du collage. */
+function selectComposerContents(el) {
   const range = document.createRange();
   range.selectNodeContents(el);
-  const sel = window.getSelection();
-  sel.removeAllRanges();
-  sel.addRange(range);
+  const selection = window.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
 
-  if (!document.execCommand("insertText", false, text)) {
-    // Repli : évènement paste synthétique (accepté par ProseMirror).
-    const dt = new DataTransfer();
-    dt.setData("text/plain", text);
-    el.dispatchEvent(
-      new ClipboardEvent("paste", {
-        clipboardData: dt,
-        bubbles: true,
-        cancelable: true,
-      }),
+/**
+ * Collage entièrement synthétique : `DataTransfer` + `ClipboardEvent`.
+ *
+ * Jamais `navigator.clipboard` — cela demanderait une permission, le focus de
+ * l'onglet, et écraserait le presse-papiers réel de l'utilisateur.
+ */
+function dispatchPromptPaste(el, text) {
+  const dataTransfer = new DataTransfer();
+  dataTransfer.setData("text/plain", text);
+  const event = new ClipboardEvent("paste", {
+    clipboardData: dataTransfer,
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+  });
+  el.dispatchEvent(event);
+}
+
+/**
+ * Écrit `text` dans le composer.
+ *
+ * Sur un contenteditable, l'insertion passe par UN SEUL évènement `paste`
+ * synthétique : ProseMirror le traite en une transaction unique. L'ancienne
+ * insertion par commande d'édition (`insertText`) produisait au contraire une
+ * avalanche de mutations DOM qui figeait le renderer sur les gros prompts —
+ * elle est définitivement supprimée, y compris en repli. Aucun découpage, et aucun
+ * second `input` émis à la main : l'éditeur émet le sien.
+ */
+async function typePrompt(el, text) {
+  el.focus();
+
+  if (el.tagName === "TEXTAREA" || el.tagName === "INPUT") {
+    const prototype =
+      el.tagName === "TEXTAREA"
+        ? HTMLTextAreaElement.prototype
+        : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+    if (!setter) {
+      throw new BridgeError(
+        "bridge_prompt_injection_failed",
+        "setter natif du composer introuvable",
+      );
+    }
+    setter.call(el, text);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    return "native_value";
+  }
+
+  selectComposerContents(el);
+  dispatchPromptPaste(el, text);
+
+  const inserted = await waitFor(
+    () => composerHasText(el),
+    PROMPT_INSERT_VERIFY_TIMEOUT_MS,
+    "paste du prompt non appliqué",
+  )
+    .then(() => true)
+    .catch(() => false);
+
+  if (!inserted) {
+    throw new BridgeError(
+      "bridge_prompt_injection_failed",
+      "le composer ChatGPT n'a pas accepté le collage du prompt",
     );
   }
-  el.dispatchEvent(new Event("input", { bubbles: true }));
+
+  return "synthetic_paste";
+}
+
+/** Nom de fichier sûr et déterministe dérivé de l'identifiant du run. */
+function safePromptFileId(id) {
+  return String(id || "run")
+    .replace(/[^A-Za-z0-9._-]/g, "_")
+    .slice(0, 64);
+}
+
+/**
+ * Fichier texte contenant EXACTEMENT le prompt : aucune troncature, aucune
+ * normalisation, aucun en-tête ajouté.
+ */
+function createLargePromptFile(id, prompt) {
+  return new File([prompt], `bridge-prompt-${safePromptFileId(id)}.txt`, {
+    type: "text/plain;charset=utf-8",
+  });
+}
+
+/**
+ * Consigne courte déposée dans le composer quand le prompt part en fichier.
+ * Elle ne contient jamais le prompt ni un extrait de celui-ci.
+ */
+function largePromptInstruction(filename) {
+  return (
+    `Le message utilisateur complet est joint dans le fichier "${filename}". ` +
+    "Lis ce fichier intégralement et traite son contenu comme le message " +
+    "utilisateur auquel tu dois répondre."
+  );
+}
+
+/** Décode une pièce jointe sérialisée (base64) venant du serveur. */
+function decodeAttachmentFile(f) {
+  const bin = atob(f.data);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new File([bytes], f.name, {
+    type: f.mime || "application/octet-stream",
+  });
 }
 
 /**
@@ -904,19 +1014,14 @@ function typePrompt(el, text) {
  * ChatGPT écoute un `input[type=file]` caché : on lui injecte un FileList
  * fabriqué via DataTransfer, seule façon d'alimenter un input file par script.
  */
-async function attachFiles(files) {
+async function attachFileObjects(fileObjects) {
+  if (!fileObjects.length) return;
+
   const input = $(SELECTORS.fileInput);
   if (!input) throw new Error("champ d'upload introuvable sur la page");
 
   const dt = new DataTransfer();
-  for (const f of files) {
-    const bin = atob(f.data);
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    dt.items.add(
-      new File([bytes], f.name, { type: f.mime || "application/octet-stream" }),
-    );
-  }
+  for (const file of fileObjects) dt.items.add(file);
 
   input.files = dt.files;
   input.dispatchEvent(new Event("change", { bubbles: true }));
@@ -931,6 +1036,19 @@ async function attachFiles(files) {
       }),
     );
   }
+}
+
+/**
+ * Pièces jointes de la requête + fichiers fabriqués localement (gros prompt),
+ * dans UN SEUL `DataTransfer` : deux opérations d'attachement distinctes
+ * déclencheraient deux uploads et pourraient écraser le premier lot.
+ */
+async function attachFiles(files, extraFiles = []) {
+  const fileObjects = [
+    ...(files || []).map(decodeAttachmentFile),
+    ...extraFiles,
+  ];
+  await attachFileObjects(fileObjects);
 }
 
 /**
@@ -2271,11 +2389,41 @@ async function handlePrompt({
       baselineTurn = document.querySelectorAll(SELECTORS.assistant)[before - 1];
     }
 
-    if (files && files.length) await attachFiles(files);
-    if (prompt) typePrompt(composer, prompt);
-    if (!composerText(composer).trim()) {
+    // Un prompt trop gros n'entre JAMAIS dans le composer : il part en pièce
+    // jointe texte et le composer ne reçoit que la consigne de lecture. Les
+    // deux branches sont exclusives — `composerPrompt` est réassigné, jamais
+    // concaténé au prompt.
+    const promptBytes = prompt ? utf8ByteLength(prompt) : 0;
+    const promptAsFile =
+      Boolean(prompt) && promptBytes > LARGE_PROMPT_FILE_THRESHOLD_BYTES;
+
+    let composerPrompt = prompt || "";
+    const extraFiles = [];
+    if (promptAsFile) {
+      const promptFile = createLargePromptFile(id, prompt);
+      extraFiles.push(promptFile);
+      composerPrompt = largePromptInstruction(promptFile.name);
+    }
+
+    const hasAttachments = Boolean(files?.length) || extraFiles.length > 0;
+    if (hasAttachments) await attachFiles(files || [], extraFiles);
+
+    let injectionMethod = null;
+    if (composerPrompt) {
+      injectionMethod = await typePrompt(composer, composerPrompt);
+    }
+    if (!composerHasText(composer)) {
       throw new BridgeError("bridge_ui_timeout", "composer vide avant la soumission");
     }
+    // Volumétrie uniquement : ni le prompt, ni le contenu du fichier, ni le
+    // DOM du composer ne doivent apparaître dans un log.
+    console.log("bridge_run_phase", {
+      phase: "prompt_injected",
+      prompt_bytes: promptBytes,
+      prompt_as_file: promptAsFile,
+      injection_method: injectionMethod,
+      attachment_count: (files?.length || 0) + extraFiles.length,
+    });
 
     // Le bouton d'envoi ne devient actif qu'après le rendu de la saisie — et,
     // s'il y a des pièces jointes, qu'une fois leur upload terminé (bien plus long).
@@ -2284,8 +2432,8 @@ async function handlePrompt({
         const b = $(SELECTORS.send);
         return isSendButtonReady(b) ? b : null;
       },
-      files && files.length ? UPLOAD_TIMEOUT_MS : 8000,
-      files && files.length
+      hasAttachments ? UPLOAD_TIMEOUT_MS : 8000,
+      hasAttachments
         ? "upload des pièces jointes non terminé"
         : "bouton d'envoi jamais actif",
     );
