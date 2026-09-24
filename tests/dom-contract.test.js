@@ -143,15 +143,34 @@ function loadPopup() {
       vm.runInContext("renderDiagnostic(globalThis.__raw)", context);
       return JSON.parse(vm.runInContext("JSON.stringify(diagnostic)", context));
     },
+    structure: (raw, tabId = null, target = null) => {
+      window.__raw = raw;
+      window.__tab = tabId;
+      window.__target = target;
+      vm.runInContext(
+        "globalThis.__structure = safeResponseStructure(globalThis.__raw, globalThis.__tab, globalThis.__target)",
+        context,
+      );
+      return JSON.parse(
+        vm.runInContext("JSON.stringify(globalThis.__structure)", context),
+      );
+    },
     text: (id) => window.document.getElementById(id).textContent,
   };
 }
 
 const SECRET = "TOP_SECRET_USER_PROMPT_42";
-function rawReport({ composer = {}, send = {}, connection = {}, surface = {}, diagnostic_target = {} } = {}) {
+function rawReport({
+  composer = {},
+  send = {},
+  connection = {},
+  surface = {},
+  diagnostic_target = {},
+  response_locator = {},
+} = {}) {
   return {
     ok: true,
-    content_script_version: "36",
+    content_script_version: "37",
     tab_id: 7,
     diagnostic_target: { source: "generic_chatgpt_tab", bridge_owned: false, ...diagnostic_target },
     extension_state: "active",
@@ -206,6 +225,22 @@ function rawReport({ composer = {}, send = {}, connection = {}, surface = {}, di
       same_form_as_composer: true,
       label: SECRET,
       ...send,
+    },
+    response_locator: {
+      conversation_surface: true,
+      surface_strategy: "composer_main",
+      strategy: "markdown_root_delta",
+      baseline_root_count: 0,
+      current_root_count: 1,
+      candidate_found: true,
+      candidate_root_tag: "DIV",
+      markdown_root: true,
+      inline_leaf_count: 46,
+      ambiguity_count: 0,
+      // Champs hors contrat : ne doivent jamais apparaître dans le rapport.
+      element: SECRET,
+      text: SECRET,
+      ...response_locator,
     },
   };
 }
@@ -301,6 +336,219 @@ function rawReport({ composer = {}, send = {}, connection = {}, surface = {}, di
     "tab_id",
     "websocket_state",
   ]);
+}
+
+// 4. Response locator : le rapport « un clic » expose la surface, la stratégie
+//    et les comptages de réponse — jamais un contenu, jamais un nœud.
+{
+  const popup = loadPopup();
+  const report = popup.render(rawReport({}));
+  assert.deepEqual(Object.keys(report.response_locator).sort(), [
+    "ambiguity_count",
+    "baseline_root_count",
+    "candidate_found",
+    "candidate_root_tag",
+    "conversation_surface",
+    "current_root_count",
+    "inline_leaf_count",
+    "markdown_root",
+    "strategy",
+    "surface_strategy",
+  ]);
+  assert.equal(popup.text("surface-status"), "OK (composer_main)");
+  assert.equal(popup.text("response-strategy"), "markdown_root_delta");
+  assert.equal(popup.text("baseline-roots"), "0");
+  assert.equal(popup.text("current-roots"), "1");
+  assert.equal(popup.text("candidate-status"), "FOUND");
+  assert.equal(popup.text("markdown-root"), "YES");
+  assert.equal(popup.text("inline-leaves"), "46");
+  assert.equal(JSON.stringify(report).includes(SECRET), false);
+
+  const ambiguous = popup.render(rawReport({
+    response_locator: {
+      candidate_found: false,
+      ambiguity_count: 2,
+      current_root_count: 2,
+    },
+  }));
+  assert.equal(popup.text("candidate-status"), "AMBIGUOUS");
+  assert.equal(popup.text("current-roots"), "2");
+  assert.equal(ambiguous.response_locator.ambiguity_count, 2);
+
+  const drifted = popup.render(rawReport({
+    response_locator: {
+      conversation_surface: false,
+      surface_strategy: null,
+      strategy: null,
+      candidate_found: false,
+      markdown_root: false,
+      current_root_count: 0,
+    },
+  }));
+  assert.equal(popup.text("surface-status"), "ABSENTE");
+  assert.equal(popup.text("response-strategy"), "—");
+  assert.equal(popup.text("candidate-status"), "NONE");
+  assert.equal(popup.text("markdown-root"), "NO");
+
+  // Valeur hors contrat (texte injecté, nœud, stratégie inconnue) : jamais
+  // recopiée, et les comptages restent bornés.
+  const injected = popup.render(rawReport({
+    response_locator: {
+      strategy: SECRET,
+      surface_strategy: SECRET,
+      candidate_root_tag: SECRET,
+      current_root_count: SECRET,
+      inline_leaf_count: 100000,
+    },
+  }));
+  assert.equal(injected.response_locator.strategy, null);
+  assert.equal(injected.response_locator.surface_strategy, null);
+  assert.equal(injected.response_locator.candidate_root_tag, null);
+  assert.equal(injected.response_locator.current_root_count, 0);
+  assert.equal(injected.response_locator.inline_leaf_count, 999);
+  assert.equal(JSON.stringify(injected).includes(SECRET), false);
+
+  // Échec du content script : la section retombe à zéro, sans contenu.
+  const failed = popup.render({
+    ok: false,
+    error: "content_script_unavailable",
+    response_locator: { strategy: SECRET },
+  });
+  assert.equal(popup.text("candidate-status"), "NONE");
+  assert.equal(popup.text("surface-status"), "—");
+  assert.equal(JSON.stringify(failed).includes(SECRET), false);
+}
+
+// 5. Snapshot structurel borné (« Copy response structure ») : liste blanche
+//    fermée, aucune propriété textuelle, aucune clé hors contrat.
+{
+  const popup = loadPopup();
+  const depthChain = (levels) => {
+    let node = { tag: "SPAN", class_tokens: ["inline-markdown"], data: {} };
+    for (let level = 0; level < levels; level += 1) {
+      node = { tag: "DIV", class_tokens: [`depth-${level}`], data: {}, children: [node] };
+    }
+    return node;
+  };
+  const node = {
+    tag: "DIV",
+    class_tokens: ["MarkdownRoot-AbCd12", "group", "flex"],
+    role: null,
+    data_testid: "conversation-turn-3",
+    data: { testid: "conversation-turn-3", state: "ready", unknown_key: SECRET },
+    has_message_id: true,
+    depth: 0,
+    children_count: 1,
+    children: [depthChain(9)],
+    width: 640,
+    height: 120,
+    visible: true,
+    // Champs hors contrat : jamais recopiés.
+    text: SECRET,
+    innerText: SECRET,
+    textContent: SECRET,
+    innerHTML: SECRET,
+    prompt: SECRET,
+    element: SECRET,
+  };
+  const structure = popup.structure(
+    {
+      ok: true,
+      content_script_version: "37",
+      conversation_surface: { found: true, strategy: "composer_main", node },
+      strategy: "markdown_root_delta",
+      markdown_root_matches: 1,
+      semantic_assistant_matches: 0,
+      inline_leaf_matches: 1,
+      roots: [{ strategy: "markdown_root_delta", node }],
+      prompt: SECRET,
+      response_text: SECRET,
+    },
+    7,
+    { source: "inflight", bridge_owned: true },
+  );
+  assert.equal(structure.ok, true);
+  assert.equal(structure.content_script_version, "37");
+  assert.equal(structure.tab_id, 7);
+  assert.equal(structure.diagnostic_target.source, "inflight");
+  assert.equal(structure.diagnostic_target.bridge_owned, true);
+  assert.equal(structure.conversation_surface.found, true);
+  assert.equal(structure.conversation_surface.strategy, "composer_main");
+  assert.equal(structure.strategy, "markdown_root_delta");
+  assert.equal(structure.markdown_root_matches, 1);
+  assert.equal(structure.inline_leaf_matches, 1);
+  assert.equal(structure.roots.length, 1);
+
+  const root = structure.roots[0].node;
+  assert.deepEqual(Object.keys(root).sort(), [
+    "children",
+    "children_count",
+    "class_tokens",
+    "data",
+    "data_testid",
+    "depth",
+    "has_message_id",
+    "height",
+    "role",
+    "tag",
+    "visible",
+    "width",
+  ]);
+  assert.equal(root.tag, "DIV");
+  assert.equal(root.visible, true);
+  assert.equal(root.has_message_id, true);
+  assert.deepEqual(Object.keys(root.data).sort(), ["state", "testid"]);
+  let deepest = root;
+  while (deepest.children.length) deepest = deepest.children[0];
+  assert.ok(deepest.depth <= 6, `profondeur bornée, vue ${deepest.depth}`);
+
+  // Un signal de dérive illisible reste un rapport borné, jamais un rejet brut.
+  const drifted = popup.structure(
+    { ok: true, roots: [{ strategy: SECRET, node: { tag: SECRET, text: SECRET } }] },
+    7,
+    { source: "generic_chatgpt_tab", bridge_owned: false },
+  );
+  assert.equal(drifted.strategy, null);
+  assert.equal(drifted.roots.length, 1);
+  assert.equal(drifted.roots[0].strategy, null);
+  assert.equal(drifted.roots[0].node.tag, null);
+
+  for (const report of [structure, drifted]) {
+    const json = JSON.stringify(report);
+    assert.equal(json.includes(SECRET), false, "aucun contenu dans le snapshot");
+    for (const forbidden of ["innerText", "textContent", "innerHTML"]) {
+      assert.equal(json.includes(forbidden), false, `snapshot structurel : ${forbidden}`);
+    }
+  }
+}
+
+// 6. Le worker et le popup partagent littéralement le même bloc de liste
+//    blanche structurelle : il ne peut pas dériver de l'un à l'autre.
+{
+  const block = (source) => {
+    const start = source.indexOf("function structureToken(");
+    assert.notEqual(start, -1, "bloc de liste blanche structurelle introuvable");
+    const marker = source.indexOf("function safeResponseStructure(");
+    assert.notEqual(marker, -1, "safeResponseStructure introuvable");
+    const end = source.indexOf("\n}\n", marker);
+    assert.notEqual(end, -1, "fin de safeResponseStructure introuvable");
+    return source.slice(start, end + 3).replace(/\s+/g, " ").trim();
+  };
+  assert.equal(block(BACKGROUND), block(POPUP), "liste blanche structurelle divergente");
+  assert.ok(BACKGROUND.includes("async function handleResponseStructure()"));
+  assert.ok(POPUP.includes('type: "response_structure"'));
+  assert.ok(POPUP_HTML.includes('id="copy-response-structure"'));
+  for (const id of [
+    "surface-status",
+    "response-strategy",
+    "baseline-roots",
+    "current-roots",
+    "candidate-status",
+    "markdown-root",
+    "inline-leaves",
+  ]) {
+    assert.ok(POPUP_HTML.includes(`id="${id}"`), `popup.html : ${id} manquant`);
+  }
 }
 
 console.log("dom contract + popup diagnostic contract: ok");

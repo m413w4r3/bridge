@@ -1232,10 +1232,10 @@ class _SelectorDriftExtension(FakeExtension):
                     "composer_strategy": "structural_fallback",
                     "composer_selector": "[contenteditable='true'][role='textbox']",
                     "composer_candidate_count": 0,
-                    "content_script_version": "36",
+                    "content_script_version": "37",
                     "dom_health": {
                         "ok": True,
-                        "content_script_version": "36",
+                        "content_script_version": "37",
                         "surface": {
                             "origin_ok": True,
                             "pathname": "/",
@@ -1296,7 +1296,7 @@ async def test_pre_submission_selector_drift_is_a_typed_502_with_dom_health(
     assert error["retryable"] is True
     details = error["details"]
     assert details["ui_contract_error"] == "composer_missing"
-    assert details["dom_health"]["content_script_version"] == "36"
+    assert details["dom_health"]["content_script_version"] == "37"
     # `_safe_diagnostics` drops null leaves (tag/role) and keeps the rest.
     assert details["dom_health"]["composer"] == {
         "status": "missing",

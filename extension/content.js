@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "36";
+const VERSION = "37";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -116,6 +116,38 @@ const SELECTORS = {
     "button[aria-label*='Temporary chat']",
     "button[aria-label*='temporaire']",
   ],
+
+  // --- Réponse (ResponseRoot) --- //
+  // La nouvelle UI ne pose plus ni rôle, ni message id, ni tour : le contenu
+  // de la réponse est rendu dans un div dont UNE CLASSE COMMENCE par ce
+  // préfixe. Le suffixe est généré : il ne doit jamais être écrit en dur dans
+  // un sélecteur (`.MarkdownRoot-rZKhxa`). Le sélecteur ci-dessous n'est qu'un
+  // pré-filtre borné ; c'est `isMarkdownRootElement()` qui tranche sur les
+  // tokens de classe.
+  responseRootClassPrefix: "MarkdownRoot-",
+  markdownRootCandidate: "[class*='MarkdownRoot-']",
+  // Feuilles inline : preuve qu'un ResponseRoot porte du contenu
+  // conversationnel, JAMAIS une réponse en soi (jamais « le dernier span »).
+  inlineMarkdown: ["[class*='inline-markdown']", "[class*='InlineMarkdown']"],
+  // Chrome applicatif : en-tête, navigation, panneaux, menus, popovers,
+  // modales. Rien de tout cela n'est une conversation — le diagnostic réel a
+  // déjà montré `data-testid="app-shell-header-context-menu-surface"` sur un
+  // nœud qui ne doit jamais être pris pour une réponse.
+  nonConversationSurface: [
+    "header",
+    "nav",
+    "aside",
+    "footer",
+    "[role='dialog']",
+    "[role='menu']",
+    "[role='listbox']",
+    "[role='toolbar']",
+    "[role='tooltip']",
+    "[data-testid*='menu']",
+    "[data-testid*='modal']",
+    "[data-testid*='popover']",
+    "[data-testid*='header']",
+  ],
 };
 
 // Libellés reconnus comme « recherche web » dans un menu d'outils (FR/EN).
@@ -203,6 +235,34 @@ const FIRST_ASSISTANT_ACTIVITY_STALL_MS = 300000;
 //    texte n'est PAS une preuve d'échec et ce garde-fou est désarmé ; la borne
 //    dure redevient alors le `bridge_total_timeout` du serveur.
 const WATCHED_TURN_ACTIVE_SIGNAL_STALL_MS = 300000;
+
+// Le contrat de réponse (ResponseRoot) a ses propres bornes, distinctes de
+// celles de l'activité :
+//
+//   - `RESPONSE_CONTRACT_DRIFT_MS` : des feuilles `inline-markdown` sont
+//     visibles alors qu'AUCUN ResponseRoot n'est résolvable. C'est la
+//     signature exacte d'un nouveau changement d'UI : au-delà de cette
+//     fenêtre bornée, on échoue en `bridge_response_contract_drift` — la borne
+//     d'activité de 300 s, elle, ne dit rien de la structure.
+//   - `RESPONSE_AMBIGUITY_HOLD_MS` : deux ResponseRoots nouveaux simultanés.
+//     React peut monter deux nœuds le temps d'une frame ; l'ambiguïté doit
+//     persister avant de conclure. Aucun choix arbitraire n'est jamais fait.
+const RESPONSE_CONTRACT_DRIFT_MS = 20000;
+const RESPONSE_AMBIGUITY_HOLD_MS = 1500;
+// Bornes de taille : une signature ou un snapshot structurel ne doivent jamais
+// pouvoir être gonflés par une page pathologique.
+const RESPONSE_SIGNATURE_MAX_TOKENS = 6;
+const RESPONSE_SIGNATURE_MAX_TOKEN_LENGTH = 40;
+const MAX_INLINE_LEAF_COUNT = 999;
+const STRUCTURE_LIMITS = {
+  max_depth: 6,
+  max_nodes: 200,
+  max_children: 40,
+  max_roots: 4,
+  max_class_tokens: 8,
+  max_token_length: 40,
+  max_value_length: 64,
+};
 
 let currentJob = null;
 const claimedRequestIds = new Set();
@@ -406,6 +466,27 @@ function inspectSendButton(composer, root = document) {
   };
 }
 
+/**
+ * État du contrat de réponse pour le diagnostic, sans contenu : surface,
+ * comptages de roots et dernière décision du locator pendant un run.
+ */
+function responseLocatorHealth() {
+  const collected = resolveResponseRoots();
+  const last = lastResponseLocatorDiagnostic;
+  return {
+    conversation_surface: Boolean(collected.surface_element),
+    surface_strategy: collected.surface_strategy || null,
+    strategy: last?.strategy ?? null,
+    baseline_root_count: last?.baseline_root_count ?? collected.markdown.length,
+    current_root_count: collected.markdown.length,
+    candidate_found: last?.candidate_found === true,
+    candidate_root_tag: last?.candidate_root_tag ?? null,
+    markdown_root: last ? last.markdown_root : collected.markdown.length > 0,
+    inline_leaf_count: collected.inline_leaf_count,
+    ambiguity_count: last?.ambiguity_count ?? 0,
+  };
+}
+
 /** Bounded UI snapshot. This function deliberately never reads page text. */
 function domHealthSnapshot() {
   let url = null;
@@ -473,6 +554,7 @@ function domHealthSnapshot() {
       ),
       form_found: Boolean(composer.element?.closest("form")),
     },
+    response_locator: responseLocatorHealth(),
     send: {
       // dom_health est un diagnostic read-only : un composer vide n'affiche
       // pas toujours Send. Le runtime, lui, garde son attente post-injection.
@@ -1126,18 +1208,24 @@ async function waitForSubmissionConfirmation(composer, sendBtn, snapshot, method
   throw error;
 }
 
-function firstAssistantWaitDiagnostics(
+/**
+ * Diagnostic d'attente du premier ResponseRoot, sans contenu : comptages,
+ * booléens et dernière décision du locator.
+ */
+function responseWaitDiagnostics(
   composer,
   sendBtn,
   snapshot,
-  before,
+  responseBaseline,
   startedAt,
+  candidate,
 ) {
   const after = captureSubmissionSnapshot(composer, sendBtn);
+  const collected = resolveResponseRoots();
   return {
     content_script_version: VERSION,
     elapsed_ms: Math.max(0, Date.now() - startedAt),
-    assistant_turns_before: before,
+    assistant_turns_before: snapshot.assistantTurns,
     assistant_turns_after: after.assistantTurns,
     user_turns_before: snapshot.userTurns,
     user_turns_after: after.userTurns,
@@ -1148,32 +1236,87 @@ function firstAssistantWaitDiagnostics(
     reasoning_visible: after.generation.reasoning,
     streaming_generation_signal_visible: after.generation.present,
     streaming_signal_sources: streamingSignalSources(document),
+    response_locator: responseLocatorDiagnostic(candidate),
+    conversation_surface_found: Boolean(collected.surface_element),
+    conversation_surface_strategy: collected.surface_strategy || null,
+    baseline_root_count: responseBaseline?.markdownRootCount || 0,
+    current_root_count: collected.markdown.length,
+    inline_leaf_count: collected.inline_leaf_count,
   };
 }
 
 /**
- * Waits for the first assistant turn created by the already-confirmed send.
- *
- * This is deliberately not a wall-clock appearance timeout. ChatGPT can spend
- * several minutes in web research or reasoning before it creates the visible
- * assistant turn.
- *
- * Activity is a *transition* from the last observed signal state, never a
- * repeated comparison against the pre-submission snapshot. That distinction
- * matters for two symmetric failures:
- *   - a signal already visible before Send never counts (it never transitions);
- *   - a signal that appears after Send and then freezes counts exactly once,
- *     so a stuck UI still reaches FIRST_ASSISTANT_ACTIVITY_STALL_MS instead of being kept
- *     alive forever by its own persistence.
- * Real activity — appearance, disappearance, signature/state change, a new
- * element — keeps refreshing the deadline for as long as the UI truly moves.
+ * Détails sûrs d'une dérive de contrat de réponse : comptages et booléens
+ * uniquement — jamais un caractère de contenu, jamais un identifiant externe.
  */
-async function waitForFirstAssistantTurn(
+function responseContractDriftDetails(reason, candidate) {
+  const collected = resolveResponseRoots();
+  const strategies = [];
+  if (collected.semantic.length) strategies.push("semantic_assistant");
+  if (collected.markdown.length) strategies.push("markdown_root_delta");
+  return {
+    reason,
+    response_root_strategies: strategies,
+    semantic_assistant_matches: collected.semantic.length,
+    markdown_root_matches: collected.markdown.length,
+    inline_leaf_matches: collected.inline_leaf_count,
+    baseline_root_count: candidate?.baseline_root_count ?? 0,
+    current_root_count: candidate?.current_root_count ?? collected.markdown.length,
+    conversation_surface_found: Boolean(collected.surface_element),
+    conversation_surface_strategy: collected.surface_strategy || null,
+    candidate_root_count: candidate?.candidate_count ?? 0,
+    submission_state: "post_submission",
+    content_script_version: VERSION,
+  };
+}
+
+/**
+ * Contrat de réponse illisible après un Send confirmé : deux candidats
+ * simultanés impossibles à départager, ou des feuilles `inline-markdown` sans
+ * ResponseRoot résolvable. Fail closed : aucun choix arbitraire, aucune
+ * resoumission, et surtout pas de réponse inventée.
+ */
+function responseContractDriftError(reason, candidate) {
+  const details = responseContractDriftDetails(reason, candidate);
+  console.warn("bridge_response_contract_drift", details);
+  const error = new BridgeError(
+    "bridge_response_contract_drift",
+    `contrat DOM de la réponse non résolu après la soumission (${reason})`,
+  );
+  error.diagnostics = details;
+  return error;
+}
+
+/**
+ * Attend le premier ResponseRoot créé par le Send déjà confirmé.
+ *
+ * Ce n'est délibérément pas une borne murale d'apparition : ChatGPT peut
+ * passer plusieurs minutes en recherche web ou en réflexion avant de rendre
+ * quoi que ce soit de lisible.
+ *
+ * L'activité est une *transition* depuis le dernier état de signaux observé,
+ * jamais une comparaison répétée avec le snapshot d'avant-Send. Cette
+ * distinction compte pour deux défaillances symétriques :
+ *   - un signal déjà visible avant le Send n'est jamais compté (il n'a pas de
+ *     transition) ;
+ *   - un signal apparu après le Send puis figé est compté exactement une fois,
+ *     donc une UI bloquée atteint bien FIRST_ASSISTANT_ACTIVITY_STALL_MS au
+ *     lieu d'être maintenue en vie par sa propre persistance.
+ * Un vrai mouvement (apparition, disparition, changement d'état, nouveau
+ * nœud) repousse la borne aussi longtemps que l'UI bouge réellement.
+ *
+ * Le candidat vient du DELTA structurel : la stratégie historique d'abord,
+ * puis le delta des MarkdownRoots contre le baseline d'avant-Send. Deux
+ * dérives de contrat sont détectées ici, bornées et fail closed :
+ *   - ambiguïté persistante : deux nouveaux ResponseRoots simultanés ;
+ *   - feuilles inline visibles mais aucun ResponseRoot résolvable.
+ */
+async function waitForResponseCandidate(
   job,
   composer,
   sendBtn,
   submissionSnapshot,
-  assistantTurnsBefore,
+  responseBaseline,
   run,
 ) {
   const startedAt = Date.now();
@@ -1181,10 +1324,14 @@ async function waitForFirstAssistantTurn(
   let lastHeartbeatAt = startedAt;
   let lastObservationAt = startedAt;
   let observationsSinceActivity = 0;
-  // Baseline = the state observed at submission time, so a pre-existing signal
-  // is already "seen" and cannot register as an appearance.
+  // Baseline = l'état observé à la soumission : un signal déjà présent est donc
+  // déjà « vu » et ne peut pas être compté comme une apparition.
   let observedSignals = submissionSnapshot.generation;
-  const watcher = createDomWatcher("first_assistant_turn");
+  // Fenêtres bornées propres au contrat de réponse (cf. constantes).
+  let ambiguousSince = null;
+  let unresolvedLeavesSince = null;
+  let candidate = null;
+  const watcher = createDomWatcher("response_root");
 
   try {
     while (!job.aborted) {
@@ -1213,8 +1360,36 @@ async function waitForFirstAssistantTurn(
       }
       lastObservationAt = now;
 
-      const turns = document.querySelectorAll(SELECTORS.assistant);
-      if (turns.length > assistantTurnsBefore) return turns[turns.length - 1];
+      candidate = resolveResponseCandidate(responseBaseline);
+      recordResponseLocator(candidate);
+      if (candidate.status === "found") return candidate;
+
+      if (candidate.status === "ambiguous") {
+        if (ambiguousSince === null) ambiguousSince = now;
+        if (now - ambiguousSince >= RESPONSE_AMBIGUITY_HOLD_MS) {
+          throw responseContractDriftError("ambiguous_response_roots", candidate);
+        }
+      } else {
+        ambiguousSince = null;
+      }
+
+      // Le contenu conversationnel est là (feuilles inline visibles) mais aucun
+      // ResponseRoot n'est résolvable : c'est un changement d'UI, pas une
+      // attente. Borné, donc : fail closed avec un diagnostic attribuable.
+      if (
+        candidate.inline_leaf_count > 0 &&
+        candidate.raw_candidate_count === 0
+      ) {
+        if (unresolvedLeavesSince === null) unresolvedLeavesSince = now;
+        if (now - unresolvedLeavesSince >= RESPONSE_CONTRACT_DRIFT_MS) {
+          throw responseContractDriftError(
+            "inline_markdown_without_response_root",
+            candidate,
+          );
+        }
+      } else {
+        unresolvedLeavesSince = null;
+      }
 
       const currentSignals = currentSubmissionGenerationSignals();
       if (generationSignalTransition(observedSignals, currentSignals)) {
@@ -1232,15 +1407,16 @@ async function waitForFirstAssistantTurn(
       ) {
         const error = new BridgeError(
           "bridge_ui_timeout",
-          "aucun tour assistant après la soumission du prompt",
+          "aucune réponse rendue après la soumission du prompt",
         );
         error.diagnostics = {
-          ...firstAssistantWaitDiagnostics(
+          ...responseWaitDiagnostics(
             composer,
             sendBtn,
             submissionSnapshot,
-            assistantTurnsBefore,
+            responseBaseline,
             startedAt,
+            candidate,
           ),
           page_state: pageStateDiagnostics(now, {
             watcher,
@@ -1560,6 +1736,597 @@ function completionState(turn) {
   });
 }
 
+// --------------------------------------------------------------------------- //
+// Localisation de la réponse : ResponseRoot
+//
+// Un ResponseRoot est « le contenu rendu de la réponse produite APRÈS la
+// soumission du prompt ». Deux stratégies le résolvent, dans cet ordre :
+//
+//   1. `semantic_assistant`  — UI historique :
+//      `[data-message-author-role="assistant"]` et son answer root historique
+//      (`answerRoot`). Ce sélecteur est intrinsèquement sémantique (il ne peut
+//      désigner qu'un message), il garde donc son périmètre d'origine.
+//   2. `markdown_root_delta` — UI observée en production : ni
+//      `data-message-author-role`, ni `data-message-id`, ni `data-turn`, ni
+//      `conversation-turn`, ni `<article>`. Le contenu vit dans un `div` dont
+//      une classe COMMENCE par « MarkdownRoot- » (suffixe généré : jamais
+//      écrit en dur dans un sélecteur). L'identité du candidat vient d'un
+//      DELTA structurel mesuré contre le baseline capturé juste avant le Send —
+//      jamais « le dernier MarkdownRoot de la page ».
+//
+// Une réponse reste UN seul ResponseRoot, quel que soit le nombre de feuilles
+// `inline-markdown` / `InlineMarkdown…` qu'elle contient : ces feuilles ne sont
+// qu'une preuve de contenu conversationnel, jamais une réponse.
+// --------------------------------------------------------------------------- //
+
+/** Un token de classe commence-t-il par `prefix` ? (suffixe généré toléré) */
+function hasClassPrefix(el, prefix) {
+  if (!el || !el.classList) return false;
+  for (const token of el.classList) {
+    if (token.startsWith(prefix)) return true;
+  }
+  return false;
+}
+
+/** `div MarkdownRoot-*` : content root d'une réponse dans la nouvelle UI. */
+function isMarkdownRootElement(el) {
+  return (
+    el?.nodeType === Node.ELEMENT_NODE &&
+    hasClassPrefix(el, SELECTORS.responseRootClassPrefix)
+  );
+}
+
+/** Tout élément du chrome applicatif : jamais une conversation. */
+function isApplicationChrome(el) {
+  if (!el?.closest) return false;
+  for (const selector of SELECTORS.nonConversationSurface) {
+    if (el.closest(selector)) return true;
+  }
+  return false;
+}
+
+/** Composer courant (jamais une référence gardée) : le périmètre interdit. */
+function composerScope(root = document) {
+  const composer = inspectComposer(root).element;
+  if (!composer) return null;
+  return composer.closest("form") || composer;
+}
+
+function isInsideComposer(el, root = document) {
+  const scope = composerScope(root);
+  return Boolean(scope && (el === scope || scope.contains(el)));
+}
+
+/** Premier ancêtre scrollable : la zone de transcript réellement rendue. */
+function nearestScrollableAncestor(el, maxDepth = 12) {
+  let node = el?.parentElement || null;
+  let depth = 0;
+  while (node && depth < maxDepth) {
+    const style = globalThis.getComputedStyle?.(node);
+    if (style?.overflowY === "auto" || style?.overflowY === "scroll") {
+      return node;
+    }
+    node = node.parentElement;
+    depth += 1;
+  }
+  return null;
+}
+
+/**
+ * Surface de conversation : la plus petite zone réellement reliée au composer.
+ * Stratégie bornée, du plus précis au plus large — jamais un scan aveugle de
+ * la page. Le chrome applicatif (header/nav/aside/menus/popovers/modales) ne
+ * peut jamais devenir une surface.
+ */
+function resolveConversationSurface(root = document) {
+  const usable = (element, strategy) => {
+    if (!element || element.nodeType !== Node.ELEMENT_NODE) return null;
+    if (isApplicationChrome(element)) return null;
+    if (!isVisibleElement(element)) return null;
+    return { element, strategy };
+  };
+  const composer = inspectComposer(root).element;
+  if (composer) {
+    const main = usable(composer.closest("main"), "composer_main");
+    if (main) return main;
+    const scroller = usable(
+      nearestScrollableAncestor(composer),
+      "composer_scroll_container",
+    );
+    if (scroller) return scroller;
+    const form = composer.closest("form");
+    const parent = usable(
+      form?.parentElement || composer.parentElement,
+      "composer_parent",
+    );
+    if (parent) return parent;
+  }
+  const main = usable(root.querySelector?.("main"), "document_main");
+  if (main) return main;
+  return {
+    element: root.body || root.documentElement || null,
+    strategy: "document_body",
+  };
+}
+
+/** Clé locale d'un nœud (WeakMap) : jamais persistée, jamais exportée. */
+const responseRootKeys = new WeakMap();
+let responseRootKeySeq = 0;
+
+function responseRootKey(el) {
+  let key = responseRootKeys.get(el);
+  if (!key) {
+    responseRootKeySeq += 1;
+    key = `root-${responseRootKeySeq}`;
+    responseRootKeys.set(el, key);
+  }
+  return key;
+}
+
+/** Tokens de classe bornés : structure seulement, jamais du contenu. */
+function boundedClassTokens(el) {
+  return [...(el?.classList || [])]
+    .slice(0, RESPONSE_SIGNATURE_MAX_TOKENS)
+    .map((token) => token.slice(0, RESPONSE_SIGNATURE_MAX_TOKEN_LENGTH))
+    .join(".");
+}
+
+/**
+ * Signature structurelle d'un MarkdownRoot : identité locale valable pendant
+ * le run, sans aucun texte. React peut recréer le nœud : la signature permet
+ * de rattacher le nouveau nœud au même candidat logique.
+ */
+function markdownRootSignature(el) {
+  const parent = el?.parentElement || null;
+  return [
+    el?.tagName || "?",
+    boundedClassTokens(el),
+    `${parent?.tagName || "?"}.${boundedClassTokens(parent)}`,
+  ].join("|");
+}
+
+/** Contenu sérialisable : du texte non blanc, ou un média réellement rendu. */
+function hasSerializableContent(el) {
+  if (!el) return false;
+  const doc = el.ownerDocument || document;
+  const walker = doc.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  let node;
+  while ((node = walker.nextNode())) {
+    if (/\S/.test(node.nodeValue || "")) return true;
+  }
+  return Boolean(el.querySelector("img[src], video, canvas"));
+}
+
+/**
+ * Un MarkdownRoot est-il un ResponseRoot plausible ?
+ * Candidat moderne = descendant de la surface, hors composer, hors chrome, hors
+ * réflexion, hors message utilisateur, visible, et non ambigu par lui-même.
+ */
+function isResponseRootCandidate(el, surfaceElement, root = document) {
+  if (!isMarkdownRootElement(el) || !el.isConnected) return false;
+  if (surfaceElement && !surfaceElement.contains(el)) return false;
+  // Un tour assistant historique contient déjà ce contenu : la stratégie
+  // sémantique le couvre, il ne doit pas être compté deux fois.
+  if (el.closest(SELECTORS.assistant)) return false;
+  // Le prompt de l'utilisateur est rendu en markdown lui aussi.
+  if (el.closest(SELECTORS.user)) return false;
+  // « Thinking » n'est pas la réponse.
+  for (const selector of SELECTORS.reasoning) {
+    if (el.closest(selector)) return false;
+  }
+  if (isApplicationChrome(el) || isInsideComposer(el, root)) return false;
+  return isVisibleElement(el);
+}
+
+/**
+ * Tous les ResponseRoots visibles, par stratégie. Observation pure : aucun
+ * choix, aucune écriture, aucun texte lu ni journalisé.
+ */
+function resolveResponseRoots(root = document) {
+  const surface = resolveConversationSurface(root);
+  const surfaceElement = surface.element;
+  const semantic = [];
+  const markdown = [];
+  let inlineLeafCount = 0;
+  if (surfaceElement) {
+    for (const element of surfaceElement.querySelectorAll(
+      SELECTORS.markdownRootCandidate,
+    )) {
+      if (isResponseRootCandidate(element, surfaceElement, root)) {
+        markdown.push(element);
+      }
+    }
+    let leaves = 0;
+    for (const leaf of surfaceElement.querySelectorAll(
+      SELECTORS.inlineMarkdown.join(", "),
+    )) {
+      if (isVisibleElement(leaf) && !isInsideComposer(leaf, root)) leaves += 1;
+    }
+    inlineLeafCount = Math.min(leaves, MAX_INLINE_LEAF_COUNT);
+  }
+  for (const element of root.querySelectorAll(SELECTORS.assistant)) {
+    if (isVisibleElement(element) && !isApplicationChrome(element)) {
+      semantic.push(element);
+    }
+  }
+  return {
+    surface_element: surfaceElement,
+    surface_strategy: surface.strategy,
+    semantic,
+    markdown,
+    inline_leaf_count: inlineLeafCount,
+  };
+}
+
+/**
+ * Baseline structurelle capturée juste AVANT le Send. Elle ne contient que des
+ * comptages, des clés locales (WeakMap) et des signatures de classes — jamais
+ * un caractère de contenu utilisateur, jamais un identifiant externe.
+ */
+function captureResponseBaseline(root = document) {
+  const collected = resolveResponseRoots(root);
+  return {
+    surface_strategy: collected.surface_strategy,
+    semanticRootKeys: collected.semantic.map(responseRootKey),
+    semanticRootCount: collected.semantic.length,
+    markdownRootKeys: collected.markdown.map(responseRootKey),
+    markdownRootCount: collected.markdown.length,
+    rootSignatures: collected.markdown.map(markdownRootSignature),
+  };
+}
+
+function emptyResponseBaseline() {
+  return {
+    surface_strategy: null,
+    semanticRootKeys: [],
+    semanticRootCount: 0,
+    markdownRootKeys: [],
+    markdownRootCount: 0,
+    rootSignatures: [],
+  };
+}
+
+/** Candidat décrit par les mêmes champs, quelle que soit la stratégie. */
+function describeResponseCandidate(status, strategy, element, collected, baseline) {
+  const roots = collected || { markdown: [], inline_leaf_count: 0 };
+  return {
+    status,
+    strategy,
+    element: element || null,
+    candidate_root_tag: element?.tagName || null,
+    candidate_count: status === "found" ? 1 : 0,
+    raw_candidate_count: 0,
+    markdown_root: strategy === "markdown_root_delta",
+    baseline_root_count: baseline?.markdownRootCount || 0,
+    current_root_count: roots.markdown.length,
+    semantic_root_count: roots.semantic?.length || 0,
+    inline_leaf_count: roots.inline_leaf_count || 0,
+    surface_found: Boolean(roots.surface_element),
+    surface_strategy: roots.surface_strategy || null,
+  };
+}
+
+/**
+ * Candidat de réponse par DELTA contre le baseline.
+ *
+ * - `found`     : exactement un nouveau ResponseRoot porteur de contenu.
+ * - `pending`   : rien de nouveau (ou un nœud monté mais encore vide).
+ * - `ambiguous` : plusieurs nouveaux ResponseRoots plausibles — on ne devine
+ *                 pas, l'appelant décide (fail closed).
+ */
+function resolveResponseCandidate(baseline, root = document) {
+  const safeBaseline = baseline || emptyResponseBaseline();
+  const collected = resolveResponseRoots(root);
+  const markdownKeys = new Set(safeBaseline.markdownRootKeys || []);
+  // Stratégie historique : un tour assistant de plus, dans l'ordre du
+  // document. Le sélecteur est intrinsèquement sémantique (il ne peut désigner
+  // qu'un message), donc la CROISSANCE du compteur suffit — et elle est plus
+  // sûre qu'une comparaison nœud par nœud : React peut recréer au passage les
+  // tours précédents, ce qui produirait sinon plusieurs « nouveaux » tours et
+  // une fausse ambiguïté sur une UI parfaitement lisible.
+  const semanticCandidates =
+    collected.semantic.length > (safeBaseline.semanticRootCount || 0)
+      ? [collected.semantic[collected.semantic.length - 1]]
+      : [];
+
+  let strategy = null;
+  let raw = [];
+  if (semanticCandidates.length) {
+    strategy = "semantic_assistant";
+    raw = semanticCandidates;
+  } else {
+    // Sélection par delta : une occurrence n'est retenue que si sa signature
+    // dépasse le compte du baseline (les occurrences antérieures consomment
+    // l'autorisation) ET si son nœud n'était pas déjà présent avant le Send.
+    const allowance = new Map();
+    for (const signature of safeBaseline.rootSignatures || []) {
+      allowance.set(signature, (allowance.get(signature) || 0) + 1);
+    }
+    const surplusRoots = [];
+    for (const el of collected.markdown) {
+      const signature = markdownRootSignature(el);
+      const left = allowance.get(signature) || 0;
+      if (left > 0) {
+        allowance.set(signature, left - 1);
+        continue;
+      }
+      surplusRoots.push(el);
+    }
+    const freshSurplus = surplusRoots.filter(
+      (el) => !markdownKeys.has(responseRootKey(el)),
+    );
+    if (freshSurplus.length) {
+      strategy = "markdown_root_delta";
+      raw = freshSurplus;
+    }
+  }
+
+  const withContent = raw.filter((el) => hasSerializableContent(el));
+  const status =
+    withContent.length > 1
+      ? "ambiguous"
+      : withContent.length === 1
+        ? "found"
+        : "pending";
+  const candidate = describeResponseCandidate(
+    status,
+    raw.length ? strategy : null,
+    status === "found" ? withContent[0] : null,
+    collected,
+    safeBaseline,
+  );
+  candidate.candidate_count = withContent.length;
+  candidate.raw_candidate_count = raw.length;
+  return candidate;
+}
+
+/**
+ * Content root d'un candidat : le nœud moderne est lui-même le content root
+ * (ne pas remonter vers des wrappers de layout moins stables), tandis que la
+ * stratégie historique garde son answer root `.markdown`.
+ */
+function resolveResponseContentRoot(candidate, fallbackOk = true) {
+  if (!candidate?.element) return null;
+  if (candidate.strategy === "semantic_assistant") {
+    return answerRoot(candidate.element, fallbackOk);
+  }
+  return candidate.element;
+}
+
+/**
+ * Locator local d'un ResponseRoot : valable pendant le run, jamais persisté,
+ * jamais comparé à un identifiant externe (conversation, tour, message).
+ */
+function createResponseLocator(candidate, baseline, root = document) {
+  if (!candidate?.element) return null;
+  if (candidate.strategy === "semantic_assistant") {
+    const surface = resolveConversationSurface(root).element;
+    const turns = surface
+      ? [...surface.querySelectorAll(SELECTORS.assistant)]
+      : [];
+    return {
+      kind: "semantic_assistant",
+      strategy: "semantic_assistant",
+      turn_locator: turnLocator(candidate.element),
+      baseline_count: baseline?.semanticRootCount || 0,
+      ordinal: turns.indexOf(candidate.element),
+    };
+  }
+  const collected = resolveResponseRoots(root);
+  return {
+    kind: "markdown_root",
+    strategy: "markdown_root_delta",
+    ordinal: collected.markdown.indexOf(candidate.element),
+    signature: markdownRootSignature(candidate.element),
+  };
+}
+
+/**
+ * Re-résout le candidat depuis son locator : React recrée volontiers le nœud
+ * (le locator doit rattacher le nouveau nœud au même candidat logique), mais
+ * deux candidats restent indistinguables — on ne devine alors pas.
+ */
+function locateResponseCandidate(locator, baseline, root = document) {
+  if (!locator) return null;
+  if (locator.kind === "semantic_assistant") {
+    const turn = findTurn(locator.turn_locator, locator.baseline_count);
+    if (!turn) return null;
+    return describeResponseCandidate(
+      "found",
+      "semantic_assistant",
+      turn,
+      resolveResponseRoots(root),
+      baseline,
+    );
+  }
+  const collected = resolveResponseRoots(root);
+  const ordinalRoot = collected.markdown[locator.ordinal] || null;
+  if (ordinalRoot && markdownRootSignature(ordinalRoot) === locator.signature) {
+    return describeResponseCandidate(
+      "found",
+      "markdown_root_delta",
+      ordinalRoot,
+      collected,
+      baseline,
+    );
+  }
+  const baselineKeys = new Set(baseline?.markdownRootKeys || []);
+  const fresh = collected.markdown.filter(
+    (el) => !baselineKeys.has(responseRootKey(el)),
+  );
+  if (fresh.length === 1) {
+    return describeResponseCandidate(
+      "found",
+      "markdown_root_delta",
+      fresh[0],
+      collected,
+      baseline,
+    );
+  }
+  return null;
+}
+
+// Dernière décision du locator : observabilité sans contenu, exposée au popup.
+let lastResponseLocatorDiagnostic = null;
+let recordedResponseLocatorSignature = null;
+
+/** Charge utile de log § « bridge_response_locator » : aucun contenu. */
+function responseLocatorDiagnostic(candidate) {
+  return {
+    strategy: candidate?.strategy ?? null,
+    baseline_root_count: candidate?.baseline_root_count ?? 0,
+    current_root_count: candidate?.current_root_count ?? 0,
+    candidate_found: candidate?.status === "found",
+    candidate_root_tag: candidate?.candidate_root_tag ?? null,
+    markdown_root: candidate?.markdown_root === true,
+    inline_leaf_count: candidate?.inline_leaf_count ?? 0,
+    ambiguity_count:
+      candidate?.status === "ambiguous" ? candidate.candidate_count : 0,
+    version: VERSION,
+  };
+}
+
+/** Mémorise et journalise la dernière décision, à chaque changement seulement. */
+function recordResponseLocator(candidate) {
+  const diagnostic = responseLocatorDiagnostic(candidate);
+  const signature = [
+    diagnostic.strategy,
+    diagnostic.candidate_found,
+    diagnostic.current_root_count,
+    diagnostic.inline_leaf_count,
+    diagnostic.ambiguity_count,
+  ].join("|");
+  if (signature === recordedResponseLocatorSignature) return diagnostic;
+  recordedResponseLocatorSignature = signature;
+  lastResponseLocatorDiagnostic = diagnostic;
+  console.log("bridge_response_locator", diagnostic);
+  return diagnostic;
+}
+
+// --------------------------------------------------------------------------- //
+// Snapshot structurel borné (« Copy response structure »)
+//
+// Sortie autorisée : tag, tokens de classe bornés, role, data-testid,
+// data-* en liste blanche, profondeur, nombre d'enfants, dimensions,
+// visibilité, stratégie de root. Interdit : innerText, textContent, innerHTML,
+// corps de réponse, prompt.
+// --------------------------------------------------------------------------- //
+
+const STRUCTURE_SAFE_ATTRIBUTES = {
+  "data-testid": "testid",
+  "data-message-author-role": "author_role",
+  "data-turn": "turn",
+  "data-state": "state",
+  "data-is-streaming": "is_streaming",
+  "data-composer-markdown": "composer_markdown",
+  "aria-hidden": "aria_hidden",
+};
+
+function boundedStructureValue(value) {
+  return typeof value === "string" &&
+    value.length <= STRUCTURE_LIMITS.max_value_length &&
+    /^[A-Za-z0-9 _.:#-]*$/.test(value)
+    ? value
+    : null;
+}
+
+function boundedStructureData(el) {
+  const data = {};
+  for (const [attribute, key] of Object.entries(STRUCTURE_SAFE_ATTRIBUTES)) {
+    const raw = el.getAttribute(attribute);
+    if (raw === null) continue;
+    if (raw === "") {
+      data[key] = true;
+      continue;
+    }
+    const bounded = boundedStructureValue(raw);
+    if (bounded !== null) data[key] = bounded;
+  }
+  return data;
+}
+
+function boundedStructureNode(el, depth, budget) {
+  budget.nodes += 1;
+  let rect = null;
+  try {
+    rect = typeof el.getBoundingClientRect === "function"
+      ? el.getBoundingClientRect()
+      : null;
+  } catch (_) {
+    // Une dimension indisponible ne doit jamais faire échouer un diagnostic.
+  }
+  const children = [];
+  if (
+    depth < STRUCTURE_LIMITS.max_depth &&
+    budget.nodes < STRUCTURE_LIMITS.max_nodes
+  ) {
+    for (const child of el.children) {
+      if (children.length >= STRUCTURE_LIMITS.max_children) break;
+      if (budget.nodes >= STRUCTURE_LIMITS.max_nodes) break;
+      children.push(boundedStructureNode(child, depth + 1, budget));
+    }
+  }
+  return {
+    tag: el.tagName,
+    class_tokens: [...(el.classList || [])]
+      .slice(0, STRUCTURE_LIMITS.max_class_tokens)
+      .map((token) => token.slice(0, STRUCTURE_LIMITS.max_token_length)),
+    role: boundedStructureValue(el.getAttribute("role")),
+    data_testid: boundedStructureValue(el.getAttribute("data-testid")),
+    data: boundedStructureData(el),
+    has_message_id: Boolean(el.getAttribute("data-message-id")),
+    depth,
+    children_count: el.children.length,
+    children,
+    width: rect && Number.isFinite(rect.width) ? Math.round(rect.width) : null,
+    height: rect && Number.isFinite(rect.height) ? Math.round(rect.height) : null,
+    visible: isVisibleElement(el),
+  };
+}
+
+/**
+ * Snapshot structurel de la surface de conversation et des ResponseRoots.
+ * Aucune propriété textuelle n'est jamais lue : ni innerText, ni textContent,
+ * ni innerHTML, ni valeur d'attribut hors liste blanche.
+ */
+function responseStructureSnapshot(root = document) {
+  const collected = resolveResponseRoots(root);
+  const surfaceElement = collected.surface_element;
+  const roots = [
+    ...collected.markdown
+      .slice(0, STRUCTURE_LIMITS.max_roots)
+      .map((element) => ({
+        strategy: "markdown_root_delta",
+        node: boundedStructureNode(element, 0, { nodes: 0 }),
+      })),
+    ...collected.semantic
+      .slice(0, STRUCTURE_LIMITS.max_roots)
+      .map((element) => ({
+        strategy: "semantic_assistant",
+        node: boundedStructureNode(element, 0, { nodes: 0 }),
+      })),
+  ];
+  return {
+    ok: true,
+    content_script_version: VERSION,
+    conversation_surface: {
+      found: Boolean(surfaceElement),
+      strategy: collected.surface_strategy || null,
+      node: surfaceElement
+        ? boundedStructureNode(surfaceElement, 0, { nodes: 0 })
+        : null,
+    },
+    strategy: collected.markdown.length
+      ? "markdown_root_delta"
+      : collected.semantic.length
+        ? "semantic_assistant"
+        : null,
+    markdown_root_matches: collected.markdown.length,
+    semantic_assistant_matches: collected.semantic.length,
+    inline_leaf_matches: collected.inline_leaf_count,
+    roots,
+  };
+}
 // --------------------------------------------------------------------------- //
 // Contrôles typés de l'interface : modèle, profil, recherche web
 //
@@ -2164,7 +2931,7 @@ function incompleteAnswer({
  * Suit la réponse dans le DOM sans transmettre les snapshots intermédiaires.
  * Chaque observation remplace la précédente, car le rendu n'est pas append-only.
  */
-async function streamAnswer(job, locator, before, run) {
+async function streamAnswer(job, locator, responseBaseline, run) {
   const output = globalThis.ChatGPTBridgeFinalOutput.createAccumulator();
   let vu = ""; // relevé précédent, pour mesurer la stabilité
   let stableSince = null;
@@ -2179,7 +2946,8 @@ async function streamAnswer(job, locator, before, run) {
   // Identité externe et locator du tour re-résolu qui a produit/vérifié le
   // snapshot final. Ils sont capturés dans la même itération que le texte : le
   // texte et l'identité décrivent toujours le même nœud DOM courant.
-  let finalTurnLocator = locator;
+  let finalTurnLocator =
+    locator.kind === "semantic_assistant" ? locator.turn_locator : null;
   let finalExternalTurnId = null;
   let finalCompletion = {
     finished: null,
@@ -2260,11 +3028,12 @@ async function streamAnswer(job, locator, before, run) {
       }
       lastObservationAt = now;
 
-      // Re-recherche du tour à chaque itération, jamais de référence gardée :
-      // React remplace le nœud du message entre la phase de réflexion et la
-      // réponse, et un nœud détaché resterait figé sur « Thinking ».
-      const turn = findTurn(locator, before);
-      if (!turn) continue;
+      // Re-résolution du candidat à chaque itération, jamais de référence
+      // gardée : React remplace le nœud entre la réflexion et la réponse, et
+      // un nœud détaché resterait figé sur « Thinking ».
+      const candidate = locateResponseCandidate(locator, responseBaseline);
+      if (!candidate) continue;
+      const turn = candidate.element;
 
       // `finished === false` (ChatGPT écrit encore) interdit de sortir ; `null`
       // (aucun signal reconnu) exige une stabilité bien plus longue.
@@ -2276,8 +3045,8 @@ async function streamAnswer(job, locator, before, run) {
         stableSince = null;
         stableObservations = 0;
       }
-      const root = answerRoot(
-        turn,
+      const root = resolveResponseContentRoot(
+        candidate,
         finished === true || Date.now() - debut > NO_MARKDOWN_FALLBACK_MS,
       );
       const serializationStartedAt = globalThis.performance?.now?.();
@@ -2426,23 +3195,28 @@ async function streamAnswer(job, locator, before, run) {
 
       if (verifyFinal) {
         // React peut remplacer le nœud entre les observations : re-résoudre le
-        // même tour, puis revérifier finalité, identité et texte sur ce nœud.
-        const verificationTurn = findTurn(
-          turnLocator(turn) || locator,
-          before,
+        // même candidat logique, puis revérifier finalité, identité et texte
+        // sur ce nœud.
+        const verificationLocator =
+          locator.kind === "semantic_assistant"
+            ? { ...locator, turn_locator: turnLocator(turn) || locator.turn_locator }
+            : locator;
+        const verificationCandidate = locateResponseCandidate(
+          verificationLocator,
+          responseBaseline,
         );
-        const verificationCompletion = verificationTurn
-          ? completionState(verificationTurn)
+        const verificationCompletion = verificationCandidate
+          ? completionState(verificationCandidate.element)
           : null;
-        const verificationRoot = verificationTurn
-          ? answerRoot(verificationTurn, true)
+        const verificationRoot = verificationCandidate
+          ? resolveResponseContentRoot(verificationCandidate, true)
           : null;
         const verification = verificationRoot
           ? readAnswer(verificationRoot, false)
           : null;
         const currentExternalTurnId = turnExternalId(turn);
-        const verificationExternalTurnId = verificationTurn
-          ? turnExternalId(verificationTurn)
+        const verificationExternalTurnId = verificationCandidate
+          ? turnExternalId(verificationCandidate.element)
           : null;
         const finalityVerified =
           finished === true
@@ -2463,7 +3237,11 @@ async function streamAnswer(job, locator, before, run) {
           output.observe(verification.text);
           finalSerialized = verification;
           finalCompletion = verificationCompletion;
-          finalTurnLocator = turnLocator(verificationTurn) || locator;
+          finalTurnLocator = verificationCandidate
+            ? turnLocator(verificationCandidate.element) ||
+              verificationLocator.turn_locator ||
+              null
+            : null;
           finalExternalTurnId = verificationExternalTurnId;
           // État de plan au moment exact où la fin est constatée : c'est cette
           // valeur qui rend vérifiable « terminé sans focus » après coup.
@@ -2508,10 +3286,14 @@ async function streamAnswer(job, locator, before, run) {
  * l'identité capturée par `streamAnswer`, et à défaut on re-résout ce même
  * tour par son locator, sans jamais réutiliser une référence DOM conservée.
  */
-function resolveExternalTurnId(serialized, locator, before) {
+function resolveExternalTurnId(serialized, locator, responseBaseline) {
   if (serialized.external_turn_id) return serialized.external_turn_id;
-  const turn = findTurn(serialized.turn_locator || locator, before);
-  return turn ? turnExternalId(turn) : null;
+  const refined =
+    locator?.kind === "semantic_assistant" && serialized.turn_locator
+      ? { ...locator, turn_locator: serialized.turn_locator }
+      : locator;
+  const candidate = locateResponseCandidate(refined, responseBaseline);
+  return candidate ? turnExternalId(candidate.element) : null;
 }
 
 /** Erreur de content script typée : `.code` traverse jusqu'au client, jamais aplati. */
@@ -2921,6 +3703,9 @@ async function handlePrompt({
     });
     // Capture after typing/upload and immediately before the one allowed
     // trigger: the composer text and send state must describe the actual click.
+    // La baseline de réponse décrit la structure déjà rendue (comptages,
+    // signatures) : aucun texte, et c'est le SEUL état de référence du delta.
+    const responseBaseline = captureResponseBaseline();
     const submissionBaseline = captureSubmissionSnapshot(composer, sendBtn);
     job.submissionState = "submission_attempted";
     job.phase = "submission_confirmation";
@@ -2956,32 +3741,33 @@ async function handlePrompt({
       });
     }
 
-    // Attendre le premier tour assistant *nouveau* (pas le précédent), sans
+    // Attendre le premier ResponseRoot *nouveau* (jamais le précédent), sans
     // imposer une courte borne murale à une recherche web ou réflexion longue.
-    const premier = await waitForFirstAssistantTurn(
+    // Le candidat vient du delta structurel contre le baseline d'avant-Send.
+    const candidate = await waitForResponseCandidate(
       job,
       composer,
       sendBtn,
       submissionBaseline,
-      before,
+      responseBaseline,
       runDiagnostics,
     );
-    if (!premier) return;
-    const streamLocator = turnLocator(premier);
+    if (!candidate) return;
+    const responseLocator = createResponseLocator(candidate, responseBaseline);
     const serialized = await streamAnswer(
       job,
-      streamLocator,
-      before,
+      responseLocator,
+      responseBaseline,
       runDiagnostics,
     );
 
     if (!job.aborted) {
-      // Le nœud `premier` peut être détaché : l'identité vient du tour courant
+      // Le nœud candidat peut être détaché : l'identité vient du tour courant
       // qui a produit ce texte, jamais de la référence gardée avant streaming.
       const externalTurnId = resolveExternalTurnId(
         serialized,
-        streamLocator,
-        before,
+        responseLocator,
+        responseBaseline,
       );
       console.log("bridge_run_phase", { phase: "generation" });
       // Un `done` promet une conversation poursuivable : sans identité externe
@@ -3184,6 +3970,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
   if (msg?.type === "recovery_capture") {
     captureLaterResponse(msg).then(sendResponse);
+    return true;
+  }
+  if (msg?.type === "response_structure") {
+    // Snapshot structurel borné : ni innerText, ni textContent, ni innerHTML.
+    sendResponse(responseStructureSnapshot());
     return true;
   }
   if (msg?.type === "observe_tick") {

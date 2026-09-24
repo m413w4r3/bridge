@@ -434,7 +434,7 @@ function recoverFencedCode(markdown) {
   };
 
   window.testJob = { id: "stall", aborted: false };
-  const result = await run(`streamAnswer(testJob, "conversation-turn-3", 1)`);
+  const result = await run(`streamAnswer(testJob, { kind: "semantic_assistant", strategy: "semantic_assistant", turn_locator: "conversation-turn-3", baseline_count: 1 }, null)`);
 
   assert.equal(result.incomplete, true);
   assert.equal(result.incomplete_reason, "active_signal_stalled");
@@ -576,7 +576,7 @@ function useVirtualClock(window) {
     assert.equal(contractLog?.composer_strategy, "named_selector");
     assert.equal(contractLog?.composer_selector, "[data-composer-markdown][contenteditable='true'][role='textbox']");
     assert.equal(contractLog?.send_selector, "button[aria-label*='Send']");
-    assert.equal(contractLog?.content_script_version, "36");
+    assert.equal(contractLog?.content_script_version, "37");
     assert.equal(JSON.stringify(contractLog).includes("bonjour moderne"), false);
     assert.equal(submit, form.querySelector("button[type='submit']"));
   }
@@ -600,7 +600,7 @@ function useVirtualClock(window) {
     );
     const current = await dispatch({ type: "dom_health" });
     assert.equal(current.ok, true);
-    assert.equal(current.content_script_version, "36");
+    assert.equal(current.content_script_version, "37");
     assert.equal(current.surface.temporary_status, "ok");
     assert.equal(current.composer.status, "ok");
     assert.equal(current.send.status, "ok");
@@ -709,7 +709,17 @@ function useVirtualClock(window) {
     const json = JSON.stringify(diagnostics);
     assert.equal(json.includes("TOP_SECRET_PROMPT_123"), false);
     assert.equal(json.includes("STORED_WS_TOKEN_SECRET"), false);
-    for (const forbidden of ["wsToken", "Authorization", "prompt", "response"]) {
+    // `response_locator` est un contrat de diagnostic (comptages, tags,
+    // stratégies) : ce qui est interdit ici, ce sont les clés porteuses de
+    // contenu et les secrets, pas le mot « response » lui-même.
+    for (const forbidden of [
+      "wsToken",
+      "Authorization",
+      "prompt",
+      "innerText",
+      "innerHTML",
+      "textContent",
+    ]) {
       assert.equal(json.toLowerCase().includes(forbidden.toLowerCase()), false, forbidden);
     }
   }
@@ -883,7 +893,7 @@ function useVirtualClock(window) {
     assert.equal(error?.submission_state, "pre_submission");
     assert.equal(error?.diagnostics?.ui_contract_error, "composer_missing");
     assert.equal(error?.diagnostics?.dom_health?.composer?.status, "missing");
-    assert.equal(error?.diagnostics?.dom_health?.content_script_version, "36");
+    assert.equal(error?.diagnostics?.dom_health?.content_script_version, "37");
     assert.equal(sent.some((message) => message.type === "done"), false);
   }
 
@@ -907,7 +917,7 @@ function useVirtualClock(window) {
     assert.equal(error?.diagnostics?.send_status, "missing");
     assert.equal(error?.diagnostics?.send_candidates, 0);
     assert.equal(error?.diagnostics?.form_found, true);
-    assert.equal(error?.diagnostics?.content_script_version, "36");
+    assert.equal(error?.diagnostics?.content_script_version, "37");
     assert.equal(JSON.stringify(error).includes("hello"), false);
   }
 
@@ -1801,7 +1811,7 @@ const PLACEHOLDER_ID =
       "l'identité doit venir du nœud courant, pas du placeholder détaché",
     );
     assert.equal(done.metadata?.initial_turn_id, "stable-assistant-42");
-    assert.equal(done.metadata?.content_script_version, "36");
+    assert.equal(done.metadata?.content_script_version, "37");
   }
 
   // Même remplacement, mais l'UI reste bloquée « en streaming » : le candidat
@@ -2101,7 +2111,7 @@ const RECHERCHE_FINALE = `# REFERENCES\n\n${RECHERCHE_FINALE_CORPS}`;
     };
 
     const result = await run(
-      `streamAnswer(testEndlessJob, "conversation-turn-endless", 0)`,
+      `streamAnswer(testEndlessJob, { kind: "semantic_assistant", strategy: "semantic_assistant", turn_locator: "conversation-turn-endless", baseline_count: 0 }, null)`,
     );
 
     assert.ok(
@@ -2191,7 +2201,7 @@ const RECHERCHE_FINALE = `# REFERENCES\n\n${RECHERCHE_FINALE_CORPS}`;
     };
     window.testScopedJob = { id: "scoped", aborted: false };
     const result = await run(
-      `streamAnswer(testScopedJob, "conversation-turn-3", 1)`,
+      `streamAnswer(testScopedJob, { kind: "semantic_assistant", strategy: "semantic_assistant", turn_locator: "conversation-turn-3", baseline_count: 1 }, null)`,
     );
 
     assert.equal(
@@ -2230,7 +2240,7 @@ const RECHERCHE_FINALE = `# REFERENCES\n\n${RECHERCHE_FINALE_CORPS}`;
       return 0;
     };
     window.testAttrJob = { id: "attr", aborted: false };
-    const result = await run(`streamAnswer(testAttrJob, "conversation-turn-3", 0)`);
+    const result = await run(`streamAnswer(testAttrJob, { kind: "semantic_assistant", strategy: "semantic_assistant", turn_locator: "conversation-turn-3", baseline_count: 0 }, null)`);
 
     assert.equal(result.incomplete_reason, "active_signal_stalled");
     assert.equal(result.text, "réponse finale");
@@ -2533,7 +2543,7 @@ async function runPromptInjection({ id, prompt, files = null }) {
     })()`);
     assert.equal(diagnostics.composer_was_non_empty, true);
     assert.equal(diagnostics.composer_still_has_text, true);
-    assert.equal(diagnostics.content_script_version, "36");
+    assert.equal(diagnostics.content_script_version, "37");
 
     // Le snapshot ne transporte plus le texte du composer, seulement un booléen.
     const snapshot = run(`captureSubmissionSnapshot(${SEL})`);

@@ -287,6 +287,7 @@ les menus ChatGPT, attend le verrou de génération et renvoie une erreur typée
 | `bridge_rate_limited` | oui | attendre `Retry-After` |
 | `bridge_extension_disconnected` | oui | ouvrir ChatGPT et reconnecter l’extension |
 | `bridge_ui_timeout` | oui | vérifier l’onglet et les sélecteurs UI |
+| `bridge_response_contract_drift` | non | l’UI a changé de contrat de réponse : lire `details` (comptages) puis étendre les stratégies de ResponseRoot |
 | `bridge_server_error` | oui | consulter les logs avec le correlation ID |
 | `bridge_auth_failed` | non | corriger/faire tourner le secret HTTP |
 | `bridge_payload_conflict` | non | corriger la génération de clé |
@@ -354,7 +355,7 @@ détail porte `details.ui_contract_error` (`composer_missing`,
 ```json
 {
   "composer": {"status": "missing", "visible_candidates": 0},
-  "content_script_version": "36"
+  "content_script_version": "37"
 }
 ```
 
@@ -384,6 +385,13 @@ Procédure, dans cet ordre :
 4. Cliquer **Copier le diagnostic** : le JSON copié ne contient que le
    contrat fixe (statuts, stratégie, sélecteur connu, compteurs, préfixes
    d’identifiants). Il peut être joint à un ticket tel quel.
+   La section **Response locator** décrit le contrat de réponse : surface de
+   conversation, stratégie (`semantic_assistant` ou `markdown_root_delta`),
+   comptages de roots et de feuilles inline, verdict du candidat
+   (`FOUND` / `AMBIGUOUS` / `NONE`). Voir « Contrat de réponse (ResponseRoot) ».
+   Le bouton **Copier la structure de réponse** joint un snapshot structurel
+   borné (tag, tokens de classe, `data-testid`, dimensions, profondeur) quand
+   il faut décrire un arbre réel sans jamais copier de texte.
 5. Seulement si le popup ne suffit pas (il faut voir l’évolution pendant un
    envoi), coller `tools/diagnose.js` dans la console DevTools de l’onglet :
    il enregistre 90 s de transitions structurelles sans lire de texte.
@@ -399,6 +407,63 @@ durée, puis soit `reply_match`, soit le code d’erreur et le `dom_health`
 borné. Il ne passe jamais la clé en argument de commande et ne l’affiche
 pas. Chaque exécution soumet un nouveau prompt (nouvelle clé
 d’idempotence).
+
+## Contrat de réponse (ResponseRoot)
+
+La réponse n’est pas cherchée comme « un tour assistant » mais comme le contenu
+rendu APRÈS la soumission du prompt : le **ResponseRoot**. Deux stratégies le
+résolvent, dans cet ordre :
+
+1. `semantic_assistant` — UI historique :
+   `[data-message-author-role="assistant"]` et son answer root `.markdown`.
+2. `markdown_root_delta` — UI observée en production : plus aucun
+   `data-message-author-role`, `data-message-id`, `data-turn`,
+   `conversation-turn` ni `<article>`. Le contenu vit dans un `div` dont une
+   classe COMMENCE par `MarkdownRoot-` (suffixe généré, jamais écrit en dur) ;
+   les feuilles `inline-markdown` / `InlineMarkdown…` ne sont qu’une preuve de
+   contenu conversationnel, jamais une réponse à elles seules. Une réponse qui
+   contient P/UL/LI/code/table reste UN seul ResponseRoot.
+
+Le candidat vient d’un DELTA structurel : `captureResponseBaseline()` est
+capturé juste avant l’unique `triggerComposerSubmission()` (comptages, clés
+locales `WeakMap`, signatures de tokens de classe — jamais un caractère de
+contenu), et `resolveResponseCandidate()` ne retient que les ResponseRoots qui
+dépassent ce baseline dans la surface de conversation. « Le dernier
+MarkdownRoot de la page » n’est jamais une réponse. La surface elle-même est
+bornée (`resolveConversationSurface()`) : header, nav, aside, menus, popovers
+et modales ne peuvent pas devenir une conversation — le diagnostic réel a déjà
+montré un `app-shell-header-context-menu-surface` qui ne doit jamais être pris
+pour une réponse.
+
+L’identité du candidat est locale au run (WeakMap + ordinal + signature) :
+React peut remplacer le nœud, le locator rattache le nouveau nœud au même
+candidat logique, sans jamais persister ni fabriquer un identifiant de
+conversation, de tour ou de message.
+
+Observabilité, sans contenu : la console de l’onglet journalise
+`bridge_response_locator` (`strategy`, `baseline_root_count`,
+`current_root_count`, `candidate_found`, `candidate_root_tag`, `markdown_root`,
+`inline_leaf_count`, `ambiguity_count`, `version`), et le popup affiche la
+section **Response locator** (Conversation surface / Strategy / Baseline roots
+/ Current roots / Candidate / Markdown root / Inline leaves). Le bouton
+**Copier la structure de réponse** produit un snapshot structurel borné — tag,
+tokens de classe bornés, role, data-testid, data-* en liste blanche,
+profondeur, nombre d’enfants, dimensions, visibilité, stratégie de root — sans
+jamais lire ni copier un texte (ni `innerText`, ni `textContent`, ni
+`innerHTML`).
+
+Dérive de contrat, fail closed : après un Send confirmé, si deux nouveaux
+ResponseRoots coexistent (`RESPONSE_AMBIGUITY_HOLD_MS`), ou si des feuilles
+`inline-markdown` restent visibles sans aucun ResponseRoot résolvable
+(`RESPONSE_CONTRACT_DRIFT_MS`), le run échoue en
+`bridge_response_contract_drift` avec `submission_state = post_submission` et
+aucun replay automatique. `details` est borné et sans contenu :
+`reason` (`ambiguous_response_roots` ou
+`inline_markdown_without_response_root`), `response_root_strategies`,
+`semantic_assistant_matches`, `markdown_root_matches`, `inline_leaf_matches`,
+`baseline_root_count`, `current_root_count`, `conversation_surface_found`,
+`conversation_surface_strategy`, `submission_state` et
+`content_script_version`.
 
 ## WebSocket churn
 

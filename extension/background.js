@@ -770,6 +770,43 @@ function diagnosticCount(value) {
   return Number.isInteger(value) ? Math.max(0, Math.min(value, 999)) : 0;
 }
 
+const RESPONSE_STRATEGIES = new Set(["semantic_assistant", "markdown_root_delta"]);
+const SURFACE_STRATEGIES = new Set([
+  "composer_main",
+  "composer_scroll_container",
+  "composer_parent",
+  "document_main",
+  "document_body",
+]);
+
+/**
+ * Contrat de réponse (ResponseRoot) : surface, stratégie, comptages et
+ * dernière décision du locator. Liste blanche fermée — jamais un texte, jamais
+ * un nœud, jamais une référence DOM.
+ */
+function safeResponseLocator(raw) {
+  const locator = raw || {};
+  const tag = ["DIV", "ARTICLE", "SECTION", "SPAN", "P"].includes(
+    locator.candidate_root_tag,
+  )
+    ? locator.candidate_root_tag
+    : null;
+  return {
+    conversation_surface: locator.conversation_surface === true,
+    surface_strategy: SURFACE_STRATEGIES.has(locator.surface_strategy)
+      ? locator.surface_strategy
+      : null,
+    strategy: RESPONSE_STRATEGIES.has(locator.strategy) ? locator.strategy : null,
+    baseline_root_count: diagnosticCount(locator.baseline_root_count),
+    current_root_count: diagnosticCount(locator.current_root_count),
+    candidate_found: locator.candidate_found === true,
+    candidate_root_tag: tag,
+    markdown_root: locator.markdown_root === true,
+    inline_leaf_count: diagnosticCount(locator.inline_leaf_count),
+    ambiguity_count: diagnosticCount(locator.ambiguity_count),
+  };
+}
+
 function safeDomHealth(raw, tabId, diagnosticTarget) {
   const statuses = new Set(["ok", "degraded", "missing", "ambiguous", "invalid", "not_rendered_idle"]);
   const composerStrategies = new Set(["named_selector", "structural_fallback"]);
@@ -854,6 +891,7 @@ function safeDomHealth(raw, tabId, diagnosticTarget) {
         ? send.same_form_as_composer
         : null,
     },
+    response_locator: safeResponseLocator(raw?.response_locator),
   };
 }
 
@@ -884,6 +922,200 @@ async function handleUiDiagnostic() {
       extension_state: "active",
       websocket_state: status.connected ? "connected" : "disconnected",
       connection: connectionDiagnostic(),
+    };
+  }
+}
+
+// --------------------------------------------------------------------------- //
+// Snapshot structurel borné (« Copy response structure »)
+//
+// Le worker ne recopie jamais la page : chaque champ traverse une liste
+// blanche fermée (tag, tokens de classe bornés, role, data-testid, data-*
+// autorisés, profondeur, nombre d'enfants, dimensions, visibilité). Aucune
+// propriété textuelle n'est jamais acceptée — ni texte, ni innerHTML, ni
+// corps de réponse, ni prompt.
+// --------------------------------------------------------------------------- //
+
+const STRUCTURE_LIMITS = {
+  depth: 6,
+  nodes: 200,
+  children: 40,
+  class_tokens: 8,
+  token_length: 40,
+  value_length: 64,
+};
+const STRUCTURE_DATA_KEYS = new Set([
+  "testid",
+  "author_role",
+  "turn",
+  "state",
+  "is_streaming",
+  "composer_markdown",
+  "aria_hidden",
+]);
+const STRUCTURE_TAGS = new Set([
+  "DIV",
+  "SPAN",
+  "P",
+  "UL",
+  "OL",
+  "LI",
+  "PRE",
+  "CODE",
+  "TABLE",
+  "TBODY",
+  "THEAD",
+  "TR",
+  "TD",
+  "TH",
+  "BLOCKQUOTE",
+  "H1",
+  "H2",
+  "H3",
+  "H4",
+  "H5",
+  "H6",
+  "A",
+  "STRONG",
+  "EM",
+  "HR",
+  "BR",
+  "IMG",
+  "VIDEO",
+  "CANVAS",
+  "MAIN",
+  "SECTION",
+  "ARTICLE",
+  "FORM",
+  "BUTTON",
+]);
+
+/** Compteur borné : jamais un NaN, jamais une valeur non finie. */
+function structureCount(value) {
+  return Number.isInteger(value) ? Math.max(0, Math.min(value, 999)) : 0;
+}
+
+/** Token de classe : borné, jamais un caractère de balisage ni d'espace. */
+function structureToken(value) {
+  return typeof value === "string" &&
+    value.length <= STRUCTURE_LIMITS.token_length &&
+    !/[\s"'<>\\]/.test(value)
+    ? value
+    : null;
+}
+
+/** Valeur d'attribut sûre : courte et sans caractère de balisage. */
+function structureValue(value) {
+  return typeof value === "string" &&
+    value.length <= STRUCTURE_LIMITS.value_length &&
+    !/[\s"'<>\\]/.test(value)
+    ? value
+    : null;
+}
+
+function safeStructureData(raw) {
+  const data = {};
+  if (!raw || typeof raw !== "object") return data;
+  for (const [key, value] of Object.entries(raw)) {
+    if (!STRUCTURE_DATA_KEYS.has(key)) continue;
+    if (value === true) {
+      data[key] = true;
+      continue;
+    }
+    const bounded = structureValue(value);
+    if (bounded !== null) data[key] = bounded;
+  }
+  return data;
+}
+
+function safeStructureNode(raw, depth, budget) {
+  if (!raw || typeof raw !== "object" || depth > STRUCTURE_LIMITS.depth) return null;
+  budget.nodes += 1;
+  const children = [];
+  if (Array.isArray(raw.children)) {
+    for (const child of raw.children.slice(0, STRUCTURE_LIMITS.children)) {
+      if (budget.nodes >= STRUCTURE_LIMITS.nodes) break;
+      const node = safeStructureNode(child, depth + 1, budget);
+      if (node) children.push(node);
+    }
+  }
+  const dimension = (value) =>
+    Number.isInteger(value) && value >= 0 && value <= 100000 ? value : null;
+  return {
+    tag: STRUCTURE_TAGS.has(raw.tag) ? raw.tag : null,
+    class_tokens: Array.isArray(raw.class_tokens)
+      ? raw.class_tokens
+          .slice(0, STRUCTURE_LIMITS.class_tokens)
+          .map(structureToken)
+          .filter((token) => token !== null && token !== "")
+      : [],
+    role: structureValue(raw.role),
+    data_testid: structureValue(raw.data_testid),
+    data: safeStructureData(raw.data),
+    has_message_id: raw.has_message_id === true,
+    depth,
+    children_count: structureCount(raw.children_count),
+    children,
+    width: dimension(raw.width),
+    height: dimension(raw.height),
+    visible: raw.visible === true,
+  };
+}
+
+function safeRootStrategy(value) {
+  return RESPONSE_STRATEGIES.has(value) ? value : null;
+}
+
+/** Copie bornée du snapshot structurel : aucune propriété textuelle, jamais. */
+function safeResponseStructure(raw, tabId, diagnosticTarget) {
+  const surface = raw?.conversation_surface || {};
+  const roots = Array.isArray(raw?.roots) ? raw.roots : [];
+  return {
+    ok: raw?.ok === true,
+    content_script_version:
+      typeof raw?.content_script_version === "string"
+        ? raw.content_script_version.slice(0, 20)
+        : null,
+    tab_id: Number.isInteger(tabId) ? tabId : null,
+    diagnostic_target: {
+      source: ["inflight", "browser_target", "bridge_conversation", "temporary_chat", "generic_chatgpt_tab"].includes(diagnosticTarget?.source)
+        ? diagnosticTarget.source
+        : "generic_chatgpt_tab",
+      bridge_owned: diagnosticTarget?.bridge_owned === true,
+    },
+    conversation_surface: {
+      found: surface.found === true,
+      strategy: SURFACE_STRATEGIES.has(surface.strategy) ? surface.strategy : null,
+      node: surface.node ? safeStructureNode(surface.node, 0, { nodes: 0 }) : null,
+    },
+    strategy: safeRootStrategy(raw?.strategy),
+    markdown_root_matches: structureCount(raw?.markdown_root_matches),
+    semantic_assistant_matches: structureCount(raw?.semantic_assistant_matches),
+    inline_leaf_matches: structureCount(raw?.inline_leaf_matches),
+    roots: roots
+      .slice(0, STRUCTURE_LIMITS.nodes)
+      .map((root) => ({
+        strategy: safeRootStrategy(root?.strategy),
+        node: safeStructureNode(root?.node, 0, { nodes: 0 }),
+      }))
+      .filter((root) => root.node !== null),
+  };
+}
+
+async function handleResponseStructure() {
+  const target = await findDiagnosticChatTab();
+  if (!target) return { ok: false, error: "no_chatgpt_tab" };
+  const { tab } = target;
+  try {
+    const structure = await chrome.tabs.sendMessage(tab.id, {
+      type: "response_structure",
+    });
+    return safeResponseStructure(structure, tab.id, target);
+  } catch {
+    return {
+      ok: false,
+      error: "content_script_unavailable",
+      tab_id: Number.isInteger(tab.id) ? tab.id : null,
     };
   }
 }
@@ -1706,6 +1938,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg?.type === "status") {
     sendResponse({ ...status, connection: connectionDiagnostic() });
+    return true;
+  }
+  if (msg?.type === "response_structure") {
+    // Snapshot structurel borné, demandé par le popup : le worker transmet la
+    // question à l'onglet diagnostiqué puis ne recopie que la liste blanche.
+    void handleResponseStructure().then(
+      sendResponse,
+      () => sendResponse({ ok: false, error: "diagnostic_failed" }),
+    );
     return true;
   }
   if (msg?.type === "reconnect") {

@@ -19,6 +19,13 @@ const diagnosticFields = {
   sendSelector: document.getElementById("send-selector"),
   sendStrategy: document.getElementById("send-strategy"),
   sendCandidates: document.getElementById("send-candidates"),
+  surface: document.getElementById("surface-status"),
+  strategy: document.getElementById("response-strategy"),
+  baselineRoots: document.getElementById("baseline-roots"),
+  currentRoots: document.getElementById("current-roots"),
+  candidate: document.getElementById("candidate-status"),
+  markdownRoot: document.getElementById("markdown-root"),
+  inlineLeaves: document.getElementById("inline-leaves"),
   message: document.getElementById("diagnostic-message"),
   json: document.getElementById("diagnostic-json"),
 };
@@ -41,9 +48,175 @@ const SEND_SELECTORS = new Set([
 ]);
 const STATUSES = new Set(["ok", "degraded", "missing", "ambiguous", "invalid", "not_rendered_idle"]);
 const CONNECTION_STATES = new Set(["stable", "connecting", "stale", "conflict", "disconnected"]);
+const RESPONSE_STRATEGIES = new Set(["semantic_assistant", "markdown_root_delta"]);
+const SURFACE_STRATEGIES = new Set([
+  "composer_main",
+  "composer_scroll_container",
+  "composer_parent",
+  "document_main",
+  "document_body",
+]);
+const STRUCTURE_LIMITS = {
+  depth: 6,
+  nodes: 200,
+  children: 40,
+  class_tokens: 8,
+  token_length: 40,
+  value_length: 64,
+};
+const STRUCTURE_DATA_KEYS = new Set([
+  "testid",
+  "author_role",
+  "turn",
+  "state",
+  "is_streaming",
+  "composer_markdown",
+  "aria_hidden",
+]);
+const STRUCTURE_TAGS = new Set([
+  "DIV", "SPAN", "P", "UL", "OL", "LI", "PRE", "CODE", "TABLE", "TBODY",
+  "THEAD", "TR", "TD", "TH", "BLOCKQUOTE", "H1", "H2", "H3", "H4", "H5",
+  "H6", "A", "STRONG", "EM", "HR", "BR", "IMG", "VIDEO", "CANVAS", "MAIN",
+  "SECTION", "ARTICLE", "FORM", "BUTTON",
+]);
 
 function boundedCount(value) {
   return Number.isInteger(value) ? Math.max(0, Math.min(value, 999)) : 0;
+}
+
+/** Contrat de réponse (ResponseRoot) : liste blanche fermée, jamais un texte. */
+function safeResponseLocator(raw) {
+  const locator = raw || {};
+  return {
+    conversation_surface: locator.conversation_surface === true,
+    surface_strategy: SURFACE_STRATEGIES.has(locator.surface_strategy)
+      ? locator.surface_strategy
+      : null,
+    strategy: RESPONSE_STRATEGIES.has(locator.strategy) ? locator.strategy : null,
+    baseline_root_count: boundedCount(locator.baseline_root_count),
+    current_root_count: boundedCount(locator.current_root_count),
+    candidate_found: locator.candidate_found === true,
+    candidate_root_tag: ["DIV", "ARTICLE", "SECTION", "SPAN", "P"].includes(
+      locator.candidate_root_tag,
+    )
+      ? locator.candidate_root_tag
+      : null,
+    markdown_root: locator.markdown_root === true,
+    inline_leaf_count: boundedCount(locator.inline_leaf_count),
+    ambiguity_count: boundedCount(locator.ambiguity_count),
+  };
+}
+
+/** Compteur borné : jamais un NaN, jamais une valeur non finie. */
+function structureCount(value) {
+  return Number.isInteger(value) ? Math.max(0, Math.min(value, 999)) : 0;
+}
+
+/** Token de classe : borné, jamais un caractère de balisage ni d'espace. */
+function structureToken(value) {
+  return typeof value === "string" &&
+    value.length <= STRUCTURE_LIMITS.token_length &&
+    !/[\s"'<>\\]/.test(value)
+    ? value
+    : null;
+}
+
+/** Valeur d'attribut sûre : courte et sans caractère de balisage. */
+function structureValue(value) {
+  return typeof value === "string" &&
+    value.length <= STRUCTURE_LIMITS.value_length &&
+    !/[\s"'<>\\]/.test(value)
+    ? value
+    : null;
+}
+
+function safeStructureData(raw) {
+  const data = {};
+  if (!raw || typeof raw !== "object") return data;
+  for (const [key, value] of Object.entries(raw)) {
+    if (!STRUCTURE_DATA_KEYS.has(key)) continue;
+    if (value === true) {
+      data[key] = true;
+      continue;
+    }
+    const bounded = structureValue(value);
+    if (bounded !== null) data[key] = bounded;
+  }
+  return data;
+}
+
+function safeStructureNode(raw, depth, budget) {
+  if (!raw || typeof raw !== "object" || depth > STRUCTURE_LIMITS.depth) return null;
+  budget.nodes += 1;
+  const children = [];
+  if (Array.isArray(raw.children)) {
+    for (const child of raw.children.slice(0, STRUCTURE_LIMITS.children)) {
+      if (budget.nodes >= STRUCTURE_LIMITS.nodes) break;
+      const node = safeStructureNode(child, depth + 1, budget);
+      if (node) children.push(node);
+    }
+  }
+  const dimension = (value) =>
+    Number.isInteger(value) && value >= 0 && value <= 100000 ? value : null;
+  return {
+    tag: STRUCTURE_TAGS.has(raw.tag) ? raw.tag : null,
+    class_tokens: Array.isArray(raw.class_tokens)
+      ? raw.class_tokens
+          .slice(0, STRUCTURE_LIMITS.class_tokens)
+          .map(structureToken)
+          .filter((token) => token !== null && token !== "")
+      : [],
+    role: structureValue(raw.role),
+    data_testid: structureValue(raw.data_testid),
+    data: safeStructureData(raw.data),
+    has_message_id: raw.has_message_id === true,
+    depth,
+    children_count: structureCount(raw.children_count),
+    children,
+    width: dimension(raw.width),
+    height: dimension(raw.height),
+    visible: raw.visible === true,
+  };
+}
+
+function safeRootStrategy(value) {
+  return RESPONSE_STRATEGIES.has(value) ? value : null;
+}
+
+/** Copie bornée du snapshot structurel : aucune propriété textuelle, jamais. */
+function safeResponseStructure(raw, tabId, diagnosticTarget) {
+  const surface = raw?.conversation_surface || {};
+  const roots = Array.isArray(raw?.roots) ? raw.roots : [];
+  return {
+    ok: raw?.ok === true,
+    content_script_version:
+      typeof raw?.content_script_version === "string"
+        ? raw.content_script_version.slice(0, 20)
+        : null,
+    tab_id: Number.isInteger(tabId) ? tabId : null,
+    diagnostic_target: {
+      source: ["inflight", "browser_target", "bridge_conversation", "temporary_chat", "generic_chatgpt_tab"].includes(diagnosticTarget?.source)
+        ? diagnosticTarget.source
+        : "generic_chatgpt_tab",
+      bridge_owned: diagnosticTarget?.bridge_owned === true,
+    },
+    conversation_surface: {
+      found: surface.found === true,
+      strategy: SURFACE_STRATEGIES.has(surface.strategy) ? surface.strategy : null,
+      node: surface.node ? safeStructureNode(surface.node, 0, { nodes: 0 }) : null,
+    },
+    strategy: safeRootStrategy(raw?.strategy),
+    markdown_root_matches: structureCount(raw?.markdown_root_matches),
+    semantic_assistant_matches: structureCount(raw?.semantic_assistant_matches),
+    inline_leaf_matches: structureCount(raw?.inline_leaf_matches),
+    roots: roots
+      .slice(0, STRUCTURE_LIMITS.nodes)
+      .map((root) => ({
+        strategy: safeRootStrategy(root?.strategy),
+        node: safeStructureNode(root?.node, 0, { nodes: 0 }),
+      }))
+      .filter((root) => root.node !== null),
+  };
 }
 
 /** Préfixe d'identifiant (8 caractères hex/tiret au plus), jamais un id complet. */
@@ -141,6 +314,7 @@ function safeDiagnostic(raw) {
         ? send.same_form_as_composer
         : null,
     },
+    response_locator: safeResponseLocator(raw.response_locator),
   };
 }
 
@@ -157,6 +331,25 @@ function setStatus(element, value, fallback = "BROKEN") {
   element.className = display[1];
 }
 
+/** Copie défensive : presse-papiers, puis repli `execCommand` borné. */
+async function copyText(value) {
+  try {
+    await navigator.clipboard.writeText(value);
+    return true;
+  } catch {
+    const temporary = document.createElement("textarea");
+    temporary.value = value;
+    temporary.setAttribute("readonly", "");
+    temporary.style.position = "fixed";
+    temporary.style.opacity = "0";
+    document.body.append(temporary);
+    temporary.select();
+    const copied = document.execCommand("copy");
+    temporary.remove();
+    return copied;
+  }
+}
+
 function describeStrategy(strategy) {
   return {
     named_selector: "named selector",
@@ -166,6 +359,7 @@ function describeStrategy(strategy) {
 
 function renderDiagnostic(raw) {
   diagnostic = safeDiagnostic(raw);
+  document.getElementById("copy-response-structure").disabled = true;
   document.getElementById("copy-diagnostic").disabled = false;
   diagnosticFields.json.textContent = JSON.stringify(diagnostic, null, 2);
   diagnosticFields.json.hidden = false;
@@ -213,13 +407,21 @@ function renderDiagnostic(raw) {
     diagnosticFields.sendSelector.textContent = "—";
     diagnosticFields.sendStrategy.textContent = "";
     diagnosticFields.sendCandidates.textContent = "";
+    diagnosticFields.surface.textContent = "—";
+    diagnosticFields.surface.className = "contract-neutral";
+    diagnosticFields.strategy.textContent = "—";
+    diagnosticFields.baselineRoots.textContent = "—";
+    diagnosticFields.currentRoots.textContent = "—";
+    setStatus(diagnosticFields.candidate, "missing", "NONE");
+    diagnosticFields.markdownRoot.textContent = "—";
+    diagnosticFields.inlineLeaves.textContent = "—";
     diagnosticFields.message.textContent = diagnostic.error === "no_chatgpt_tab"
       ? "Aucun onglet ChatGPT ouvert."
       : "Content script absent ou indisponible. Recharge l’onglet ChatGPT.";
     return;
   }
 
-  const { surface, composer, send } = diagnostic;
+  const { surface, composer, send, response_locator: locator } = diagnostic;
   if (diagnostic.diagnostic_target.source === "generic_chatgpt_tab") {
     diagnosticFields.temporary.textContent = "N/A";
     diagnosticFields.temporary.className = "contract-neutral";
@@ -241,6 +443,29 @@ function renderDiagnostic(raw) {
   diagnosticFields.sendCandidates.textContent = send.status === "not_rendered_idle"
     ? `${send.visible_candidates} visible · bouton non rendu tant que le composer est vide`
     : `${send.visible_candidates} visible · type ${send.type || "unknown"} · disabled ${send.disabled ? "yes" : "no"} · aria-disabled ${send.aria_disabled ? "yes" : "no"} · same form ${send.same_form_as_composer == null ? "unknown" : send.same_form_as_composer ? "yes" : "no"}`;
+  // Response locator : surface, stratégie et comptages — jamais un contenu.
+  diagnosticFields.surface.textContent = locator.conversation_surface
+    ? `OK${locator.surface_strategy ? ` (${locator.surface_strategy})` : ""}`
+    : "ABSENTE";
+  diagnosticFields.surface.className = locator.conversation_surface
+    ? "contract-good"
+    : "contract-bad";
+  diagnosticFields.strategy.textContent = locator.strategy || "—";
+  diagnosticFields.baselineRoots.textContent = String(locator.baseline_root_count);
+  diagnosticFields.currentRoots.textContent = String(locator.current_root_count);
+  const candidateLabel = locator.ambiguity_count > 0
+    ? ["AMBIGUOUS", "contract-bad"]
+    : locator.candidate_found
+      ? ["FOUND", "contract-good"]
+      : ["NONE", "contract-neutral"];
+  diagnosticFields.candidate.textContent = candidateLabel[0];
+  diagnosticFields.candidate.className = candidateLabel[1];
+  diagnosticFields.markdownRoot.textContent = locator.markdown_root ? "YES" : "NO";
+  diagnosticFields.markdownRoot.className = locator.markdown_root
+    ? "contract-good"
+    : "contract-neutral";
+  diagnosticFields.inlineLeaves.textContent = String(locator.inline_leaf_count);
+  document.getElementById("copy-response-structure").disabled = false;
   diagnosticFields.message.textContent = "Diagnostic terminé. Aucun contenu de conversation n’a été lu.";
 }
 
@@ -306,25 +531,42 @@ document.getElementById("diagnose").addEventListener("click", async () => {
 
 document.getElementById("copy-diagnostic").addEventListener("click", async () => {
   if (!diagnostic) return;
-  const json = JSON.stringify(diagnostic, null, 2);
+  diagnosticFields.message.textContent = (await copyText(
+    JSON.stringify(diagnostic, null, 2),
+  ))
+    ? "Diagnostic JSON copié."
+    : "Copie impossible depuis cette fenêtre.";
+});
+
+/**
+ * Demande le snapshot structurel borné au service worker puis le copie.
+ * Le popup ne recopie jamais la page : `safeResponseStructure` re-filtre.
+ */
+document.getElementById("copy-response-structure").addEventListener("click", async () => {
+  const button = document.getElementById("copy-response-structure");
+  button.disabled = true;
   try {
-    await navigator.clipboard.writeText(json);
-  } catch {
-    const temporary = document.createElement("textarea");
-    temporary.value = json;
-    temporary.setAttribute("readonly", "");
-    temporary.style.position = "fixed";
-    temporary.style.opacity = "0";
-    document.body.append(temporary);
-    temporary.select();
-    const copied = document.execCommand("copy");
-    temporary.remove();
-    if (!copied) {
-      diagnosticFields.message.textContent = "Copie impossible depuis cette fenêtre.";
+    const structure = safeResponseStructure(
+      await chrome.runtime.sendMessage({ type: "response_structure" }),
+      diagnostic?.tab_id ?? null,
+      diagnostic?.diagnostic_target ?? null,
+    );
+    if (structure.ok !== true) {
+      diagnosticFields.message.textContent =
+        "Structure de réponse indisponible (content script absent ?).";
       return;
     }
+    diagnosticFields.message.textContent = (await copyText(
+      JSON.stringify(structure, null, 2),
+    ))
+      ? "Structure de réponse copiée."
+      : "Copie impossible depuis cette fenêtre.";
+  } catch {
+    diagnosticFields.message.textContent =
+      "Structure de réponse indisponible (content script absent ?).";
+  } finally {
+    button.disabled = false;
   }
-  diagnosticFields.message.textContent = "Diagnostic JSON copié.";
 });
 
 chrome.storage.local.get(["serverUrl", "wsToken"]).then(({ serverUrl, wsToken }) => {

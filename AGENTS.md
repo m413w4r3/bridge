@@ -95,6 +95,21 @@ response text can never change what conversation is opened or closed.
   guard. See "Quatre bornes indépendantes" in
   `docs/chatgpt_bridge_operations.md`.
 - **No timeout resubmits** the prompt.
+- **The response is located by DOM delta, never by position.** The rendered
+  answer is a *ResponseRoot* — either the historical semantic assistant turn
+  (`semantic_assistant`) or, in the current ChatGPT UI, the `div` whose class
+  starts with `MarkdownRoot-` (`markdown_root_delta`). The candidate is the
+  structural surplus measured against `captureResponseBaseline()` taken just
+  before the single Send, inside the composer-linked conversation surface;
+  "the last MarkdownRoot in the page" is never an answer, `inline-markdown`
+  leaves are only evidence of conversational content. Two simultaneous new
+  roots, or inline leaves with no resolvable root, fail closed as
+  `bridge_response_contract_drift` with `submission_state = post_submission`
+  and no replay. The locator identity is run-local (WeakMap/ordinal/class
+  signature) so a React node replacement re-attaches to the same logical
+  candidate — it is never persisted as a conversation, turn or message id.
+  See "Contrat de réponse (ResponseRoot)" in
+  `docs/chatgpt_bridge_operations.md`.
 - **conversation_id + exact live tab binding + expected_turn_id** remain strict
   (no inference, no recovery search, no URL-based reopening).
   `external_locator` is diagnostic only and is never used to route or reopen
@@ -170,13 +185,14 @@ uv run \
   python -m pytest tests/ -q --tb=short
 ```
 
-Run the JavaScript gate (7+ passed; `npm ci` installs jsdom once):
+Run the JavaScript gate (8+ passed; `npm ci` installs jsdom once):
 
 ```bash
 npm ci
 node --test \
   tests/completion.test.js \
   tests/content-dom.test.js \
+  tests/response-root.test.js \
   tests/final-output.test.js \
   tests/background-conversation.test.js \
   tests/content-background-tab.test.js \

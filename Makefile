@@ -32,6 +32,7 @@ test-js: node_modules
 	node --test \
 		tests/completion.test.js \
 		tests/content-dom.test.js \
+		tests/response-root.test.js \
 		tests/final-output.test.js \
 		tests/background-conversation.test.js \
 		tests/content-background-tab.test.js \

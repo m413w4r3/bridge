@@ -1605,7 +1605,7 @@ async function main() {
       contentMessage = { tabId, message };
       return {
         ok: true,
-        content_script_version: "36",
+        content_script_version: "37",
         surface: {
           origin_ok: true,
           pathname: "/",
@@ -1671,7 +1671,9 @@ async function main() {
       "wsToken",
       "Authorization",
       "prompt",
-      "response",
+      "innerText",
+      "innerHTML",
+      "textContent",
     ]) {
       assert.equal(json.toLowerCase().includes(forbidden.toLowerCase()), false, forbidden);
     }

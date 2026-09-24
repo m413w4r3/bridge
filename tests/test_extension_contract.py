@@ -31,7 +31,7 @@ def test_extension_reserves_request_before_real_send_trigger() -> None:
     # émis avant tout `continue` dépendant du DOM, sinon une phase de recherche
     # web qui remplace le tour assistant provoque un faux idle timeout.
     assert 'type: "heartbeat"' in content
-    assert content.index('type: "heartbeat"') < content.index("if (!turn) continue;")
+    assert content.index('type: "heartbeat"') < content.index("if (!candidate) continue;")
     assert 'type: "chunk"' not in content
     assert "text: serialized.text" in content
     send_start = background.index("async function sendToTab(")
