@@ -27,7 +27,17 @@ let connectAttempt = null;
 let reconnectDelay = RECONNECT_MIN;
 let reconnectTimer = null;
 let suppressUntil = 0;
+/** Raison typée de la suppression courante : "replaced" (4000) ou "owner_active" (4409). */
+let suppressReason = null;
 let status = { connected: false, lastError: null, url: DEFAULT_URL };
+// Diagnostic de connexion sans contenu : identité du socket courant, nombre de
+// reconnexions de ce worker et âge du dernier ping serveur.
+let connectionIdentity = null;
+let openedConnections = 0;
+let lastPingAt = null;
+// Le serveur pinge toutes les 20 s ; au-delà de trois pings manqués, un socket
+// OPEN est considéré stale (même borne que BRIDGE_EXTENSION_PONG_TIMEOUT).
+const PING_STALE_MS = 60000;
 /** id de requête -> id de l'onglet qui la traite */
 const inflight = new Map();
 /** Deuxième barrière persistante : un id reçu n'est jamais retransmis deux fois au DOM. */
@@ -380,6 +390,10 @@ async function connect() {
     ws.onopen = () => {
       if (socket !== ws) return;
       reconnectDelay = RECONNECT_MIN;
+      connectionIdentity = identity;
+      openedConnections += 1;
+      lastPingAt = null;
+      suppressReason = null;
       setStatus({ connected: true, lastError: null });
       send({ type: "hello", client: "extension-chrome", ...identity });
       flush(); // rejoue ce qui a été produit pendant la coupure
@@ -395,6 +409,7 @@ async function connect() {
         return;
       }
       if (msg.type === "ping") {
+        lastPingAt = Date.now();
         send({ type: "pong" }); // maintient aussi le service worker éveillé
         pumpObservationTicks();
         return;
@@ -429,6 +444,7 @@ async function connect() {
         // Le serveur nous a remplacés par un autre client (fake_extension.py,
         // un second profil Chrome…). On s'efface au lieu de reprendre la main.
         suppressUntil = Date.now() + REPLACED_BACKOFF;
+        suppressReason = "replaced";
         scheduleReconnect(ws, "remplacé par un autre client du pont", { generation });
         return;
       }
@@ -436,6 +452,7 @@ async function connect() {
         // Un autre owner détient un lease sain : attendre avant toute nouvelle
         // tentative évite une oscillation entre plusieurs profils Chrome.
         suppressUntil = Date.now() + REPLACED_BACKOFF;
+        suppressReason = "owner_active";
         scheduleReconnect(ws, "owner_active", { generation });
         return;
       }
@@ -689,6 +706,32 @@ async function findDiagnosticChatTab() {
   });
 }
 
+/**
+ * État de connexion du point de vue du worker, sans contenu ni secret :
+ * seuls des préfixes d'identifiants, des compteurs et des âges bornés.
+ */
+function connectionDiagnostic(now = Date.now()) {
+  const open = socket?.readyState === WebSocket.OPEN;
+  let state;
+  if (now < suppressUntil) state = "conflict";
+  else if (!socket) state = "disconnected";
+  else if (!open) state = "connecting";
+  else if (lastPingAt !== null && now - lastPingAt > PING_STALE_MS) state = "stale";
+  else state = "stable";
+  const prefix = (value) => (typeof value === "string" ? value.slice(0, 8) : null);
+  const current = open ? connectionIdentity : null;
+  return {
+    state,
+    conflict_reason: state === "conflict" ? suppressReason : null,
+    instance_id_prefix: prefix(current?.instance_id),
+    worker_session_prefix: prefix(workerSessionId),
+    connection_id_prefix: prefix(current?.connection_id),
+    reconnections: Math.max(0, openedConnections - 1),
+    seconds_since_ping:
+      open && lastPingAt !== null ? Math.max(0, Math.round((now - lastPingAt) / 1000)) : null,
+  };
+}
+
 function diagnosticCount(value) {
   return Number.isInteger(value) ? Math.max(0, Math.min(value, 999)) : 0;
 }
@@ -733,6 +776,7 @@ function safeDomHealth(raw, tabId) {
     tab_id: Number.isInteger(tabId) ? tabId : null,
     extension_state: "active",
     websocket_state: status.connected ? "connected" : "disconnected",
+    connection: connectionDiagnostic(),
     surface: {
       origin_ok: surface.origin_ok === true,
       pathname: typeof surface.pathname === "string" ? surface.pathname.slice(0, 128) : "",
@@ -779,6 +823,7 @@ async function handleUiDiagnostic() {
       error: "no_chatgpt_tab",
       extension_state: "active",
       websocket_state: status.connected ? "connected" : "disconnected",
+      connection: connectionDiagnostic(),
     };
   }
   try {
@@ -791,6 +836,7 @@ async function handleUiDiagnostic() {
       tab_id: Number.isInteger(tab.id) ? tab.id : null,
       extension_state: "active",
       websocket_state: status.connected ? "connected" : "disconnected",
+      connection: connectionDiagnostic(),
     };
   }
 }
@@ -1606,18 +1652,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         error: "diagnostic_failed",
         extension_state: "active",
         websocket_state: status.connected ? "connected" : "disconnected",
+        connection: connectionDiagnostic(),
       }),
     );
     return true;
   }
   if (msg?.type === "status") {
-    sendResponse(status);
+    sendResponse({ ...status, connection: connectionDiagnostic() });
     return true;
   }
   if (msg?.type === "reconnect") {
     // Reconnexion manuelle : reprend le pont même si on vient d'être remplacé.
     reconnectDelay = RECONNECT_MIN;
     suppressUntil = 0;
+    suppressReason = null;
     connect();
     sendResponse({ ok: true });
     return true;

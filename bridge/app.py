@@ -315,6 +315,10 @@ class BridgeApplication:
         registry_accessible = self.registry.accessible()
         if not registry_accessible:
             status = "server_unavailable"
+        elif not self.accepting_runs or self.bridge.closing:
+            # Pendant le drainage de l'arrêt, l'extension peut encore être
+            # saine : annoncer 200 inviterait un run que le serveur refuse.
+            status = "server_shutting_down"
         elif not configuration["complete"]:
             status = "configuration_incomplete"
         else:

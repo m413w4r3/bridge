@@ -170,7 +170,7 @@ uv run \
   python -m pytest tests/ -q --tb=short
 ```
 
-Run the JavaScript gate (6+ passed; `npm ci` installs jsdom once):
+Run the JavaScript gate (7+ passed; `npm ci` installs jsdom once):
 
 ```bash
 npm ci
@@ -180,5 +180,6 @@ node --test \
   tests/final-output.test.js \
   tests/background-conversation.test.js \
   tests/content-background-tab.test.js \
-  tests/serializer.test.js
+  tests/serializer.test.js \
+  tests/dom-contract.test.js
 ```

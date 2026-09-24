@@ -1197,3 +1197,129 @@ async def test_bridge_logs_neither_prompt_nor_idempotency_secret(
     assert "TOP-SECRET-PROMPT" not in rendered
     assert "TOP-SECRET-IDEMPOTENCY-KEY" not in rendered
     assert "idempotency_fingerprint=" in rendered
+
+
+class _SelectorDriftExtension(FakeExtension):
+    """Content script whose composer contract no longer matches the page.
+
+    The error packet mirrors `uiContractError()` in `extension/content.js`:
+    typed code, pre-submission phase, and a bounded `dom_health` snapshot.
+    """
+
+    async def _respond(self, payload: dict[str, Any]) -> None:
+        if payload["type"] != "prompt":
+            await super()._respond(payload)
+            return
+        self.prompt_count += 1
+        await asyncio.sleep(0)
+        browser_target = payload.get("browser_target")
+        route = (
+            {"target_id": browser_target["id"], "tab_id": 1}
+            if isinstance(browser_target, dict) and browser_target.get("id")
+            else {}
+        )
+        self.runtime.bridge.dispatch(
+            {
+                "type": "error",
+                "id": payload["id"],
+                "event_id": "1",
+                "code": "bridge_ui_timeout",
+                "message": "composer introuvable",
+                "phase": "pre_submission",
+                "submission_state": "pre_submission",
+                "diagnostics": {
+                    "ui_contract_error": "composer_missing",
+                    "composer_strategy": "structural_fallback",
+                    "composer_selector": "[contenteditable='true'][role='textbox']",
+                    "composer_candidate_count": 0,
+                    "content_script_version": "36",
+                    "dom_health": {
+                        "ok": True,
+                        "content_script_version": "36",
+                        "surface": {
+                            "origin_ok": True,
+                            "pathname": "/",
+                            "temporary_query": True,
+                            "temporary_status": "ok",
+                            "visibility_state": "hidden",
+                            "has_focus": False,
+                        },
+                        "composer": {
+                            "status": "missing",
+                            "strategy": "structural_fallback",
+                            "selector": "[contenteditable='true'][role='textbox']",
+                            "visible_candidates": 0,
+                            "known_selector_candidates": 0,
+                            "structural_candidates": 0,
+                            "tag": None,
+                            "role": None,
+                            "contenteditable": False,
+                            "data_composer_markdown": False,
+                            "form_found": False,
+                        },
+                        "send": {
+                            "status": "missing",
+                            "strategy": "structural_fallback",
+                            "selector": "button[type='submit']",
+                            "visible_candidates": 0,
+                            "type": None,
+                            "disabled": False,
+                            "aria_disabled": False,
+                            "same_form_as_composer": False,
+                        },
+                    },
+                },
+                **route,
+            }
+        )
+
+
+async def test_pre_submission_selector_drift_is_a_typed_502_with_dom_health(
+    runtime: BridgeApplication, tmp_path: Path
+) -> None:
+    isolated_registry(runtime, tmp_path)
+    extension = _SelectorDriftExtension(runtime)
+    runtime.bridge.ws = extension
+
+    with pytest.raises(HTTPException) as raised:
+        await runtime.bridge_routes.create_bridge_run(
+            BridgeRunRequest(input="SECRET_PROMPT_BODY"), request_with_key("selector-drift")
+        )
+
+    assert raised.value.status_code == 502
+    rendered = await runtime.openai_error(None, raised.value)  # type: ignore[arg-type]
+    assert rendered.status_code == 502
+    error = json.loads(rendered.body)["error"]
+    assert error["code"] == "bridge_ui_timeout"
+    assert error["phase"] == "pre_submission"
+    assert error["submission_state"] == "pre_submission"
+    assert error["retryable"] is True
+    details = error["details"]
+    assert details["ui_contract_error"] == "composer_missing"
+    assert details["dom_health"]["content_script_version"] == "36"
+    # `_safe_diagnostics` drops null leaves (tag/role) and keeps the rest.
+    assert details["dom_health"]["composer"] == {
+        "status": "missing",
+        "strategy": "structural_fallback",
+        "selector": "[contenteditable='true'][role='textbox']",
+        "visible_candidates": 0,
+        "known_selector_candidates": 0,
+        "structural_candidates": 0,
+        "contenteditable": False,
+        "data_composer_markdown": False,
+        "form_found": False,
+    }
+    assert details["dom_health"]["send"]["status"] == "missing"
+    assert "SECRET_PROMPT_BODY" not in rendered.body.decode()
+    # Pre-submission: nothing was sent to ChatGPT, so the target is released,
+    # never retained for recovery, and the prompt was delivered exactly once.
+    assert extension.prompt_count == 1
+    assert not [m for m in extension.sent if m["type"] == "browser_target_retain"]
+    # The durable record replays the same diagnostic for the same key.
+    with pytest.raises(HTTPException) as replay:
+        await runtime.bridge_routes.create_bridge_run(
+            BridgeRunRequest(input="SECRET_PROMPT_BODY"), request_with_key("selector-drift")
+        )
+    assert replay.value.status_code == 502
+    assert replay.value.detail["details"]["dom_health"]["composer"]["status"] == "missing"
+    assert extension.prompt_count == 1

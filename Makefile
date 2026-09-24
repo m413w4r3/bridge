@@ -35,7 +35,8 @@ test-js: node_modules
 		tests/final-output.test.js \
 		tests/background-conversation.test.js \
 		tests/content-background-tab.test.js \
-		tests/serializer.test.js
+		tests/serializer.test.js \
+		tests/dom-contract.test.js
 
 test: test-python test-js
 

@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "35";
+const VERSION = "36";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -1479,7 +1479,10 @@ function completionState(turn) {
   // ne doit jamais maintenir ce tour en état « running ». Volontairement sans
   // `composerRoot()`, dont le repli sur document.body rendrait le scope inutile :
   // composer introuvable => pas de signal, plutôt qu'un signal de toute la page.
-  const composer = resolveComposer().element;
+  // Observation pure : `inspect*` ne lève jamais. Une ambiguïté transitoire du
+  // composer après l'envoi signifie « pas de signal », jamais une erreur de
+  // contrat UI qui ferait échouer un tour déjà soumis.
+  const composer = inspectComposer().element;
   const generationControls =
     composer && (closestOf(composer, ["form"]) || composer.parentElement);
   const visible = (element) => {
@@ -1518,7 +1521,7 @@ function completionState(turn) {
       [...scope.querySelectorAll(selector)].some(visible),
     ),
     // Conservé uniquement comme observation : le moteur pur l'ignore volontairement.
-    sendVisible: Boolean(composer && resolveSendButton(composer).element),
+    sendVisible: Boolean(composer && inspectSendButton(composer).element),
   });
 }
 

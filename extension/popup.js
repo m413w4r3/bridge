@@ -10,6 +10,7 @@ const diagnosticFields = {
   send: document.getElementById("send-status"),
   version: document.getElementById("content-version"),
   extension: document.getElementById("extension-state"),
+  connection: document.getElementById("connection-detail"),
   tab: document.getElementById("diagnostic-tab"),
   composerSelector: document.getElementById("composer-selector"),
   composerStrategy: document.getElementById("composer-strategy"),
@@ -38,9 +39,34 @@ const SEND_SELECTORS = new Set([
   "button[type='submit']",
 ]);
 const STATUSES = new Set(["ok", "degraded", "missing", "ambiguous", "invalid"]);
+const CONNECTION_STATES = new Set(["stable", "connecting", "stale", "conflict", "disconnected"]);
 
 function boundedCount(value) {
   return Number.isInteger(value) ? Math.max(0, Math.min(value, 999)) : 0;
+}
+
+/** Préfixe d'identifiant (8 caractères hex/tiret au plus), jamais un id complet. */
+function idPrefix(value) {
+  return typeof value === "string" && /^[0-9a-f-]{1,8}$/i.test(value) ? value : null;
+}
+
+function safeConnection(raw) {
+  const connection = raw || {};
+  const state = CONNECTION_STATES.has(connection.state) ? connection.state : "disconnected";
+  return {
+    state,
+    conflict_reason:
+      state === "conflict" && ["replaced", "owner_active"].includes(connection.conflict_reason)
+        ? connection.conflict_reason
+        : null,
+    instance_id_prefix: idPrefix(connection.instance_id_prefix),
+    worker_session_prefix: idPrefix(connection.worker_session_prefix),
+    connection_id_prefix: idPrefix(connection.connection_id_prefix),
+    reconnections: boundedCount(connection.reconnections),
+    seconds_since_ping: Number.isInteger(connection.seconds_since_ping)
+      ? Math.max(0, Math.min(connection.seconds_since_ping, 86400))
+      : null,
+  };
 }
 
 /** Copy only the fixed diagnostic contract; never pass arbitrary message data through. */
@@ -54,6 +80,7 @@ function safeDiagnostic(raw) {
     tab_id: Number.isInteger(raw?.tab_id) ? raw.tab_id : null,
     extension_state: raw?.extension_state === "active" ? "active" : "unknown",
     websocket_state: raw?.websocket_state === "connected" ? "connected" : "disconnected",
+    connection: safeConnection(raw?.connection),
   };
   if (raw?.ok !== true) {
     return {
@@ -132,11 +159,23 @@ function renderDiagnostic(raw) {
   document.getElementById("copy-diagnostic").disabled = false;
   diagnosticFields.json.textContent = JSON.stringify(diagnostic, null, 2);
   diagnosticFields.json.hidden = false;
+  const { connection } = diagnostic;
   diagnosticFields.extension.textContent =
-    `${diagnostic.extension_state} / WebSocket ${diagnostic.websocket_state}`;
-  diagnosticFields.extension.className = diagnostic.websocket_state === "connected"
-    ? "contract-good"
-    : "contract-warn";
+    `${diagnostic.extension_state} / WebSocket ${connection.state.toUpperCase()}`;
+  diagnosticFields.extension.className = {
+    stable: "contract-good",
+    connecting: "contract-warn",
+    stale: "contract-bad",
+    conflict: "contract-bad",
+  }[connection.state] || "contract-bad";
+  diagnosticFields.connection.textContent = [
+    `instance ${connection.instance_id_prefix || "—"}`,
+    `worker ${connection.worker_session_prefix || "—"}`,
+    `connexion ${connection.connection_id_prefix || "—"}`,
+    `reconnexions ${connection.reconnections}`,
+    `dernier ping ${connection.seconds_since_ping == null ? "—" : `${connection.seconds_since_ping} s`}`,
+    connection.conflict_reason ? `conflit ${connection.conflict_reason}` : null,
+  ].filter(Boolean).join(" · ");
 
   if (!diagnostic.ok) {
     setStatus(diagnosticFields.temporary, "invalid");

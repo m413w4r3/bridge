@@ -29,6 +29,14 @@
     "[data-is-streaming='true']",
   ];
 
+  // Copie lisible du contrat de extension/content.js (SELECTORS.composer/send,
+  // inspectComposer, inspectSendButton). tests/dom-contract.test.js vérifie
+  // qu'elle couvre toujours le runtime.
+  function estComposer(el) {
+    return el.tagName === "TEXTAREA" || el.tagName === "INPUT" ||
+      el.getAttribute("contenteditable") === "true";
+  }
+
   function visibles(selector) {
     return [...document.querySelectorAll(selector)].filter((el) => {
       if (!el.isConnected) return false;
@@ -40,7 +48,7 @@
 
   function inspecterComposer() {
     for (const selector of SELECTEURS_COMPOSER) {
-      const found = visibles(selector);
+      const found = visibles(selector).filter(estComposer);
       if (found.length > 1) return { element: null, status: "ambiguous", strategy: "named_selector", selector, count: found.length };
       if (found.length === 1) return { element: found[0], status: "ok", strategy: "named_selector", selector, count: 1 };
     }

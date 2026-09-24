@@ -320,8 +320,9 @@ HTTP/WebSocket, l’accès SQLite et l’état de l’extension. Après acceptat
 socket, le serveur attend au plus cinq secondes un premier paquet `hello`
 valide avant d’attacher cette connexion. Les états d’extension sont
 `extension_absent`, `extension_handshake_pending`, `extension_stale`,
-`extension_conflict` et `extension_available`. Seul `extension_available`
-répond HTTP 200. Une connexion récente peut attendre son premier pong pendant
+`extension_conflict` et `extension_available`. Pendant l’arrêt, `/ready`
+répond `server_shutting_down` dès que le serveur n’accepte plus de runs, même
+si l’extension est encore saine. Seul `extension_available` répond HTTP 200. Une connexion récente peut attendre son premier pong pendant
 40 secondes ; ensuite, un pong vieux de plus de 60 secondes rend l’extension
 stale. Ces seuils peuvent être réglés avec
 `BRIDGE_EXTENSION_HELLO_TIMEOUT`, `BRIDGE_EXTENSION_FIRST_PONG_GRACE`,
@@ -340,6 +341,99 @@ make logs
 
 `make status` affiche l’état Compose puis health, ready et capabilities. Il
 construit l’en-tête Bearer dans le conteneur et n’affiche jamais le secret.
+
+## UI contract drift
+
+Symptôme typique : les runs échouent en HTTP 502 avec
+`error.code = bridge_ui_timeout`, `phase = pre_submission` et
+`submission_state = pre_submission`. Rien n’a été envoyé à ChatGPT ; le
+détail porte `details.ui_contract_error` (`composer_missing`,
+`ambiguous_composer`, `send_missing`, `ambiguous_send_button`) et
+`details.dom_health`, par exemple :
+
+```json
+{
+  "composer": {"status": "missing", "visible_candidates": 0},
+  "content_script_version": "36"
+}
+```
+
+Procédure, dans cet ordre :
+
+1. Ouvrir le popup de l’extension (icône ChatGPT Mini-Bridge), avec un onglet
+   `chatgpt.com` ouvert.
+2. Cliquer **Diagnostiquer l’UI ChatGPT**. Le diagnostic ne lit aucun texte
+   de la page ni du composer.
+3. Interpréter les lignes Composer et Send :
+   - **OK** : un sélecteur nommé du contrat correspond à exactement un élément
+     visible. Rien à faire.
+   - **DEGRADED** : aucun sélecteur nommé ne correspond, mais le repli
+     structurel a trouvé un candidat unique et sûr (textbox `contenteditable`
+     dans un formulaire, ou bouton `submit` du formulaire du composer). Les
+     runs passent ; la console de l’onglet journalise
+     `bridge_dom_contract_degraded`. Ajouter la nouvelle signature à
+     `SELECTORS` dans `extension/content.js` (et aux listes blanches de
+     `background.js`/`popup.js` et à `tools/diagnose.js` —
+     `tests/dom-contract.test.js` échoue tant qu’elles divergent).
+   - **BROKEN** (missing) ou **AMBIGUOUS** : le runtime refusera d’écrire ou
+     d’envoyer, par construction ; il ne choisit jamais un élément au hasard.
+     Les compteurs `visible · known · structural` indiquent si le composer a
+     disparu (0 partout) ou s’il y en a plusieurs (≥ 2).
+   - **Content script v…** doit correspondre à `VERSION` dans
+     `extension/content.js` ; sinon recharger l’extension **et** l’onglet.
+4. Cliquer **Copier le diagnostic** : le JSON copié ne contient que le
+   contrat fixe (statuts, stratégie, sélecteur connu, compteurs, préfixes
+   d’identifiants). Il peut être joint à un ticket tel quel.
+5. Seulement si le popup ne suffit pas (il faut voir l’évolution pendant un
+   envoi), coller `tools/diagnose.js` dans la console DevTools de l’onglet :
+   il enregistre 90 s de transitions structurelles sans lire de texte.
+
+Pour vérifier la chaîne complète après correction :
+
+```bash
+BRIDGE_API_KEY=... tools/smoke_chatgpt_bridge.sh   # [base_url], défaut http://127.0.0.1:8001
+```
+
+Le script envoie « Reply exactly BRIDGE_OK », affiche le statut HTTP, la
+durée, puis soit `reply_match`, soit le code d’erreur et le `dom_health`
+borné. Il ne passe jamais la clé en argument de commande et ne l’affiche
+pas. Chaque exécution soumet un nouveau prompt (nouvelle clé
+d’idempotence).
+
+## WebSocket churn
+
+Symptôme : `/ready` alterne entre `extension_available`, `extension_stale`
+ou `extension_conflict`, ou les logs montrent des
+`extension_connection_replaced` / `extension_connection_conflict` répétés.
+Cinq valeurs, visibles à la fois dans `/health`/`/ready` (côté serveur) et
+dans la ligne « Extension / WebSocket » du diagnostic du popup (côté worker),
+suffisent à qualifier la situation :
+
+| Valeur | Serveur | Popup | Lecture |
+|---|---|---|---|
+| instance id | `instance_id_prefix` | `instance …` | Stable par installation de l’extension (chrome.storage.local). Deux préfixes différents = deux profils Chrome/installations. |
+| worker session | `worker_session_prefix` | `worker …` | Change à chaque redémarrage du service worker MV3. Changer seul, avec le même instance id, est normal. |
+| connection id | `connection_id_prefix` | `connexion …` | Change à chaque socket. |
+| reconnection count | `reconnections` | `reconnexions …` | Serveur : remplacements depuis son démarrage. Popup : reconnexions de ce worker. Une croissance régulière (≈ 1/min) signale une boucle. |
+| last pong / ping | `seconds_since_pong` | `dernier ping … s` | Au-delà de 60 s, la connexion est stale des deux côtés. |
+
+États du popup : **STABLE** (socket ouvert, ping récent), **CONNECTING**,
+**STALE** (socket ouvert sans ping depuis plus de 60 s), **CONFLICT** (le
+worker s’efface 60 s après `replaced` — fermeture 4000 — ou `owner_active`
+— fermeture 4409), **DISCONNECTED**.
+
+Interprétation :
+
+- instance id différents et `extension_conflict` : deux installations se
+  disputent le pont. Le serveur garde l’owner sain ; l’autre réessaie au plus
+  une fois par minute sans jamais le remplacer. Désactiver l’extension dans
+  le profil en trop.
+- même instance id, worker session qui change, reconnexions qui montent
+  lentement : redémarrages MV3 normaux ; aucune action.
+- `extension_stale` persistant avec popup STABLE : les pings ne passent plus
+  (proxy, réseau, serveur bloqué) ; consulter `make logs`.
+- Le bouton **Enregistrer & reconnecter** du popup lève volontairement la
+  suppression de 60 s ; ne pas l’utiliser en boucle sur deux profils.
 
 ## Cycle de vie et arrêt
 

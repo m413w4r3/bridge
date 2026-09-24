@@ -31,7 +31,9 @@ function createFakeWebSocket() {
     send(data) {
       this.sent.push(data);
     }
-    close() {}
+    close() {
+      this.closeCalls = (this.closeCalls || 0) + 1;
+    }
   }
   FakeWebSocket.instances = [];
   FakeWebSocket.CONNECTING = 0;
@@ -408,6 +410,149 @@ async function main() {
     socket.onclose({ code: 4409, reason: "owner_active" });
     assert.equal(run("suppressUntil - Date.now()"), 60000);
     assert.equal([...timers.pending.values()][0].delay, 60000);
+  }
+
+  // WebSocket race matrix, from the worker's point of view. Every state is
+  // reported by connectionDiagnostic() without content, and none of them
+  // produces a periodic replacement loop.
+  {
+    const connection = (run) => JSON.parse(JSON.stringify(run("connectionDiagnostic()")));
+
+    // OPEN stable: keepalive alarms and server pings never create or close a socket.
+    {
+      const { run, WebSocket, webSockets, timers } = await makeTransportHarness();
+      const socketA = webSockets[0];
+      openFakeSocket(socketA, WebSocket);
+      for (let tick = 0; tick < 20; tick += 1) {
+        await run("connect()"); // chrome.alarms "keepalive" listener
+        socketA.onmessage({ data: JSON.stringify({ type: "ping", t: tick }) });
+      }
+      assert.equal(webSockets.length, 1, "OPEN stable: no replacement socket");
+      assert.equal(socketA.closeCalls || 0, 0, "OPEN stable: never closed by the worker");
+      assert.equal(timers.pending.size, 0, "OPEN stable: no reconnect timer");
+      const state = connection(run);
+      assert.equal(state.state, "stable");
+      assert.equal(state.reconnections, 0);
+      assert.equal(state.seconds_since_ping, 0);
+      const hello = JSON.parse(socketA.sent.find((text) => JSON.parse(text).type === "hello"));
+      assert.equal(state.instance_id_prefix, hello.instance_id.slice(0, 8));
+      assert.equal(state.worker_session_prefix, hello.worker_session_id.slice(0, 8));
+      assert.equal(state.connection_id_prefix, hello.connection_id.slice(0, 8));
+      assert.equal(JSON.stringify(state).includes(hello.instance_id), false, "only id prefixes");
+      assert.equal(
+        socketA.sent.filter((text) => JSON.parse(text).type === "pong").length,
+        20,
+        "each ping gets exactly one pong",
+      );
+    }
+
+    // CONNECTING: alarms during the handshake do not open a second socket.
+    {
+      const { run, webSockets, timers } = await makeTransportHarness();
+      for (let tick = 0; tick < 5; tick += 1) await run("connect()");
+      assert.equal(webSockets.length, 1, "CONNECTING: one socket only");
+      assert.equal(timers.pending.size, 0);
+      assert.equal(connection(run).state, "connecting");
+    }
+
+    // Stale: an OPEN socket with no ping for more than 60 s is reported stale,
+    // but the worker does not tear it down itself (the server owns that verdict).
+    {
+      const { run, WebSocket, webSockets } = await makeTransportHarness();
+      const socketA = webSockets[0];
+      openFakeSocket(socketA, WebSocket);
+      run("globalThis.__realNow = Date.now; globalThis.__t0 = Date.now()");
+      socketA.onmessage({ data: JSON.stringify({ type: "ping" }) });
+      run("Date.now = () => __t0 + 61000");
+      const state = connection(run);
+      run("Date.now = __realNow");
+      assert.equal(state.state, "stale");
+      assert.ok(state.seconds_since_ping >= 61);
+      assert.equal(webSockets.length, 1);
+      assert.equal(socketA.closeCalls || 0, 0);
+    }
+
+    // 4000 on the current socket: conflict(replaced), and alarms during the
+    // suppression window never take the connection back.
+    {
+      const { run, WebSocket, webSockets } = await makeTransportHarness();
+      const socketA = webSockets[0];
+      openFakeSocket(socketA, WebSocket);
+      socketA.readyState = WebSocket.CLOSED;
+      socketA.onclose({ code: 4000 });
+      for (let tick = 0; tick < 5; tick += 1) await run("connect()");
+      assert.equal(webSockets.length, 1, "no reconnect during suppression");
+      const state = connection(run);
+      assert.equal(state.state, "conflict");
+      assert.equal(state.conflict_reason, "replaced");
+      assert.equal(state.connection_id_prefix, null);
+    }
+
+    // Two instances: owner_active is a typed conflict. Each retry waits the
+    // full backoff, so a contender makes at most one attempt per 60 s and
+    // never replaces anyone.
+    {
+      const { run, WebSocket, webSockets, timers } = await makeTransportHarness();
+      let rejected = 0;
+      for (let cycle = 0; cycle < 3; cycle += 1) {
+        const current = webSockets[webSockets.length - 1];
+        openFakeSocket(current, WebSocket);
+        current.readyState = WebSocket.CLOSED;
+        current.onclose({ code: 4409, reason: "owner_active" });
+        rejected += 1;
+        assert.equal(connection(run).state, "conflict");
+        assert.equal(connection(run).conflict_reason, "owner_active");
+        assert.equal(timers.pending.size, 1, "exactly one pending retry");
+        const [[timerId, timer]] = [...timers.pending.entries()];
+        assert.equal(timer.delay, 60000, "retry honours the owner_active backoff");
+        run("suppressUntil = 0"); // the 60 s have elapsed
+        timers.fire(timerId);
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      assert.equal(webSockets.length, rejected + 1, "one attempt per backoff window");
+      for (const old of webSockets.slice(0, -1)) {
+        assert.equal(old.closeCalls || 0, 0, "the contender never closes anyone");
+      }
+    }
+
+    // Reconnect after a plain drop: the counter and connection id move, the
+    // instance and worker session stay; the stale close of A changes nothing.
+    {
+      const { run, WebSocket, webSockets, timers } = await makeTransportHarness();
+      const socketA = webSockets[0];
+      openFakeSocket(socketA, WebSocket);
+      const before = connection(run);
+      socketA.readyState = WebSocket.CLOSED;
+      socketA.onclose({ code: 1006 });
+      assert.equal(connection(run).state, "disconnected");
+      const [timerId] = timers.pending.keys();
+      timers.fire(timerId);
+      await new Promise((resolve) => setImmediate(resolve));
+      const socketB = webSockets[1];
+      openFakeSocket(socketB, WebSocket);
+      socketA.onclose({ code: 1006 });
+      socketA.onerror();
+      const after = connection(run);
+      assert.equal(after.state, "stable");
+      assert.equal(after.reconnections, 1);
+      assert.equal(after.instance_id_prefix, before.instance_id_prefix);
+      assert.equal(after.worker_session_prefix, before.worker_session_prefix);
+      assert.notEqual(after.connection_id_prefix, before.connection_id_prefix);
+      assert.equal(webSockets.length, 2);
+      assert.equal(timers.pending.size, 0);
+    }
+
+    // The status message the popup polls carries the same safe connection block.
+    {
+      const { WebSocket, webSockets, mock } = await makeTransportHarness();
+      openFakeSocket(webSockets[0], WebSocket);
+      const response = await new Promise((resolve) => {
+        for (const listener of mock.messageListeners) listener({ type: "status" }, {}, resolve);
+      });
+      assert.equal(response.connected, true);
+      assert.equal(response.connection.state, "stable");
+      assert.equal(JSON.stringify(response).includes("token"), false);
+    }
   }
 
   // 1. FRESH A creates exactly one inactive tab at the Temporary Chat URL.
@@ -1460,7 +1605,7 @@ async function main() {
       contentMessage = { tabId, message };
       return {
         ok: true,
-        content_script_version: "35",
+        content_script_version: "36",
         surface: {
           origin_ok: true,
           pathname: "/",
