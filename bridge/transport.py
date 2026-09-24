@@ -4,14 +4,29 @@ import asyncio
 import logging
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Dict, Optional
 
 from fastapi import WebSocket
 
-from bridge.config import RECONNECT_GRACE
+from bridge.config import (
+    EXTENSION_CONFLICT_WINDOW,
+    EXTENSION_FIRST_PONG_GRACE,
+    EXTENSION_PONG_TIMEOUT,
+    RECONNECT_GRACE,
+)
 from bridge.contracts import UiState
 
 logger = logging.getLogger("chatgpt_bridge")
+
+
+@dataclass(frozen=True)
+class ExtensionIdentity:
+    instance_id: str
+    worker_session_id: str
+    connection_id: str
+    client_name: str
+    extension_version: str
 
 
 class Bridge:
@@ -28,7 +43,16 @@ class Bridge:
         # L'UI ChatGPT ne peut générer qu'une réponse à la fois.
         self.slot = asyncio.Lock()
         self.connected_at: Optional[float] = None
+        self.identified_at: Optional[float] = None
+        self.last_pong_at: Optional[float] = None
+        self.instance_id: Optional[str] = None
+        self.worker_session_id: Optional[str] = None
+        self.connection_id: Optional[str] = None
         self.client_name: str = "inconnu"
+        self.extension_version: Optional[str] = None
+        self._pending_handshakes: Dict[int, tuple[WebSocket, float]] = {}
+        self.connection_conflict_at: Optional[float] = None
+        self._has_connected = False
         self._grace: Optional[asyncio.Task] = None
         self.last_ui_state: Optional[UiState] = None
         self.last_ui_at: Optional[float] = None
@@ -40,23 +64,142 @@ class Bridge:
     def online(self) -> bool:
         return self.ws is not None
 
-    async def attach(self, ws: WebSocket) -> None:
-        if self.connected_at is not None:
+    @property
+    def identified(self) -> bool:
+        return bool(self.ws is not None and self.connection_id)
+
+    @property
+    def healthy_extension(self) -> bool:
+        """La connexion identifiée a un pong récent ou attend son premier ping."""
+        if not self.online or not self.identified or self.connected_at is None:
+            return False
+        now = time.time()
+        if self.last_pong_at is not None:
+            return now - self.last_pong_at <= EXTENSION_PONG_TIMEOUT
+        return now - self.connected_at <= EXTENSION_FIRST_PONG_GRACE
+
+    @property
+    def ready(self) -> bool:
+        return self.healthy_extension
+
+    @property
+    def handshake_pending(self) -> bool:
+        return bool(self._pending_handshakes)
+
+    @staticmethod
+    def _prefix(value: Optional[str]) -> str:
+        return value[:8] if value else "none"
+
+    def diagnostics(self, now: Optional[float] = None) -> dict:
+        now = time.time() if now is None else now
+        return {
+            "extension_connected": self.online,
+            "extension_identified": self.identified,
+            "extension_handshake_pending": self.handshake_pending,
+            "instance_id_prefix": self._prefix(self.instance_id),
+            "worker_session_prefix": self._prefix(self.worker_session_id),
+            "connection_id_prefix": self._prefix(self.connection_id),
+            "connected_for_seconds": (
+                max(0.0, now - self.connected_at) if self.connected_at is not None else None
+            ),
+            "seconds_since_pong": (
+                max(0.0, now - self.last_pong_at) if self.last_pong_at is not None else None
+            ),
+            "reconnections": self.reconnections,
+            "busy": self.slot.locked(),
+        }
+
+    def readiness_status(self, now: Optional[float] = None) -> str:
+        now = time.time() if now is None else now
+        if self.healthy_extension:
+            if (
+                self.connection_conflict_at is not None
+                and now - self.connection_conflict_at <= EXTENSION_CONFLICT_WINDOW
+            ):
+                return "extension_conflict"
+            return "extension_available"
+        if self.online and self.identified:
+            return "extension_stale"
+        if self.handshake_pending:
+            return "extension_handshake_pending"
+        return "extension_absent"
+
+    def begin_handshake(self, ws: WebSocket) -> None:
+        self._pending_handshakes[id(ws)] = (ws, time.time())
+
+    def end_handshake(self, ws: WebSocket) -> None:
+        self._pending_handshakes.pop(id(ws), None)
+
+    def is_current(self, ws: WebSocket, connection_id: str) -> bool:
+        return self.ws is ws and self.connection_id == connection_id
+
+    def record_pong(self, ws: WebSocket, connection_id: str) -> bool:
+        if not self.is_current(ws, connection_id):
+            return False
+        self.last_pong_at = time.time()
+        return True
+
+    async def attach(self, ws: WebSocket, identity: ExtensionIdentity) -> bool:
+        """Attache un hello validé si son owner est libre ou stale.
+
+        Un owner sain conserve son lease : cela empêche deux profils Chrome de
+        se voler silencieusement le transport à chaque reconnexion.
+        """
+        self.end_handshake(ws)
+        old_ws = self.ws
+        old_identity = self.instance_id
+        old_worker = self.worker_session_id
+        old_connected_at = self.connected_at
+        now = time.time()
+
+        if old_ws is not None and self.healthy_extension:
+            same_instance = old_identity == identity.instance_id
+            old_age_ms = max(0, int((now - (old_connected_at or now)) * 1000))
+            logger.warning(
+                "extension_connection_conflict old_instance=%s new_instance=%s "
+                "old_worker=%s new_worker=%s same_instance=%s old_connection_age_ms=%s",
+                self._prefix(old_identity),
+                self._prefix(identity.instance_id),
+                self._prefix(old_worker),
+                self._prefix(identity.worker_session_id),
+                str(same_instance).lower(),
+                old_age_ms,
+            )
+            self.connection_conflict_at = now
+            return False
+
+        if self._has_connected:
             self.reconnections += 1
-        if self.ws is not None:
-            # Un nouveau client prend la place de l'ancien : c'est ce qui permet
-            # à un rechargement d'onglet de reprendre le pont sans redémarrage.
-            print(f"⚠️  Connexion précédente ({self.client_name}) remplacée — un seul client à la fois")
-            try:
-                await self.ws.close(code=4000, reason="replaced")
-            except Exception:
-                pass
+        if old_ws is not None:
+            logger.info(
+                "extension_connection_replaced old_instance=%s new_instance=%s "
+                "old_worker=%s new_worker=%s",
+                self._prefix(old_identity),
+                self._prefix(identity.instance_id),
+                self._prefix(old_worker),
+                self._prefix(identity.worker_session_id),
+            )
         if self._grace is not None:
             self._grace.cancel()  # reconnexion à temps : les requêtes survivent
             self._grace = None
+
         self.ws = ws
-        self.connected_at = time.time()
-        self.client_name = "inconnu"
+        self.connected_at = now
+        self.identified_at = now
+        self.last_pong_at = None
+        self.instance_id = identity.instance_id
+        self.worker_session_id = identity.worker_session_id
+        self.connection_id = identity.connection_id
+        self.client_name = identity.client_name
+        self.extension_version = identity.extension_version
+        self._has_connected = True
+        self.connection_conflict_at = None
+        if old_ws is not None and old_ws is not ws:
+            try:
+                await old_ws.close(code=4000, reason="replaced")
+            except Exception:
+                pass
+        return True
 
     def detach(self, ws: WebSocket) -> None:
         # Un socket remplacé (`attach`) n'est plus l'actif : sa fermeture ne doit
@@ -65,8 +208,14 @@ class Bridge:
             return
         self.ws = None
         self.connected_at = None
+        self.identified_at = None
+        self.last_pong_at = None
+        self.instance_id = None
+        self.worker_session_id = None
+        self.connection_id = None
         self.client_name = "inconnu"
-        print("❌ Extension déconnectée")
+        self.extension_version = None
+        logger.info("extension_disconnected")
         # Un service worker MV3 est arrêté et relancé à tout moment : sa
         # reconnexion ne doit pas faire échouer une génération en cours. On
         # laisse donc un délai de grâce avant d'abandonner les requêtes.
@@ -82,12 +231,25 @@ class Bridge:
         ws = self.ws
         self.ws = None
         self.connected_at = None
+        self.identified_at = None
+        self.last_pong_at = None
+        self.instance_id = None
+        self.worker_session_id = None
+        self.connection_id = None
         self.client_name = "inconnu"
+        self.extension_version = None
         if ws is not None:
             try:
                 await ws.close(code=1001, reason="server shutdown")
             except Exception:
                 logger.exception("websocket_shutdown_failure")
+        pending = [entry[0] for entry in self._pending_handshakes.values()]
+        self._pending_handshakes.clear()
+        for pending_ws in pending:
+            try:
+                await pending_ws.close(code=1013, reason="server shutdown")
+            except Exception:
+                pass
 
     async def _fail_after_grace(self) -> None:
         await asyncio.sleep(RECONNECT_GRACE)

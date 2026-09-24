@@ -11,6 +11,8 @@ const RECONNECT_MIN = 1000;
 const RECONNECT_MAX = 30000;
 
 const REPLACED_BACKOFF = 60000; // après un remplacement, on laisse la place
+const workerSessionId = crypto.randomUUID();
+let bridgeInstanceIdPromise = null;
 
 // Toute conversation fraîche ouverte par le bridge est un Temporary Chat :
 // jamais écrite dans l'historique ChatGPT, donc jamais à en supprimer après
@@ -307,6 +309,21 @@ async function authenticatedServerUrl() {
   return parsed.toString();
 }
 
+async function persistentBridgeInstanceId() {
+  if (!bridgeInstanceIdPromise) {
+    bridgeInstanceIdPromise = (async () => {
+      const { bridgeInstanceId: storedId } = await chrome.storage.local.get("bridgeInstanceId");
+      if (typeof storedId === "string" && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(storedId)) {
+        return storedId.toLowerCase();
+      }
+      const instanceId = crypto.randomUUID();
+      await chrome.storage.local.set({ bridgeInstanceId: instanceId });
+      return instanceId;
+    })();
+  }
+  return bridgeInstanceIdPromise;
+}
+
 function setStatus(patch) {
   status = { ...status, ...patch };
   chrome.storage.local.set({ status });
@@ -336,6 +353,7 @@ async function connect() {
   try {
     const displayUrl = await serverUrl();
     const url = await authenticatedServerUrl();
+    const instanceId = await persistentBridgeInstanceId();
     if (connectAttempt !== attempt) return;
     if (socketIsOwned(socket)) return;
     if (Date.now() < suppressUntil) return;
@@ -343,6 +361,12 @@ async function connect() {
 
     if (socket && socket.readyState === WebSocket.CLOSED) socket = null;
     let ws;
+    const identity = {
+      instance_id: instanceId,
+      worker_session_id: workerSessionId,
+      connection_id: crypto.randomUUID(),
+      extension_version: chrome.runtime.getManifest().version,
+    };
     try {
       ws = new WebSocket(url);
     } catch (err) {
@@ -357,7 +381,7 @@ async function connect() {
       if (socket !== ws) return;
       reconnectDelay = RECONNECT_MIN;
       setStatus({ connected: true, lastError: null });
-      send({ type: "hello", client: "extension-chrome" });
+      send({ type: "hello", client: "extension-chrome", ...identity });
       flush(); // rejoue ce qui a été produit pendant la coupure
       console.log("🤖 Connecté au Mini-Bridge", displayUrl, enAttente.length ? "(file non vidée)" : "");
     };
@@ -406,6 +430,13 @@ async function connect() {
         // un second profil Chrome…). On s'efface au lieu de reprendre la main.
         suppressUntil = Date.now() + REPLACED_BACKOFF;
         scheduleReconnect(ws, "remplacé par un autre client du pont", { generation });
+        return;
+      }
+      if (event.code === 4409 && event.reason === "owner_active") {
+        // Un autre owner détient un lease sain : attendre avant toute nouvelle
+        // tentative évite une oscillation entre plusieurs profils Chrome.
+        suppressUntil = Date.now() + REPLACED_BACKOFF;
+        scheduleReconnect(ws, "owner_active", { generation });
         return;
       }
       scheduleReconnect(ws, null, { generation });

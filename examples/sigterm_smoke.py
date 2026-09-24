@@ -5,6 +5,7 @@ import http.client
 import json
 import os
 import sys
+import uuid
 import urllib.error
 import urllib.request
 from urllib.parse import urlencode
@@ -68,7 +69,18 @@ async def answer_ui(socket: websockets.ClientConnection, message: dict) -> None:
 async def run(phase: str) -> None:
     prompt_count = 0
     async with websockets.connect(f"{WS_URL}?{urlencode({'token': WS_TOKEN})}") as socket:
-        await socket.send(json.dumps({"type": "hello", "client": f"sigterm-{phase}"}))
+        await socket.send(
+            json.dumps(
+                {
+                    "type": "hello",
+                    "client": "extension-chrome",
+                    "instance_id": str(uuid.uuid4()),
+                    "worker_session_id": str(uuid.uuid4()),
+                    "connection_id": str(uuid.uuid4()),
+                    "extension_version": f"sigterm-{phase}",
+                }
+            )
+        )
         post = asyncio.create_task(asyncio.to_thread(post_run))
         try:
             while not post.done():

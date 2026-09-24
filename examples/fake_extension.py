@@ -1,8 +1,8 @@
 """Fausse extension : simule Chrome pour tester le serveur sans navigateur.
 
 ⚠️  Un seul client à la fois peut tenir le pont. Désactive l'extension Chrome
-(ou ferme l'onglet chatgpt.com) avant de lancer ce script, sinon l'un des deux
-se fait déconnecter avec le code 4000 « replaced ».
+(ou ferme l'onglet chatgpt.com) avant de lancer ce script ; un autre owner
+sain conserve son lease et ce simulateur est refusé avec `owner_active`.
 
     python examples/fake_extension.py
     BRIDGE_PORT=8001 python examples/fake_extension.py
@@ -52,6 +52,8 @@ UI = {"model": "gpt-5", "profile": "personnel", "web_search": False}
 # volontairement, pour prouver que le routage n'en dépend pas.
 TEMPORARY_CHAT_URL = "https://chatgpt.com/?temporary-chat=true"
 CONVERSATIONS: dict[str, str | None] = {}
+INSTANCE_ID = str(uuid.uuid4())
+WORKER_SESSION_ID = str(uuid.uuid4())
 
 
 def _picker(courant: list, choix: str, probe: bool) -> dict:
@@ -142,7 +144,18 @@ async def main() -> None:
         )
 
     async with ws:
-        await ws.send(json.dumps({"type": "hello", "client": "simulateur"}))
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "hello",
+                    "client": "extension-chrome",
+                    "instance_id": INSTANCE_ID,
+                    "worker_session_id": WORKER_SESSION_ID,
+                    "connection_id": str(uuid.uuid4()),
+                    "extension_version": "simulateur",
+                }
+            )
+        )
         print(f"connecté au bridge sur {URL}")
         try:
             async for raw in ws:

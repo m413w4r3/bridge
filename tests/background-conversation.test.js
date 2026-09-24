@@ -15,6 +15,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { webcrypto } = require("node:crypto");
 
 const EXTENSION = path.join(__dirname, "..", "extension");
 const BACKGROUND_SOURCE = fs.readFileSync(path.join(EXTENSION, "background.js"), "utf8");
@@ -189,6 +190,7 @@ function makeChromeMock() {
     },
     scripting: { executeScript: async () => {} },
     runtime: {
+      getManifest: () => ({ version: "1.2.3" }),
       onMessage: { addListener: (fn) => messageListeners.push(fn) },
       onStartup: { addListener: () => {} },
       onInstalled: { addListener: () => {} },
@@ -223,6 +225,7 @@ function loadBackground(chrome, timers = { setTimeout, clearTimeout }) {
     setTimeout: timers.setTimeout,
     clearTimeout: timers.clearTimeout,
     WebSocket,
+    crypto: webcrypto,
   };
   const context = vm.createContext(sandbox);
   vm.runInContext(BACKGROUND_SOURCE, context, { filename: "background.js" });
@@ -291,6 +294,44 @@ async function main() {
     assert.equal(timers.pending.size, timersBefore);
   }
 
+  // Extension identity survives reconnects and worker restarts. The worker
+  // id is module-scoped, while each newly-created WebSocket gets a new id.
+  {
+    const mock = makeChromeMock();
+    mock.localStore.wsToken = "test-ws-secret";
+    const timers = makeFakeTimers();
+    const first = loadBackground(mock.chrome, timers);
+    await new Promise((resolve) => setImmediate(resolve));
+    const socketA = first.webSockets[0];
+    openFakeSocket(socketA, first.WebSocket);
+    const helloA = JSON.parse(socketA.sent.find((text) => JSON.parse(text).type === "hello"));
+    assert.equal(helloA.instance_id, mock.localStore.bridgeInstanceId);
+    assert.ok(helloA.worker_session_id);
+    assert.ok(helloA.connection_id);
+    assert.equal(helloA.extension_version, "1.2.3");
+    assert.equal(Object.hasOwn(helloA, "wsToken"), false);
+    assert.equal(JSON.stringify(helloA).includes("test-ws-secret"), false);
+
+    socketA.readyState = first.WebSocket.CLOSED;
+    socketA.onclose({ code: 1006 });
+    await first.run("connect()");
+    const socketB = first.run("socket");
+    openFakeSocket(socketB, first.WebSocket);
+    const helloB = JSON.parse(socketB.sent.find((text) => JSON.parse(text).type === "hello"));
+    assert.equal(helloB.instance_id, helloA.instance_id, "instance id is stable on reconnect");
+    assert.equal(helloB.worker_session_id, helloA.worker_session_id, "worker id is stable in one worker");
+    assert.notEqual(helloB.connection_id, helloA.connection_id, "connection id changes per socket");
+
+    const restarted = loadBackground(mock.chrome, makeFakeTimers());
+    await new Promise((resolve) => setImmediate(resolve));
+    const socketC = restarted.webSockets[0];
+    openFakeSocket(socketC, restarted.WebSocket);
+    const helloC = JSON.parse(socketC.sent.find((text) => JSON.parse(text).type === "hello"));
+    assert.equal(helloC.instance_id, helloA.instance_id, "instance id survives worker restart");
+    assert.notEqual(helloC.worker_session_id, helloA.worker_session_id, "worker id changes on restart");
+    assert.notEqual(helloC.connection_id, helloB.connection_id);
+  }
+
   // send() queues during CLOSING and leaves reconnect ownership to A's close.
   {
     const { run, WebSocket, webSockets, timers } = await makeTransportHarness();
@@ -355,6 +396,18 @@ async function main() {
     );
     assert.equal(webSockets.length, 1, "send during suppression does not reconnect early");
     assert.deepEqual([...timers.pending.keys()], [timerId], "suppression timer remains the sole timer");
+  }
+
+  // A typed owner_active rejection uses the same backoff, avoiding connection
+  // ping-pong when another healthy extension owns the lease.
+  {
+    const { run, WebSocket, webSockets, timers } = await makeTransportHarness();
+    const socket = webSockets[0];
+    openFakeSocket(socket, WebSocket);
+    socket.readyState = WebSocket.CLOSED;
+    socket.onclose({ code: 4409, reason: "owner_active" });
+    assert.equal(run("suppressUntil - Date.now()"), 60000);
+    assert.equal([...timers.pending.values()][0].delay, 60000);
   }
 
   // 1. FRESH A creates exactly one inactive tab at the Temporary Chat URL.

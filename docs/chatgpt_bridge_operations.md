@@ -310,11 +310,28 @@ reconnexion. `GET /v1/bridge/metrics` expose des compteurs sans labels sensibles
 (runs, déduplication, conflits, timeouts UI, reconnexions et activité). Les probes de santé réussies ne sont pas journalisées par le
 backend. Aucun prompt, réponse, token, cookie ni clé brute ne doit être logué.
 
-`/health` est une liveness rapide et reste à HTTP 200 sans extension. `/ready`
-décrit séparément `server_operational`, la configuration HTTP/WebSocket,
-l’accès SQLite et l’état `extension_absent` ou `extension_available`. Une
-configuration incomplète et une extension absente répondent HTTP 503 sans
-faire échouer le healthcheck Compose.
+`/health` est une liveness rapide et reste à HTTP 200 sans extension. Il expose
+les préfixes des identifiants d’installation, de worker et de connexion, ainsi
+que l’âge de la connexion et du dernier pong ; il ne renvoie ni identifiant
+complet, ni clé, ni URL WebSocket.
+
+`/ready` décrit séparément `server_operational`, la configuration
+HTTP/WebSocket, l’accès SQLite et l’état de l’extension. Après acceptation du
+socket, le serveur attend au plus cinq secondes un premier paquet `hello`
+valide avant d’attacher cette connexion. Les états d’extension sont
+`extension_absent`, `extension_handshake_pending`, `extension_stale`,
+`extension_conflict` et `extension_available`. Seul `extension_available`
+répond HTTP 200. Une connexion récente peut attendre son premier pong pendant
+40 secondes ; ensuite, un pong vieux de plus de 60 secondes rend l’extension
+stale. Ces seuils peuvent être réglés avec
+`BRIDGE_EXTENSION_HELLO_TIMEOUT`, `BRIDGE_EXTENSION_FIRST_PONG_GRACE`,
+`BRIDGE_EXTENSION_PONG_TIMEOUT` et `BRIDGE_EXTENSION_CONFLICT_WINDOW`.
+
+Une extension saine conserve son lease. Un autre owner reçoit une fermeture
+`owner_active`, et le conflit est journalisé avec des préfixes d’identifiants.
+Une connexion stale peut être remplacée. Une configuration incomplète et une
+extension indisponible répondent HTTP 503 sans faire échouer le healthcheck
+Compose.
 
 ```bash
 make status

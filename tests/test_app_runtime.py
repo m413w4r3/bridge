@@ -12,6 +12,7 @@ from conftest import FakeExtension, isolated_registry, request_with_key
 
 from bridge.app import BridgeApplication
 from bridge.contracts import BridgeRunRequest
+from bridge.transport import ExtensionIdentity
 
 
 async def test_ready_distinguishes_incomplete_absent_and_available_states(
@@ -37,7 +38,16 @@ async def test_ready_distinguishes_incomplete_absent_and_available_states(
     assert absent.status_code == 503
     assert json.loads(absent.body)["status"] == "extension_absent"
 
-    runtime.bridge.ws = FakeExtension(runtime)
+    await runtime.bridge.attach(
+        FakeExtension(runtime),
+        ExtensionIdentity(
+            instance_id="11111111-1111-4111-8111-111111111111",
+            worker_session_id="22222222-2222-4222-8222-222222222222",
+            connection_id="33333333-3333-4333-8333-333333333333",
+            client_name="extension-chrome",
+            extension_version="1.0.0",
+        ),
+    )
     available = await runtime.ready()
     assert available.status_code == 200
     assert json.loads(available.body)["status"] == "extension_available"

@@ -148,7 +148,18 @@ class Extension:
 
 async def main() -> None:
     async with websockets.connect(f"{WS_URL}?{urlencode({'token': WS_TOKEN})}") as socket:
-        await socket.send(json.dumps({"type": "hello", "client": "timeout-soak"}))
+        await socket.send(
+            json.dumps(
+                {
+                    "type": "hello",
+                    "client": "extension-chrome",
+                    "instance_id": str(uuid.uuid4()),
+                    "worker_session_id": str(uuid.uuid4()),
+                    "connection_id": str(uuid.uuid4()),
+                    "extension_version": "timeout-soak",
+                }
+            )
+        )
         extension = Extension(socket)
         served = asyncio.create_task(extension.serve())
 

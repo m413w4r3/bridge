@@ -7,6 +7,7 @@ import asyncio
 import hmac
 import json
 import logging
+import re
 import time
 from contextlib import asynccontextmanager
 from typing import Any, Optional
@@ -17,6 +18,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from bridge.config import (
     API_KEY,
+    EXTENSION_HELLO_TIMEOUT,
     HOST,
     KEEPALIVE_INTERVAL,
     PORT,
@@ -29,11 +31,14 @@ from bridge.run_service import DurableRunService
 from bridge.routes_bridge import BridgeRoutes
 from bridge.routes_conversations import ConversationRoutes
 from bridge.routes_openai import OpenAIRoutes
-from bridge.transport import Bridge
+from bridge.transport import Bridge, ExtensionIdentity
 
 logger = logging.getLogger("chatgpt_bridge")
 
 _bearer = HTTPBearer(auto_error=False)
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 
 class BridgeApplication:
@@ -200,6 +205,29 @@ class BridgeApplication:
     # WebSocket extension
     # ----------------------------------------------------------------- #
 
+    @staticmethod
+    def _parse_extension_hello(packet: Any) -> ExtensionIdentity | None:
+        if not isinstance(packet, dict) or packet.get("type") != "hello":
+            return None
+        if packet.get("client") != "extension-chrome":
+            return None
+        instance_id = packet.get("instance_id")
+        worker_session_id = packet.get("worker_session_id")
+        connection_id = packet.get("connection_id")
+        extension_version = packet.get("extension_version")
+        identifiers = (instance_id, worker_session_id, connection_id)
+        if any(not isinstance(value, str) or not _UUID_RE.fullmatch(value) for value in identifiers):
+            return None
+        if not isinstance(extension_version, str) or not extension_version or len(extension_version) > 64:
+            return None
+        return ExtensionIdentity(
+            instance_id=instance_id.lower(),
+            worker_session_id=worker_session_id.lower(),
+            connection_id=connection_id.lower(),
+            client_name="extension-chrome",
+            extension_version=extension_version,
+        )
+
     async def websocket_endpoint(self, ws: WebSocket) -> None:
         if not self.accepting_runs or self.bridge.closing:
             await ws.close(code=1013, reason="server shutdown")
@@ -211,21 +239,53 @@ class BridgeApplication:
             logger.warning("websocket_auth_failed")
             return
         await ws.accept()
-        await self.bridge.attach(ws)
-        logger.info("extension_connected reconnections=%s", self.bridge.reconnections)
+        self.bridge.begin_handshake(ws)
+        attached = False
         try:
+            try:
+                raw_hello = await asyncio.wait_for(
+                    ws.receive_text(), timeout=EXTENSION_HELLO_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                await ws.close(code=4408, reason="hello_timeout")
+                logger.warning("extension_handshake_timeout")
+                return
+            try:
+                hello = json.loads(raw_hello)
+            except (json.JSONDecodeError, TypeError):
+                hello = None
+            identity = self._parse_extension_hello(hello)
+            if identity is None:
+                await ws.close(code=4400, reason="invalid_hello")
+                logger.warning("extension_handshake_invalid")
+                return
+            if not await self.bridge.attach(ws, identity):
+                await ws.close(code=4409, reason="owner_active")
+                return
+            attached = True
+            diagnostics = self.bridge.diagnostics()
+            logger.info(
+                "extension_connected instance=%s worker=%s connection=%s reconnections=%s",
+                diagnostics["instance_id_prefix"],
+                diagnostics["worker_session_prefix"],
+                diagnostics["connection_id_prefix"],
+                self.bridge.reconnections,
+            )
             while True:
                 raw = await ws.receive_text()
+                if not self.bridge.is_current(ws, identity.connection_id):
+                    break
                 try:
                     packet = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(packet, dict):
+                    continue
                 kind = packet.get("type")
                 if kind == "pong":
+                    self.bridge.record_pong(ws, identity.connection_id)
                     continue
-                if kind == "hello":
-                    self.bridge.client_name = str(packet.get("client", "inconnu"))
-                    logger.info("extension_identified client=%s", self.bridge.client_name[:64])
+                if kind == "hello":  # l'identité est immuable pendant cette connexion
                     continue
                 self.bridge.dispatch(packet)
         except WebSocketDisconnect:
@@ -233,7 +293,9 @@ class BridgeApplication:
         except Exception:  # noqa: BLE001 - on ne veut jamais tuer le serveur
             logger.exception("websocket_failure")
         finally:
-            self.bridge.detach(ws)
+            self.bridge.end_handshake(ws)
+            if attached:
+                self.bridge.detach(ws)
 
     # ----------------------------------------------------------------- #
     # Liveness / readiness
@@ -242,9 +304,8 @@ class BridgeApplication:
     async def health(self):
         return {
             "status": "ok",
-            "extension_connected": self.bridge.online,
-            "client": self.bridge.client_name if self.bridge.online else None,
-            "busy": self.bridge.slot.locked(),
+            **self.bridge.diagnostics(),
+            "client": self.bridge.client_name if self.bridge.identified else None,
             "connected_since": self.bridge.connected_at,
         }
 
@@ -256,17 +317,19 @@ class BridgeApplication:
             status = "server_unavailable"
         elif not configuration["complete"]:
             status = "configuration_incomplete"
-        elif not self.bridge.online:
-            status = "extension_absent"
         else:
-            status = "extension_available"
+            status = self.bridge.readiness_status()
+        diagnostics = self.bridge.diagnostics()
         body = {
             "status": status,
             "server_operational": registry_accessible and self.accepting_runs,
             "accepting_runs": self.accepting_runs,
             "configuration": configuration,
             "sqlite_registry": "accessible" if registry_accessible else "unavailable",
-            "extension": "connected" if self.bridge.online else "disconnected",
+            "extension": status if status.startswith("extension_") else (
+                "connected" if self.bridge.online else "disconnected"
+            ),
+            **diagnostics,
         }
         return JSONResponse(
             status_code=200 if status == "extension_available" else 503,
