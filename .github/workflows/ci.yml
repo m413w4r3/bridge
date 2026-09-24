@@ -39,6 +39,7 @@ jobs:
         run: |
           node --test \
             tests/completion.test.js \
+            tests/finalization-state.test.js \
             tests/content-dom.test.js \
             tests/response-root.test.js \
             tests/final-output.test.js \

@@ -116,6 +116,11 @@ Elles ne se remplacent pas et ne doivent jamais être confondues :
    bornée : aucune preuve de production ne les montre longuement actifs sans
    mutation. `assistant_actions` reste le signal final le plus fort et finalise
    immédiatement, même si un signal d’activité est encore présent.
+
+   **Une réponse sans boutons d’actions reste finalisable.** La stabilité du
+   texte ne conclut jamais pendant un signal actif, mais elle conclut *après*
+   sa disparition : c’est le mode `quiescent_stability` (`SETTLE_UNKNOWN_MS`).
+   Voir « Finalisation (ACTIVE / QUIESCENT / FINAL) ».
 4. **Total generation timeout** — `BRIDGE_TOTAL_TIMEOUT` (3600 s). Plafond
    absolu d’une génération, quelle que soit l’activité observée. Une recherche
    approfondie ChatGPT dépasse couramment le quart d’heure : cette borne protège
@@ -465,6 +470,76 @@ aucun replay automatique. `details` est borné et sans contenu :
 `conversation_surface_strategy`, `submission_state` et
 `content_script_version`.
 
+## Finalisation (ACTIVE / QUIESCENT / FINAL)
+
+Les boutons Copy/actions historiques ne sont plus la seule preuve de fin : la
+nouvelle UI peut rendre une réponse complète sans jamais les monter. La décision
+est donc une machine à états explicite — `extension/completion.js` (états purs),
+`extension/final-output.js` (décision de durée), pilotée par `streamAnswer()` :
+
+    ACTIVE    = au moins un signal d’activité, tous SCOPÉS
+    QUIESCENT = réponse non vide, aucun signal actif, aucune preuve terminale
+    FINAL     = preuve terminale, ou quiescence stable assez longtemps
+
+Signaux d’activité, chacun borné à son périmètre :
+
+- `streaming` et `reasoning` — lus dans le **périmètre de la réponse** : le
+  ResponseRoot et son plus proche wrapper qui ne contient aucun autre
+  ResponseRoot (`responseSignalScope()`). Le nœud lui-même est inclus
+  (`matches`) : un `MarkdownRoot-*` moderne porte `result-streaming` sur son
+  propre nœud, que `querySelectorAll` seul manquerait. Un indicateur laissé par
+  un ancien tour, ou par un widget latéral, ne maintient donc jamais *cette*
+  réponse en vie.
+- `stop_button` — lu dans le composer courant uniquement (`inspectComposer()`
+  puis son `form`/parent), jamais dans la page : un Stop d’un autre widget ne
+  compte pas.
+
+**Preuve terminale** (`terminal_action`) : la barre d’actions du tour
+(`SELECTORS.turnActions`, dont Copy). Elle reste le signal le plus fort et
+finalise après `SETTLE_MS` — mais elle n’est plus requise.
+
+**Quiescence** (`quiescent_stability`) : `SETTLE_UNKNOWN_MS` (15 s) de stabilité
+*réellement observée*, avec au moins `MIN_QUIESCENT_OBSERVATIONS` (3)
+observations réelles, un texte sérialisé non vide et identique d’une
+observation à l’autre. Durée et observations sont exigées ensemble : un unique
+réveil throttlé tardif n’est pas une preuve. La confiance de cette fin est
+`medium`, jamais `high` : c’est une inférence, pas une preuve terminale.
+FINAL est terminal — un unique `done`/`incomplete` est émis, jamais un second,
+même si un MutationObserver se déclenche après coup.
+
+Ce que la stabilité ne fait **jamais** : conclure pendant ACTIVE. Un texte figé
+60 s pendant que le streaming (ou le Stop, ou le reasoning) reste allumé n’est
+pas une réponse finie. Quand le signal actif disparaît, la fenêtre quiescente
+commence à cette observation-là ; un changement de sortie ou de candidat
+logique la remet à zéro.
+
+Double vérification avant de conclure : le ResponseRoot est re-résolu,
+re-sérialisé, les signaux sont relus, et le texte doit être identique. Pour
+`quiescent_stability`, la seconde lecture exige seulement l’**absence de signal
+actif** — jamais l’apparition d’un bouton Copy entre-temps : c’est exactement
+la boucle sans fin que cette machine remplace.
+
+Remplacement React : un `MarkdownRoot` recréé avec le même texte reste le même
+candidat logique (clé locale du ResponseRoot) et conserve sa fenêtre de
+stabilité. Une identité ambiguë, elle, ne conclut rien : le candidat redevient
+`null`, l’état retombe sur `waiting` et la fenêtre repart de zéro (fail closed).
+
+Observabilité, jamais de contenu : chaque heartbeat publie
+`progress.finalization` — `finalization_state`, `signal`, `output_chars`,
+`stable_for_ms`, `stable_observations`, `streaming_visible`, `reasoning_visible`,
+`stop_visible`, `terminal_action_visible`, `response_strategy` — que le serveur
+conserve borné (`bridge/generation.py::_finalization_state`) sous
+`bridge_progress.finalization`, et joint aux `details` d’un `needs_review`. Une
+fin conclue joint `finalization_evidence` : `mode` (`terminal_action` ou
+`quiescent_stability`), `signal`, `stable_for_ms`, `stable_observations`,
+`output_chars`, `candidate_strategy`.
+
+Un signal ACTIVE qui reste allumé anormalement longtemps n’est jamais converti
+en FINAL par la durée seule : `WATCHED_TURN_ACTIVE_SIGNAL_STALL_MS` produit
+`incomplete/active_signal_stalled` (candidat joint, `blocking_signal` nommé),
+`FINALIZATION_STALL_MS` produit `incomplete/finalization_stalled`. L’exception
+`.streaming-animation` reste inchangée (cf. « Quatre bornes indépendantes »).
+
 ## WebSocket churn
 
 Symptôme : `/ready` alterne entre `extension_available`, `extension_stale`
@@ -531,7 +606,7 @@ cycle de vie de la fenêtre, **jamais** l’absence de dépendance au premier pl
 1. `make up`, puis vérifier le pont : `make status`.
 2. Recharger l’extension dans Chrome et vérifier la version du content script :
    dans la console de l’onglet ChatGPT, la ligne
-   `🔌 ChatGPT Mini-Bridge : content script prêt — version 31`. Une version plus
+   `🔌 ChatGPT Mini-Bridge : content script prêt — version 38`. Une version plus
    ancienne signifie que Chrome sert encore le code précédent.
 3. Lancer une génération qui occupe ChatGPT **au moins 6 à 10 minutes**
    (recherche approfondie), sans effet de bord de production.

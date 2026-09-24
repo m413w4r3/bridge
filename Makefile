@@ -31,6 +31,7 @@ node_modules: package.json package-lock.json
 test-js: node_modules
 	node --test \
 		tests/completion.test.js \
+		tests/finalization-state.test.js \
 		tests/content-dom.test.js \
 		tests/response-root.test.js \
 		tests/final-output.test.js \

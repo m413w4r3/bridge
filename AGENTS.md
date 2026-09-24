@@ -94,6 +94,18 @@ response text can never change what conversation is opened or closed.
   `[data-is-streaming='true']` keep their bounded `active_signal_stalled`
   guard. See "Quatre bornes indépendantes" in
   `docs/chatgpt_bridge_operations.md`.
+- **finalization is an explicit state machine** (ACTIVE / QUIESCENT / FINAL):
+  the historical Copy/action bar is a high-confidence terminal signal but is no
+  longer *required*. A non-empty response with no active signal and no terminal
+  proof is QUIESCENT, and concludes as `quiescent_stability` only after
+  `SETTLE_UNKNOWN_MS` **and** `MIN_QUIESCENT_OBSERVATIONS` real observations.
+  Every signal is scoped: streaming/reasoning inside the ResponseRoot's own
+  scope, Stop inside the current composer. Text stability never concludes while
+  a scoped active signal is visible, and the double verification of a
+  `quiescent_stability` end never requires a Copy button to appear. FINAL is
+  terminal (exactly one `done`/`incomplete`, late mutations included). See
+  "Finalisation (ACTIVE / QUIESCENT / FINAL)" in
+  `docs/chatgpt_bridge_operations.md`.
 - **No timeout resubmits** the prompt.
 - **The response is located by DOM delta, never by position.** The rendered
   answer is a *ResponseRoot* — either the historical semantic assistant turn
@@ -191,6 +203,7 @@ Run the JavaScript gate (8+ passed; `npm ci` installs jsdom once):
 npm ci
 node --test \
   tests/completion.test.js \
+  tests/finalization-state.test.js \
   tests/content-dom.test.js \
   tests/response-root.test.js \
   tests/final-output.test.js \

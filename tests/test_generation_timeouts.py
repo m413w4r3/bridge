@@ -633,3 +633,80 @@ def test_page_state_diagnostics_are_bounded_and_content_free() -> None:
     }
     assert _page_state({"visibility_state": "focused"}) == {}
     assert _page_state("hidden") == {}
+
+
+def test_finalization_diagnostics_are_bounded_and_content_free() -> None:
+    from bridge.generation import (
+        _blocking_signal,
+        _finalization_evidence,
+        _finalization_state,
+    )
+
+    state = _finalization_state(
+        {
+            "finalization_state": "quiescent",
+            "signal": "output_stable",
+            "output_chars": 15,
+            "stable_for_ms": 16_000,
+            "stable_observations": 4,
+            "streaming_visible": False,
+            "reasoning_visible": False,
+            "stop_visible": False,
+            "terminal_action_visible": False,
+            "response_strategy": "markdown_root_delta",
+            # Rejets attendus : hors vocabulaire, hors borne, mauvais type, et
+            # surtout aucun contenu — même glissé dans un diagnostic.
+            "finalization_state_typo": "final",
+            "answer_text": "réponse confidentielle",
+        }
+    )
+
+    assert state == {
+        "finalization_state": "quiescent",
+        "signal": "output_stable",
+        "output_chars": 15,
+        "stable_for_ms": 16_000,
+        "stable_observations": 4,
+        "streaming_visible": False,
+        "reasoning_visible": False,
+        "stop_visible": False,
+        "terminal_action_visible": False,
+        "response_strategy": "markdown_root_delta",
+    }
+    # Chaque champ est validé pour lui-même : une valeur hors vocabulaire, hors
+    # borne ou d'un autre type est simplement écartée.
+    assert _finalization_state({"signal": "document_body"}) == {}
+    assert _finalization_state({"streaming_visible": "true"}) == {}
+    assert _finalization_state({"stable_observations": -1}) == {}
+    assert _finalization_state({"output_chars": 10_000_001}) == {}
+    assert _finalization_state("quiescent") == {}
+    assert _finalization_state(None) == {}
+
+    evidence = _finalization_evidence(
+        {
+            "mode": "quiescent_stability",
+            "signal": "quiescent_stability",
+            "stable_for_ms": 16_000,
+            "stable_observations": 4,
+            "output_chars": 15,
+            "candidate_strategy": "markdown_root_delta",
+            "candidate_strategy_guess": "semantic_assistant",
+            "text": "réponse confidentielle",
+        }
+    )
+
+    assert evidence == {
+        "mode": "quiescent_stability",
+        "signal": "quiescent_stability",
+        "candidate_strategy": "markdown_root_delta",
+        "output_chars": 15,
+        "stable_for_ms": 16_000,
+        "stable_observations": 4,
+    }
+    assert _finalization_evidence({"mode": "guess"}) == {}
+    assert _finalization_evidence("quiescent_stability") == {}
+
+    assert _blocking_signal("streaming") == "streaming"
+    assert _blocking_signal("assistant_actions") == "assistant_actions"
+    assert _blocking_signal("réponse confidentielle") is None
+    assert _blocking_signal(None) is None

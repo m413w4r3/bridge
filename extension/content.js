@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "37";
+const VERSION = "38";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -215,6 +215,11 @@ const FINALIZATION_STALL_MS = 45000;
 // observations distinctes distingue « la boucle a vraiment tourné sans jamais
 // conclure » de « la boucle n'a tourné qu'une fois, tard ».
 const MIN_STALL_OBSERVATIONS = 3;
+
+// Même exigence pour conclure sur la seule stabilité : une quiescence n'est
+// jamais un unique réveil tardif, même quand le texte n'a pas bougé. Une durée
+// de SETTLE_UNKNOWN_MS sans plusieurs observations réelles ne conclut rien.
+const MIN_QUIESCENT_OBSERVATIONS = 3;
 
 // Deux garde-fous distincts, longtemps confondus sous un même nom.
 //
@@ -1013,10 +1018,34 @@ const MAX_SIGNAL_SOURCES = 10;
  * `aria-hidden`, `data-state`) — jamais de texte, de HTML ni d'attribut
  * arbitraire.
  */
+/** Description bornée d'un détecteur de streaming actif : aucun contenu. */
+function streamingSignalSource(element, selector) {
+  return {
+    source: selector,
+    visible: true,
+    data_is_streaming: element.getAttribute("data-is-streaming"),
+    aria_hidden: element.getAttribute("aria-hidden"),
+    data_state: element.getAttribute("data-state"),
+  };
+}
+
 function streamingSignalSources(scope) {
   const root = scope || document;
   const sources = [];
   for (const selector of SELECTORS.streaming) {
+    // Le scope lui-même peut porter le détecteur (un MarkdownRoot moderne porte
+    // `result-streaming` sur son propre nœud) : `querySelectorAll` seul le
+    // manquerait et le diagnostic contredirait le signal lu.
+    let self = false;
+    try {
+      self = typeof root.matches === "function" && root.matches(selector);
+    } catch (_) {
+      self = false;
+    }
+    if (self && submissionSignalVisible(root)) {
+      sources.push(streamingSignalSource(root, selector));
+      if (sources.length >= MAX_SIGNAL_SOURCES) return sources;
+    }
     let nodes;
     try {
       nodes = root.querySelectorAll(selector);
@@ -1025,13 +1054,7 @@ function streamingSignalSources(scope) {
     }
     for (const element of nodes) {
       if (!submissionSignalVisible(element)) continue;
-      sources.push({
-        source: selector,
-        visible: true,
-        data_is_streaming: element.getAttribute("data-is-streaming"),
-        aria_hidden: element.getAttribute("aria-hidden"),
-        data_state: element.getAttribute("data-state"),
-      });
+      sources.push(streamingSignalSource(element, selector));
       if (sources.length >= MAX_SIGNAL_SOURCES) return sources;
     }
   }
@@ -1679,61 +1702,114 @@ function turnSignalScope(turn) {
 }
 
 /**
- * La réponse est-elle terminée ?  true / false / null quand aucun signal connu
- * n'est reconnaissable — ce dernier cas est capital : conclure « terminé » par
- * défaut tronquait la réponse pendant la phase de réflexion (« Thinking »).
+ * Périmètre des signaux d'activité d'une réponse : le ResponseRoot et son plus
+ * proche wrapper qui ne contient AUCUNE autre réponse. Jamais la page, jamais
+ * la conversation entière : un indicateur de streaming laissé par un ancien
+ * tour ne doit pas maintenir cette réponse en vie, et un Stop d'un widget
+ * latéral ne doit jamais compter.
+ *
+ * Un wrapper qui contient déjà un autre ResponseRoot candidat décrit le
+ * transcript (tours précédents inclus) : la remontée s'arrête avant lui.
  */
-function completionState(turn) {
-  const scope = turnSignalScope(turn);
+function responseSignalScope(candidate, root = document) {
+  const element = candidate?.element;
+  if (!element) return null;
+  if (candidate.strategy === "semantic_assistant") return turnSignalScope(element);
+  const surface = resolveConversationSurface(root).element;
+  const holdsAnotherResponse = (container) => {
+    for (const other of container.querySelectorAll(
+      SELECTORS.markdownRootCandidate,
+    )) {
+      if (other === element) continue;
+      if (isResponseRootCandidate(other, surface, root)) return true;
+    }
+    return false;
+  };
+  let scope = element;
+  let ancestor = element.parentElement;
+  while (ancestor && ancestor !== surface && !isApplicationChrome(ancestor)) {
+    if (holdsAnotherResponse(ancestor)) break;
+    scope = ancestor;
+    ancestor = ancestor.parentElement;
+  }
+  return scope;
+}
+
+/**
+ * Un sélecteur est-il visible dans `scope` — scope lui-même inclus ?
+ * Le ResponseRoot moderne peut porter `result-streaming` directement sur son
+ * propre nœud : `querySelectorAll` seul manquerait ce signal et conclurait
+ * « quiescent » pendant que ChatGPT écrit.
+ */
+function scopedSignalVisible(scope, selectors, predicate = submissionSignalVisible) {
+  if (!scope) return false;
+  for (const selector of selectors) {
+    let self = false;
+    try {
+      self = typeof scope.matches === "function" && scope.matches(selector);
+    } catch (_) {
+      self = false;
+    }
+    if (self && predicate(scope)) return true;
+    if (typeof scope.querySelectorAll !== "function") continue;
+    for (const element of scope.querySelectorAll(selector)) {
+      if (predicate(element)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Signaux bruts de finalisation d'une réponse, tous lus dans SON périmètre.
+ * Observation pure : les `inspect*` ne lèvent jamais. Un composer introuvable
+ * signifie « pas de signal Stop », jamais une erreur de contrat UI.
+ * Les clés sont celles du diagnostic borné (heartbeat, fin de run).
+ */
+function finalizationSignals(scope, root = document) {
+  const composer = inspectComposer(root).element;
   // Le Stop est un contrôle de la génération courante : il ne se cherche que
-  // dans le composer. Un bouton portant le même libellé ailleurs dans la page
-  // ne doit jamais maintenir ce tour en état « running ». Volontairement sans
-  // `composerRoot()`, dont le repli sur document.body rendrait le scope inutile :
-  // composer introuvable => pas de signal, plutôt qu'un signal de toute la page.
-  // Observation pure : `inspect*` ne lève jamais. Une ambiguïté transitoire du
-  // composer après l'envoi signifie « pas de signal », jamais une erreur de
-  // contrat UI qui ferait échouer un tour déjà soumis.
-  const composer = inspectComposer().element;
+  // dans le composer. Volontairement sans `composerRoot()`, dont le repli sur
+  // document.body rendrait le cloisonnement inutile.
   const generationControls =
     composer && (closestOf(composer, ["form"]) || composer.parentElement);
-  const visible = (element) => {
-    if (!element || element.getAttribute?.("aria-hidden") === "true")
-      return false;
-    const style = globalThis.getComputedStyle?.(element);
-    if (style?.display === "none" || style?.visibility === "hidden")
-      return false;
-    return (
-      typeof element.getClientRects !== "function" ||
-      element.getClientRects().length > 0
-    );
+  return {
+    streaming_visible: scopedSignalVisible(scope, SELECTORS.streaming),
+    reasoning_visible: scopedSignalVisible(
+      scope,
+      SELECTORS.reasoning,
+      activeReasoningSignal,
+    ),
+    stop_visible: scopedSignalVisible(generationControls, SELECTORS.stop),
+    terminal_action_visible: scopedSignalVisible(scope, SELECTORS.turnActions),
   };
-  const activeReasoning = (element) => {
-    if (element?.tagName === "DETAILS" && !element.open) return false;
-    if (["closed", "collapsed"].includes(element?.getAttribute?.("data-state")))
-      return false;
-    return visible(element);
+}
+
+/**
+ * État de finalisation le plus récent, dans une forme strictement bornée :
+ * aucun texte, aucun identifiant, aucun attribut arbitraire. C'est exactement
+ * l'objet joint aux heartbeats et aux fins de run — jamais recalculé après coup.
+ */
+function finalizationDiagnostics(
+  finalization,
+  signals,
+  strategy,
+  outputChars,
+  stableForMs,
+  stableObservations,
+) {
+  const scope = signals || {};
+  return {
+    finalization_state: finalization?.state || "waiting",
+    signal: finalization?.signal || "unknown",
+    output_chars: outputChars || 0,
+    stable_for_ms: stableForMs || 0,
+    stable_observations: stableObservations || 0,
+    streaming_visible: scope.streaming_visible === true,
+    reasoning_visible: scope.reasoning_visible === true,
+    stop_visible: scope.stop_visible === true,
+    terminal_action_visible: scope.terminal_action_visible === true,
+    response_strategy: strategy || null,
   };
-  return globalThis.ChatGPTBridgeCompletion.completionState({
-    stopVisible: Boolean(
-      generationControls &&
-      SELECTORS.stop.some((selector) =>
-        [...generationControls.querySelectorAll(selector)].some(visible),
-      ),
-    ),
-    // Le streaming se lit dans le tour surveillé : un indicateur laissé par un
-    // ancien tour ou par un widget latéral ne doit pas empêcher sa finalisation.
-    streamingVisible: Boolean(
-      [...scope.querySelectorAll(SELECTORS.streaming.join(", "))].some(visible),
-    ),
-    reasoningVisible: SELECTORS.reasoning.some((selector) =>
-      [...scope.querySelectorAll(selector)].some(activeReasoning),
-    ),
-    actionsVisible: SELECTORS.turnActions.some((selector) =>
-      [...scope.querySelectorAll(selector)].some(visible),
-    ),
-    // Conservé uniquement comme observation : le moteur pur l'ignore volontairement.
-    sendVisible: Boolean(composer && inspectSendButton(composer).element),
-  });
 }
 
 // --------------------------------------------------------------------------- //
@@ -2900,8 +2976,13 @@ function incompleteAnswer({
   reason,
   text,
   snapshot,
-  completion,
+  finalization,
+  evidence,
+  signals,
+  strategy,
+  blockingSignal,
   stableForMs,
+  stableObservations,
   turn,
   signalSources,
   pageState,
@@ -2912,11 +2993,24 @@ function incompleteAnswer({
     text: candidate,
     visible_citations: candidate ? snapshot?.visible_citations || [] : [],
     serializer_version: DOM_SERIALIZER.SERIALIZER_VERSION,
-    completion_signal: completion.signal,
-    completion_confidence: completion.confidence,
+    completion_signal: finalization.signal,
+    completion_confidence: finalization.confidence,
     stable_for_ms: stableForMs,
     output_chars: globalThis.ChatGPTBridgeFinalOutput.outputChars(candidate),
     streaming_signal_sources: signalSources || [],
+    // Dernier état de la machine à états, exactement celui du dernier
+    // heartbeat : un stall se diagnostique sur cet objet, jamais sur une
+    // reconstruction a posteriori.
+    finalization: finalizationDiagnostics(
+      finalization,
+      signals,
+      strategy,
+      globalThis.ChatGPTBridgeFinalOutput.outputChars(candidate),
+      stableForMs,
+      stableObservations,
+    ),
+    finalization_evidence: evidence || null,
+    blocking_signal: blockingSignal || null,
     incomplete: true,
     incomplete_reason: reason,
     // Identité lue sur le tour *courant* — celui qui vient d'être re-résolu et
@@ -2930,6 +3024,17 @@ function incompleteAnswer({
 /**
  * Suit la réponse dans le DOM sans transmettre les snapshots intermédiaires.
  * Chaque observation remplace la précédente, car le rendu n'est pas append-only.
+ *
+ * La décision est une machine à états explicite (ACTIVE / QUIESCENT / FINAL) :
+ *
+ *   - ACTIVE    : streaming, reasoning ou Stop visible — la stabilité du texte
+ *                 ne conclut JAMAIS tant qu'un signal actif est présent ;
+ *   - QUIESCENT : réponse non vide, aucun signal actif, aucune preuve
+ *                 terminale — finalisable seulement après une longue
+ *                 stabilité réellement observée ;
+ *   - FINAL     : preuve terminale (barre d'actions historique) ou quiescence
+ *                 confirmée. FINAL est terminal : un unique `done`/`incomplete`
+ *                 est émis par l'appelant, jamais un second.
  */
 async function streamAnswer(job, locator, responseBaseline, run) {
   const output = globalThis.ChatGPTBridgeFinalOutput.createAccumulator();
@@ -2938,8 +3043,8 @@ async function streamAnswer(job, locator, responseBaseline, run) {
   // Observations consécutives où le texte n'a pas bougé (cf. MIN_STALL_OBSERVATIONS).
   let stableObservations = 0;
   let full = "";
+  let outputChars = 0;
   let debugSig = "";
-  let completionSignature = "";
   const debut = Date.now();
   let lastHeartbeatAt = debut;
   let finalSerialized = null;
@@ -2949,11 +3054,31 @@ async function streamAnswer(job, locator, responseBaseline, run) {
   let finalTurnLocator =
     locator.kind === "semantic_assistant" ? locator.turn_locator : null;
   let finalExternalTurnId = null;
+  // Signal et confiance de la fin retenue : `finished` n'existe plus ici, c'est
+  // la machine à états (`finalization`) qui porte l'état, et une seule fois.
   let finalCompletion = {
-    finished: null,
     signal: "unknown",
     confidence: "low",
   };
+  // Preuve exacte retenue pour la fin : mode, signal, fenêtre de stabilité,
+  // nombre d'observations, taille de sortie et stratégie du candidat. Jamais
+  // un caractère de contenu, jamais un identifiant externe.
+  let finalEvidence = null;
+  // Machine à états : le dernier état observé est la seule vérité du heartbeat,
+  // des garde-fous et des diagnostics de fin.
+  let finalization = {
+    state: "waiting",
+    mode: null,
+    signal: "unknown",
+    confidence: "low",
+  };
+  let signals = {
+    streaming_visible: false,
+    reasoning_visible: false,
+    stop_visible: false,
+    terminal_action_visible: false,
+  };
+  let responseStrategy = locator?.strategy || null;
   let stableForMs = 0;
   let lastSerializationMs = 0;
   let lastRuntimeMetricsAt = 0;
@@ -2999,6 +3124,14 @@ async function streamAnswer(job, locator, responseBaseline, run) {
     stable_for_ms: 0,
     completion_signal: "unknown",
     completion_confidence: "low",
+    finalization: finalizationDiagnostics(
+      finalization,
+      signals,
+      responseStrategy,
+      0,
+      0,
+      0,
+    ),
   };
 
   try {
@@ -3032,25 +3165,64 @@ async function streamAnswer(job, locator, responseBaseline, run) {
       // gardée : React remplace le nœud entre la réflexion et la réponse, et
       // un nœud détaché resterait figé sur « Thinking ».
       const candidate = locateResponseCandidate(locator, responseBaseline);
-      if (!candidate) continue;
-      const turn = candidate.element;
-
-      // `finished === false` (ChatGPT écrit encore) interdit de sortir ; `null`
-      // (aucun signal reconnu) exige une stabilité bien plus longue.
-      const completion = completionState(turn);
-      const finished = completion.finished;
-      const nextCompletionSignature = `${finished}:${completion.signal}`;
-      if (nextCompletionSignature !== completionSignature) {
-        completionSignature = nextCompletionSignature;
+      if (!candidate) {
+        // Aucune identité résoluble (nœud pas encore monté, ou deux roots
+        // indistinguables) : on ne finalise JAMAIS sur un état antérieur. La
+        // fenêtre de stabilité repart de zéro et l'état retombe sur `waiting`.
         stableSince = null;
         stableObservations = 0;
+        stableForMs = 0;
+        finalization = {
+          state: "waiting",
+          mode: null,
+          signal: "unknown",
+          confidence: "low",
+        };
+        signals = {
+          streaming_visible: false,
+          reasoning_visible: false,
+          stop_visible: false,
+          terminal_action_visible: false,
+        };
+        lastProgress = {
+          phase: "waiting_answer",
+          output_chars: 0,
+          stable_for_ms: 0,
+          completion_signal: "unknown",
+          completion_confidence: "low",
+          serialization_ms: lastSerializationMs,
+          finalization: finalizationDiagnostics(
+            finalization,
+            signals,
+            responseStrategy,
+            0,
+            0,
+            0,
+          ),
+          ...sampledRuntimeMetrics(now),
+        };
+        continue;
       }
+      const turn = candidate.element;
+      responseStrategy = candidate.strategy;
+
+      // Signaux actifs ET terminaux, tous lus dans le périmètre de CETTE
+      // réponse : son ResponseRoot et son wrapper (le composer courant pour le
+      // Stop). Jamais un scan de la page.
+      const scope = responseSignalScope(candidate);
+      signals = finalizationSignals(scope);
       const root = resolveResponseContentRoot(
         candidate,
-        finished === true || Date.now() - debut > NO_MARKDOWN_FALLBACK_MS,
+        signals.terminal_action_visible ||
+          Date.now() - debut > NO_MARKDOWN_FALLBACK_MS,
       );
       const serializationStartedAt = globalThis.performance?.now?.();
-      const snapshot = root ? readAnswer(root, finished !== true) : null;
+      // Le dernier bloc de code reste « ouvert » tant qu'AUCUNE preuve
+      // terminale n'est visible : la réponse peut encore s'écrire (sémantique
+      // historique, cf. `dernierPre`).
+      const snapshot = root
+        ? readAnswer(root, !signals.terminal_action_visible)
+        : null;
       const serializationFinishedAt = globalThis.performance?.now?.();
       if (
         Number.isFinite(serializationStartedAt) &&
@@ -3063,10 +3235,11 @@ async function streamAnswer(job, locator, responseBaseline, run) {
       }
       full = snapshot ? snapshot.text : "";
       output.observe(full);
+      outputChars = globalThis.ChatGPTBridgeFinalOutput.outputChars(full);
 
       if (DEBUG) {
         const pres = root ? root.querySelectorAll("pre") : [];
-        const sig = `fini=${finished} root=${root ? root.tagName + "." + (root.className || "-").slice(0, 24) : "null"} pre=${pres.length}`;
+        const sig = `fini=${finalization.state} root=${root ? root.tagName + "." + (root.className || "-").slice(0, 24) : "null"} pre=${pres.length}`;
         if (sig !== debugSig) {
           debugSig = sig;
           console.log(
@@ -3075,34 +3248,73 @@ async function streamAnswer(job, locator, responseBaseline, run) {
         }
       }
 
+      const previousFinalization = finalization;
+      finalization = globalThis.ChatGPTBridgeCompletion.finalizationState({
+        ...signals,
+        output_chars: outputChars,
+      });
+      const stateChanged =
+        finalization.state !== previousFinalization.state ||
+        finalization.signal !== previousFinalization.signal;
+
       if (full !== vu) {
+        // La sortie a changé : la fenêtre de stabilité repart de zéro, quelle
+        // qu'en soit la cause (nouveau texte, réécriture React).
         vu = full;
         stableSince = null;
         stableObservations = 0;
-      } else if (stableSince === null) {
-        stableSince = Date.now();
+      } else if (stateChanged || stableSince === null) {
+        // Un changement d'état (ACTIVE → QUIESCENT, ou l'apparition de la
+        // preuve terminale) OUVRE une nouvelle période, et cette observation
+        // en est la première : le texte est déjà identique, mais l'ancienne
+        // période ne compte plus. Pendant ACTIVE, la stabilité continue d'être
+        // *mesurée* — c'est ce qui rend un signal figé diagnosticable — mais
+        // aucune durée ne conclut : cf. `finalizationOutcome`.
+        stableSince = now;
         stableObservations = 1;
       } else {
+        // Même texte sérialisé, même état : un nœud recréé par React reste le
+        // même candidat logique et ne perd pas sa fenêtre — la stabilité est
+        // une propriété du *contenu*, pas d'un nœud DOM. Une identité réellement
+        // ambiguë n'arrive jamais jusqu'ici : `locateResponseCandidate` a déjà
+        // rendu `null`.
         stableObservations += 1;
       }
+      stableForMs = stableSince === null ? 0 : now - stableSince;
 
-      const need =
-        finished === true && full.length === 0
-          ? EMPTY_FINAL_SETTLE_MS
-          : finished === null
-            ? SETTLE_UNKNOWN_MS
-            : SETTLE_MS;
-      stableForMs = stableSince === null ? 0 : Date.now() - stableSince;
-      const stable = stableForMs >= need;
+      const outcome = globalThis.ChatGPTBridgeFinalOutput.finalizationOutcome({
+        state: finalization.state,
+        mode: finalization.mode,
+        signal: finalization.signal,
+        confidence: finalization.confidence,
+        text: full,
+        stableForMs,
+        stableObservations,
+        thresholds: {
+          settle_ms: SETTLE_MS,
+          settle_unknown_ms: SETTLE_UNKNOWN_MS,
+          empty_final_settle_ms: EMPTY_FINAL_SETTLE_MS,
+          min_quiescent_observations: MIN_QUIESCENT_OBSERVATIONS,
+        },
+      });
+
+      const diagnostics = finalizationDiagnostics(
+        finalization,
+        signals,
+        candidate.strategy,
+        outputChars,
+        stableForMs,
+        stableObservations,
+      );
 
       // Mettre à jour l'état courant pour le prochain heartbeat.
       // Ce calcul n'envoie rien : le heartbeat lui-même est émis plus haut,
       // indépendamment de la présence du tour.
       const phase =
-        completion.signal === "reasoning"
+        finalization.signal === "reasoning"
           ? "reasoning"
-          : completion.signal === "stop_button" ||
-              completion.signal === "streaming"
+          : finalization.signal === "stop_button" ||
+              finalization.signal === "streaming"
             ? "generating"
             : full.length === 0
               ? "waiting_answer"
@@ -3114,39 +3326,40 @@ async function streamAnswer(job, locator, responseBaseline, run) {
       // dire *quel* détecteur l'affirme. Un stall futur doit être imputable à un
       // sélecteur nommé, jamais à un booléen agrégé.
       const signalSources =
-        completion.signal === "streaming"
-          ? streamingSignalSources(turnSignalScope(turn))
+        finalization.state === "active" && finalization.signal === "streaming"
+          ? streamingSignalSources(scope)
           : [];
 
       lastProgress = {
         phase,
-        output_chars:
-          globalThis.ChatGPTBridgeFinalOutput.outputChars(full),
+        output_chars: outputChars,
         stable_for_ms: stableForMs,
-        completion_signal: completion.signal,
-        completion_confidence: completion.confidence,
+        completion_signal: finalization.signal,
+        completion_confidence: finalization.confidence,
         serialization_ms: lastSerializationMs,
+        finalization: diagnostics,
         ...(signalSources.length
           ? { streaming_signal_sources: signalSources }
           : {}),
         ...sampledRuntimeMetrics(now),
       };
-      const outcome = globalThis.ChatGPTBridgeFinalOutput.settledOutcome({
-        completion,
-        text: full,
-        stableForMs,
-        emptySettleMs: EMPTY_FINAL_SETTLE_MS,
-      });
+
       const incompleteFields = {
         snapshot,
-        completion,
+        finalization,
+        evidence: null,
+        signals,
+        strategy: candidate.strategy,
         stableForMs,
+        stableObservations,
         turn,
         signalSources,
         pageState: pageState(),
       };
-      if (outcome === "incomplete") {
-        // Fin confirmée mais rien d'écrit : il n'y a honnêtement aucun candidat.
+
+      if (outcome.outcome === "no_final_answer") {
+        // Fin terminale confirmée mais rien d'écrit : il n'y a honnêtement
+        // aucun candidat (le DOM peut monter la barre d'actions avant le texte).
         return incompleteAnswer({
           reason: "no_final_answer",
           text: "",
@@ -3154,107 +3367,140 @@ async function streamAnswer(job, locator, responseBaseline, run) {
         });
       }
 
-      let verifyFinal = false;
-      if (finished === true) {
-        // `assistant_actions` est une finalité explicite : elle ne peut jamais
-        // devenir `finalization_stalled`, même après un réveil tardif.
-        verifyFinal = stable && full.length > 0;
-      } else if (finished === false) {
-        // Un texte stable n'est PAS la preuve qu'une génération active a échoué.
-        // Quand `.streaming-animation` est visible dans le tour surveillé,
-        // ChatGPT recherche encore : la borne dure appartient au serveur
-        // (`bridge_total_timeout`).
-        if (
-          full.length > 0 &&
-          stableForMs >= WATCHED_TURN_ACTIVE_SIGNAL_STALL_MS &&
-          stableObservations >= MIN_STALL_OBSERVATIONS &&
-          !longRunningStreamingSignalActive(signalSources)
-        ) {
-          return incompleteAnswer({
-            reason: "active_signal_stalled",
-            text: full,
-            ...incompleteFields,
-          });
-        }
-      } else {
-        // Finalité inconnue : c'est le seul état auquel le stall de finalisation
-        // peut s'appliquer.
-        if (
-          full.length > 0 &&
-          stableForMs >= FINALIZATION_STALL_MS &&
-          stableObservations >= MIN_STALL_OBSERVATIONS
-        ) {
-          return incompleteAnswer({
-            reason: "finalization_stalled",
-            text: full,
-            ...incompleteFields,
-          });
-        }
-        verifyFinal = stable && full.length > 0;
+      // §11 — un signal ACTIVE qui reste allumé anormalement longtemps n'est
+      // JAMAIS transformé en FINAL par la durée seule. On rend la main en
+      // `incomplete` (candidat joint, adoptable), en nommant le signal bloquant.
+      if (
+        finalization.state === "active" &&
+        full.length > 0 &&
+        stableForMs >= WATCHED_TURN_ACTIVE_SIGNAL_STALL_MS &&
+        stableObservations >= MIN_STALL_OBSERVATIONS &&
+        !longRunningStreamingSignalActive(signalSources)
+      ) {
+        return incompleteAnswer({
+          reason: "active_signal_stalled",
+          blocking_signal: finalization.signal,
+          text: full,
+          ...incompleteFields,
+        });
+      }
+      // Borne de dernier recours : l'état quiescent n'a pas pu conclure
+      // (observations insuffisantes ou vérification constamment rejetée) et
+      // l'UI ne bouge plus. Jamais un FINAL inventé.
+      if (
+        finalization.state === "quiescent" &&
+        full.length > 0 &&
+        stableForMs >= FINALIZATION_STALL_MS &&
+        stableObservations >= MIN_STALL_OBSERVATIONS
+      ) {
+        return incompleteAnswer({
+          reason: "finalization_stalled",
+          blocking_signal: finalization.signal,
+          text: full,
+          ...incompleteFields,
+        });
       }
 
-      if (verifyFinal) {
-        // React peut remplacer le nœud entre les observations : re-résoudre le
-        // même candidat logique, puis revérifier finalité, identité et texte
-        // sur ce nœud.
-        const verificationLocator =
-          locator.kind === "semantic_assistant"
-            ? { ...locator, turn_locator: turnLocator(turn) || locator.turn_locator }
-            : locator;
-        const verificationCandidate = locateResponseCandidate(
-          verificationLocator,
-          responseBaseline,
-        );
-        const verificationCompletion = verificationCandidate
-          ? completionState(verificationCandidate.element)
-          : null;
-        const verificationRoot = verificationCandidate
-          ? resolveResponseContentRoot(verificationCandidate, true)
-          : null;
-        const verification = verificationRoot
-          ? readAnswer(verificationRoot, false)
-          : null;
-        const currentExternalTurnId = turnExternalId(turn);
-        const verificationExternalTurnId = verificationCandidate
-          ? turnExternalId(verificationCandidate.element)
-          : null;
-        const finalityVerified =
-          finished === true
-            ? verificationCompletion?.finished === true
-            : verificationCompletion?.finished !== false;
-        const externalTurnIdentityStable =
-          currentExternalTurnId === verificationExternalTurnId;
+      if (outcome.outcome !== "final") continue;
 
-        // La décision de fin porte uniquement sur le contenu textuel.
-        // Les citations restent des métadonnées et peuvent encore être
-        // réordonnées/enrichies par l'UI après la fin visible de la réponse.
-        if (
-          finalityVerified &&
-          externalTurnIdentityStable &&
-          verification &&
-          verification.text === full
-        ) {
-          output.observe(verification.text);
-          finalSerialized = verification;
-          finalCompletion = verificationCompletion;
-          finalTurnLocator = verificationCandidate
-            ? turnLocator(verificationCandidate.element) ||
-              verificationLocator.turn_locator ||
-              null
-            : null;
-          finalExternalTurnId = verificationExternalTurnId;
-          // État de plan au moment exact où la fin est constatée : c'est cette
-          // valeur qui rend vérifiable « terminé sans focus » après coup.
-          finalPageState = pageState();
-          break;
-        }
+      // --- Double vérification avant de conclure -------------------------- //
+      // React peut remplacer le nœud entre les observations : on re-résout le
+      // même candidat logique, on re-sérialise, on ré-évalue les signaux, puis
+      // on vérifie que l'évidence tient toujours sur CE nœud.
+      //
+      // Invariant capital : une fin `quiescent_stability` ne doit PAS exiger
+      // qu'une action Copy soit apparue entre-temps — c'est exactement la
+      // boucle sans fin que cette machine remplace. L'évidence d'une quiescence
+      // est « aucun signal actif », rien d'autre.
+      const verificationLocator =
+        locator.kind === "semantic_assistant"
+          ? { ...locator, turn_locator: turnLocator(turn) || locator.turn_locator }
+          : locator;
+      const verificationCandidate = locateResponseCandidate(
+        verificationLocator,
+        responseBaseline,
+      );
+      const verificationScope = verificationCandidate
+        ? responseSignalScope(verificationCandidate)
+        : null;
+      const verificationSignals = verificationScope
+        ? finalizationSignals(verificationScope)
+        : null;
+      const verificationRoot = verificationCandidate
+        ? resolveResponseContentRoot(verificationCandidate, true)
+        : null;
+      const verification = verificationRoot
+        ? readAnswer(verificationRoot, !verificationSignals?.terminal_action_visible)
+        : null;
+      const verificationFinalization =
+        verificationSignals && verification
+          ? globalThis.ChatGPTBridgeCompletion.finalizationState({
+              ...verificationSignals,
+              output_chars:
+                globalThis.ChatGPTBridgeFinalOutput.outputChars(
+                  verification.text,
+                ),
+            })
+          : null;
+      const currentExternalTurnId = turnExternalId(turn);
+      const verificationExternalTurnId = verificationCandidate
+        ? turnExternalId(verificationCandidate.element)
+        : null;
+      const externalTurnIdentityStable =
+        currentExternalTurnId === verificationExternalTurnId;
+      const evidenceStillValid =
+        outcome.mode === "terminal_action"
+          ? verificationFinalization?.state === "final"
+          : verificationFinalization?.state !== "active";
 
-        // Le texte, la finalité ou l'identité a réellement changé entre les
-        // deux lectures : on recommence la fenêtre de stabilisation.
-        vu = verification ? verification.text : "";
-        stableSince = null;
-        stableObservations = 0;
+      // La décision de fin porte uniquement sur le contenu textuel.
+      // Les citations restent des métadonnées et peuvent encore être
+      // réordonnées/enrichies par l'UI après la fin visible de la réponse.
+      if (
+        evidenceStillValid &&
+        externalTurnIdentityStable &&
+        verification &&
+        verification.text === full
+      ) {
+        output.observe(verification.text);
+        finalSerialized = verification;
+        finalCompletion = {
+          signal: outcome.signal,
+          confidence: outcome.confidence,
+        };
+        finalEvidence = {
+          mode: outcome.mode,
+          signal: outcome.signal,
+          stable_for_ms: stableForMs,
+          stable_observations: stableObservations,
+          output_chars: outputChars,
+          candidate_strategy: candidate.strategy,
+        };
+        // FINAL est terminal : le dernier état publié est celui de la décision.
+        finalization = {
+          state: "final",
+          mode: outcome.mode,
+          signal: outcome.signal,
+          confidence: outcome.confidence,
+        };
+        signals = verificationSignals || signals;
+        finalTurnLocator = verificationCandidate
+          ? turnLocator(verificationCandidate.element) ||
+            verificationLocator.turn_locator ||
+            null
+          : null;
+        finalExternalTurnId = verificationExternalTurnId;
+        // État de plan au moment exact où la fin est constatée : c'est cette
+        // valeur qui rend vérifiable « terminé sans focus » après coup.
+        finalPageState = pageState();
+        break;
       }
+
+      // Le texte, la finalité ou l'identité a réellement changé entre les
+      // deux lectures : on recommence la fenêtre de stabilisation.
+      vu = verification ? verification.text : "";
+      stableSince = null;
+      stableObservations = 0;
     }
   } finally {
     watcher.disconnect();
@@ -3270,6 +3516,15 @@ async function streamAnswer(job, locator, responseBaseline, run) {
     completion_signal: finalCompletion.signal,
     completion_confidence: finalCompletion.confidence,
     stable_for_ms: stableForMs,
+    finalization: finalizationDiagnostics(
+      finalization,
+      signals,
+      responseStrategy,
+      outputChars,
+      stableForMs,
+      stableObservations,
+    ),
+    finalization_evidence: finalEvidence,
     turn_locator: finalTurnLocator,
     external_turn_id: finalExternalTurnId,
     page_state: finalPageState || pageState(),
@@ -3805,6 +4060,20 @@ async function handlePrompt({
           content_script_version: VERSION,
           submission_state: "post_submission",
           initial_turn_id: externalTurnId,
+          // Dernier état de la machine de finalisation, joint à TOUTE fin de
+          // run (`done`, `incomplete` d'identité, stall) : exactement l'objet
+          // du dernier heartbeat, jamais reconstruit après coup.
+          ...(serialized.finalization
+            ? { finalization: serialized.finalization }
+            : {}),
+          // Preuve exacte retenue quand la fin est conclue (mode, signal,
+          // fenêtre de stabilité, stratégie) : jamais un texte.
+          ...(serialized.finalization_evidence
+            ? { finalization_evidence: serialized.finalization_evidence }
+            : {}),
+          ...(serialized.blocking_signal
+            ? { blocking_signal: serialized.blocking_signal }
+            : {}),
           // Diagnostic d'autonomie : état de plan de l'onglet au moment où la
           // fin a été constatée. Sans contenu, jamais un signal de décision.
           ...(serialized.page_state ? { page_state: serialized.page_state } : {}),
@@ -3893,32 +4162,45 @@ async function captureLaterResponse(msg) {
 
   for (let index = candidates.length - 1; index >= 0; index -= 1) {
     const turn = candidates[index];
-    const completion = completionState(turn);
-
-    // Stateless recovery is strict: a visible answer must be explicitly final.
-    // Conversation-backed recovery keeps its existing human-preview tolerance
-    // for an unknown completion signal.
-    if (stateless ? completion.finished !== true : completion.finished === false) continue;
-
     const turnId = turnExternalId(turn);
     if (!turnId) continue;
     const root = answerRoot(turn, true);
     const serialized = root ? readAnswer(root, false) : null;
     if (!serialized?.text?.trim()) continue;
+    // La capture de recovery relit un tour historique avec la même machine à
+    // états, mais sans boucle de stabilité : seuls un signal ACTIVE ou l'absence
+    // de preuve terminale discréditent le candidat.
+    const recoveryState = globalThis.ChatGPTBridgeCompletion.finalizationState({
+      ...finalizationSignals(turnSignalScope(turn)),
+      output_chars: globalThis.ChatGPTBridgeFinalOutput.outputChars(
+        serialized.text,
+      ),
+    });
+
+    // Stateless recovery is strict: a visible answer must be explicitly final.
+    // Conversation-backed recovery keeps its existing human-preview tolerance
+    // for an answer that is merely quiescent.
+    if (stateless ? recoveryState.state !== "final" : recoveryState.state === "active") continue;
 
     // React may replace the turn between the two reads. Re-read the same
     // external message id and accept only unchanged text and completion state;
     // this remains entirely read-only (no click, input, or requestSubmit).
     const verificationTurn = findAssistantTurnByExternalId(turnId);
     if (!verificationTurn) continue;
-    const verificationCompletion = completionState(verificationTurn);
-    if (stateless && verificationCompletion.finished !== true) continue;
-    if (!stateless && verificationCompletion.finished === false) continue;
     const verificationRoot = answerRoot(verificationTurn, true);
     const verification = verificationRoot
       ? readAnswer(verificationRoot, false)
       : null;
     if (!verification?.text?.trim() || verification.text !== serialized.text) continue;
+    const verificationState =
+      globalThis.ChatGPTBridgeCompletion.finalizationState({
+        ...finalizationSignals(turnSignalScope(verificationTurn)),
+        output_chars: globalThis.ChatGPTBridgeFinalOutput.outputChars(
+          verification.text,
+        ),
+      });
+    if (stateless && verificationState.state !== "final") continue;
+    if (!stateless && verificationState.state === "active") continue;
 
     return {
       type: "recovery_preview",
@@ -3938,11 +4220,13 @@ async function captureLaterResponse(msg) {
         output_chars: globalThis.ChatGPTBridgeFinalOutput.outputChars(
           verification.text,
         ),
-        completion_signal: verificationCompletion.signal,
-        completion_confidence: verificationCompletion.confidence,
+        completion_signal: verificationState.signal,
+        completion_confidence: verificationState.confidence,
         content_script_version: VERSION,
+        // Une fin explicitement terminale reste la seule capture « vérifiée » ;
+        // une réponse seulement quiescente reste une adoption humaine.
         capture_confidence:
-          verificationCompletion.finished === true
+          verificationState.state === "final"
             ? "verified_final"
             : "visible_unknown",
       },

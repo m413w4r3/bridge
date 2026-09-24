@@ -407,7 +407,7 @@ function observeModernComposer(window, onRender) {
     );
     const health = await dispatch({ type: "dom_health" });
     assert.equal(health.ok, true);
-    assert.equal(health.content_script_version, "37");
+    assert.equal(health.content_script_version, "38");
     assert.deepEqual(Object.keys(health.response_locator).sort(), [
       "ambiguity_count",
       "baseline_root_count",
@@ -443,7 +443,7 @@ function observeModernComposer(window, onRender) {
     );
     const structure = await dispatch({ type: "response_structure" });
     assert.equal(structure.ok, true);
-    assert.equal(structure.content_script_version, "37");
+    assert.equal(structure.content_script_version, "38");
     assert.equal(structure.conversation_surface.found, true);
     assert.equal(structure.conversation_surface.strategy, "composer_main");
     assert.equal(structure.strategy, "markdown_root_delta");
@@ -513,7 +513,7 @@ function observeModernComposer(window, onRender) {
     assert.equal(answers[0].text, "BRIDGE_OK");
     assert.equal(answers[0].submission_state, "post_submission");
     assert.equal(answers[0].metadata.output_chars, "BRIDGE_OK".length);
-    assert.equal(answers[0].metadata.content_script_version, "37");
+    assert.equal(answers[0].metadata.content_script_version, "38");
     // La nouvelle UI n'expose aucun identifiant externe : aucun `done` ne peut
     // promettre une conversation poursuivable — contrat inchangé ici, la
     // finalisation est traitée dans le commit suivant.
@@ -541,7 +541,7 @@ function observeModernComposer(window, onRender) {
     assert.equal(locatorLogs[0].current_root_count, 1);
     assert.equal(locatorLogs[0].inline_leaf_count, 1);
     assert.equal(locatorLogs[0].ambiguity_count, 0);
-    assert.equal(locatorLogs[0].version, "37");
+    assert.equal(locatorLogs[0].version, "38");
     assert.equal(JSON.stringify(locatorLogs).includes("BRIDGE_OK"), false);
   }
 
@@ -635,7 +635,7 @@ function observeModernComposer(window, onRender) {
     assert.equal(details.current_root_count, 2);
     assert.equal(details.conversation_surface_found, true);
     assert.equal(details.submission_state, "post_submission");
-    assert.equal(details.content_script_version, "37");
+    assert.equal(details.content_script_version, "38");
     assert.deepEqual([...details.response_root_strategies], ["markdown_root_delta"]);
     assert.ok(
       clockOf() >= run("RESPONSE_AMBIGUITY_HOLD_MS"),
@@ -679,7 +679,7 @@ function observeModernComposer(window, onRender) {
     assert.equal(details.conversation_surface_found, true);
     assert.deepEqual([...details.response_root_strategies], []);
     assert.equal(details.submission_state, "post_submission");
-    assert.equal(details.content_script_version, "37");
+    assert.equal(details.content_script_version, "38");
     assert.ok(
       clockOf() >= run("RESPONSE_CONTRACT_DRIFT_MS"),
       "la dérive se conclut dans une fenêtre bornée",

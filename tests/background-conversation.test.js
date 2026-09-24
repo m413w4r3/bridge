@@ -1605,7 +1605,7 @@ async function main() {
       contentMessage = { tabId, message };
       return {
         ok: true,
-        content_script_version: "37",
+        content_script_version: "38",
         surface: {
           origin_ok: true,
           pathname: "/",

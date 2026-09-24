@@ -2,8 +2,24 @@ const assert = require("node:assert/strict");
 
 require("../extension/final-output.js");
 
-const { createAccumulator, outputChars, settledOutcome } =
+const { createAccumulator, outputChars, finalizationOutcome } =
   globalThis.ChatGPTBridgeFinalOutput;
+
+const thresholds = {
+  settle_ms: 2_000,
+  settle_unknown_ms: 15_000,
+  empty_final_settle_ms: 10_000,
+  min_quiescent_observations: 3,
+};
+
+const outcome = (fields) =>
+  finalizationOutcome({
+    text: "rapport final",
+    stableForMs: 0,
+    stableObservations: 0,
+    thresholds,
+    ...fields,
+  }).outcome;
 
 const rewritten = createAccumulator();
 rewritten.observe("ABC");
@@ -12,43 +28,125 @@ rewritten.observe("ABXYZ");
 assert.equal(rewritten.final(), "ABXYZ");
 assert.notEqual(rewritten.final(), "ABCDEXYZ");
 assert.equal(outputChars("A😀B"), 3);
+
+// --- Fin terminale explicite : SETTLE court -------------------------------- //
 assert.equal(
-  settledOutcome({
-    completion: { finished: true },
-    text: "",
-    stableForMs: 10_000,
-    emptySettleMs: 10_000,
+  outcome({
+    state: "final",
+    mode: "terminal_action",
+    signal: "assistant_actions",
+    confidence: "high",
+    stableForMs: 1_999,
   }),
-  "incomplete",
+  "pending",
+  "une preuve terminale attend son SETTLE court",
 );
 assert.equal(
-  settledOutcome({
-    completion: { finished: false },
+  outcome({
+    state: "final",
+    mode: "terminal_action",
+    signal: "assistant_actions",
+    confidence: "high",
+    stableForMs: 2_000,
+  }),
+  "final",
+);
+assert.equal(
+  outcome({
+    state: "final",
+    mode: "terminal_action",
+    signal: "assistant_actions",
+    confidence: "high",
+    text: "",
+    stableForMs: 9_999,
+  }),
+  "pending",
+  "une fin terminale sans texte reste en attente du texte",
+);
+assert.equal(
+  outcome({
+    state: "final",
+    mode: "terminal_action",
+    signal: "assistant_actions",
+    confidence: "high",
+    text: "",
+    stableForMs: 10_000,
+  }),
+  "no_final_answer",
+  "une fin terminale durablement vide n'est jamais un succès",
+);
+
+// --- Quiescence : SETTLE_UNKNOWN_MS ET plusieurs observations réelles ------ //
+assert.equal(
+  outcome({
+    state: "quiescent",
+    signal: "output_stable",
+    confidence: "medium",
+    stableForMs: 14_999,
+    stableObservations: 120,
+  }),
+  "pending",
+);
+assert.equal(
+  outcome({
+    state: "quiescent",
+    signal: "output_stable",
+    confidence: "medium",
+    stableForMs: 15_000,
+    stableObservations: 2,
+  }),
+  "pending",
+  "un unique réveil tardif ne conclut pas une quiescence",
+);
+const quiescentFinal = finalizationOutcome({
+  state: "quiescent",
+  signal: "output_stable",
+  confidence: "medium",
+  text: "BRIDGE_OK",
+  stableForMs: 15_000,
+  stableObservations: 3,
+  thresholds,
+});
+assert.equal(quiescentFinal.outcome, "final");
+assert.equal(quiescentFinal.mode, "quiescent_stability");
+assert.equal(quiescentFinal.signal, "quiescent_stability");
+assert.equal(quiescentFinal.confidence, "medium");
+
+// --- ACTIVE : aucune durée ne conclut -------------------------------------- //
+assert.equal(
+  outcome({
+    state: "active",
+    signal: "streaming",
+    confidence: "high",
+    stableForMs: 60_000,
+    stableObservations: 50,
+  }),
+  "pending",
+  "un texte stable pendant une génération active n'est pas une réponse finie",
+);
+assert.equal(
+  outcome({
+    state: "active",
+    signal: "reasoning",
+    confidence: "high",
     text: "",
     stableForMs: 60_000,
-    emptySettleMs: 10_000,
+    stableObservations: 50,
   }),
-  "active",
+  "pending",
   "un raisonnement actif ne devient jamais incomplet par durée seule",
 );
 assert.equal(
-  settledOutcome({
-    completion: { finished: true },
-    text: "rapport final",
-    stableForMs: 2_000,
-    emptySettleMs: 10_000,
-  }),
-  "complete",
-);
-assert.equal(
-  settledOutcome({
-    completion: { finished: null },
+  outcome({
+    state: "waiting",
+    signal: "unknown",
+    confidence: "low",
     text: "",
     stableForMs: 60_000,
-    emptySettleMs: 10_000,
+    stableObservations: 50,
   }),
-  "unknown",
-  "une longue durée ne transforme pas un état DOM inconnu en fin fiable",
+  "pending",
+  "aucune preuve lisible : rien ne conclut",
 );
 
 const fiveSubjects = createAccumulator();

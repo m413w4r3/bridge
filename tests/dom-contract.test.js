@@ -170,7 +170,7 @@ function rawReport({
 } = {}) {
   return {
     ok: true,
-    content_script_version: "37",
+    content_script_version: "38",
     tab_id: 7,
     diagnostic_target: { source: "generic_chatgpt_tab", bridge_owned: false, ...diagnostic_target },
     extension_state: "active",
@@ -454,7 +454,7 @@ function rawReport({
   const structure = popup.structure(
     {
       ok: true,
-      content_script_version: "37",
+      content_script_version: "38",
       conversation_surface: { found: true, strategy: "composer_main", node },
       strategy: "markdown_root_delta",
       markdown_root_matches: 1,
@@ -468,7 +468,7 @@ function rawReport({
     { source: "inflight", bridge_owned: true },
   );
   assert.equal(structure.ok, true);
-  assert.equal(structure.content_script_version, "37");
+  assert.equal(structure.content_script_version, "38");
   assert.equal(structure.tab_id, 7);
   assert.equal(structure.diagnostic_target.source, "inflight");
   assert.equal(structure.diagnostic_target.bridge_owned, true);

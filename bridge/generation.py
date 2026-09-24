@@ -344,6 +344,97 @@ def _page_state(value: object) -> dict[str, Any]:
     return state
 
 
+# Vocabulaire ferme de la machine de finalisation du content script. Une valeur
+# hors de ces ensembles est écartée, jamais recopiée : un diagnostic ne porte
+# aucun contenu, même quand il vient de la page.
+_FINALIZATION_STATES = {"active", "quiescent", "final", "waiting"}
+_FINALIZATION_SIGNALS = {
+    "assistant_actions",
+    "output_stable",
+    "quiescent_stability",
+    "reasoning",
+    "stop_button",
+    "streaming",
+    "unknown",
+}
+_FINALIZATION_MODES = {"terminal_action", "quiescent_stability"}
+_RESPONSE_STRATEGIES = {"semantic_assistant", "markdown_root_delta"}
+_FINALIZATION_FLAGS = (
+    "streaming_visible",
+    "reasoning_visible",
+    "stop_visible",
+    "terminal_action_visible",
+)
+_FINALIZATION_COUNTERS = (
+    ("output_chars", MAX_CANDIDATE_OUTPUT_BYTES),
+    ("stable_for_ms", 3_600_000),
+    ("stable_observations", 1_000_000),
+)
+
+
+def _finalization_state(value: object) -> dict[str, Any]:
+    """Dernier état de la machine de finalisation : aucun texte, aucun identifiant.
+
+    Répond à une seule question, vérifiable après coup dans les logs : la fin
+    a-t-elle été conclue sur une preuve terminale ou sur une stabilité
+    quiescente, et quel signal d'activité l'a bloquée le cas échéant. C'est
+    exactement l'objet publié par le dernier heartbeat, jamais une
+    reconstruction a posteriori.
+    """
+    if not isinstance(value, dict):
+        return {}
+    state: dict[str, Any] = {}
+    reported_state = value.get("finalization_state")
+    if reported_state in _FINALIZATION_STATES:
+        state["finalization_state"] = reported_state
+    for field, allowed in (
+        ("signal", _FINALIZATION_SIGNALS),
+        ("response_strategy", _RESPONSE_STRATEGIES),
+    ):
+        reported = value.get(field)
+        if reported in allowed:
+            state[field] = reported
+    for field in _FINALIZATION_FLAGS:
+        reported = value.get(field)
+        if isinstance(reported, bool):
+            state[field] = reported
+    for field, ceiling in _FINALIZATION_COUNTERS:
+        reported = value.get(field)
+        if isinstance(reported, bool):
+            continue
+        if isinstance(reported, int) and 0 <= reported <= ceiling:
+            state[field] = reported
+    return state
+
+
+def _finalization_evidence(value: object) -> dict[str, Any]:
+    """Preuve exacte retenue pour conclure une fin : bornée, sans contenu."""
+    if not isinstance(value, dict):
+        return {}
+    evidence: dict[str, Any] = {}
+    reported_mode = value.get("mode")
+    if reported_mode in _FINALIZATION_MODES:
+        evidence["mode"] = reported_mode
+    reported_signal = value.get("signal")
+    if reported_signal in _FINALIZATION_SIGNALS:
+        evidence["signal"] = reported_signal
+    reported_strategy = value.get("candidate_strategy")
+    if reported_strategy in _RESPONSE_STRATEGIES:
+        evidence["candidate_strategy"] = reported_strategy
+    for field, ceiling in _FINALIZATION_COUNTERS:
+        reported = value.get(field)
+        if isinstance(reported, bool):
+            continue
+        if isinstance(reported, int) and 0 <= reported <= ceiling:
+            evidence[field] = reported
+    return evidence
+
+
+def _blocking_signal(value: object) -> Optional[str]:
+    """Signal actif nommé qui a empêché la conclusion d'un run, ou None."""
+    return value if value in _FINALIZATION_SIGNALS else None
+
+
 def _incomplete_candidate(
     packet: dict[str, Any], metadata: dict[str, Any]
 ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
@@ -509,9 +600,14 @@ async def run_generation(
             """
             progress = _live_progress.get(request_id, {})
             page_state = progress.get("page_state", {})
+            # Dernier état de la machine de finalisation, exactement celui du
+            # dernier heartbeat : une échéance se diagnostique sur cet objet
+            # borné, jamais sur une reconstruction après coup.
+            finalization = progress.get("finalization", {})
             logger.warning(
                 "%s bridge_run_id=%s phase=%s output_chars=%s stable_for_ms=%s "
-                "completion_signal=%s streaming_signal_sources=%s serialization_ms=%s "
+                "completion_signal=%s finalization=%s "
+                "streaming_signal_sources=%s serialization_ms=%s "
                 "js_heap_bytes=%s "
                 "dom_node_count=%s visibility_state=%s has_focus=%s focus_gains=%s "
                 "ms_since_dom_mutation=%s ms_since_heartbeat=%s "
@@ -523,6 +619,7 @@ async def run_generation(
                 progress.get("output_chars"),
                 progress.get("stable_for_ms"),
                 progress.get("completion_signal"),
+                finalization or None,
                 [
                     source.get("source")
                     for source in progress.get("streaming_signal_sources", [])
@@ -671,6 +768,12 @@ async def run_generation(
                     sources = _signal_sources(progress.get("streaming_signal_sources"))
                     if sources:
                         _live_progress[request_id]["streaming_signal_sources"] = sources
+                    # Dernier état de la machine de finalisation, tel qu'observé
+                    # par le content script : c'est ce que lit un diagnostic de
+                    # run bloqué, sans jamais reconstruire l'état après coup.
+                    finalization = _finalization_state(progress.get("finalization"))
+                    if finalization:
+                        _live_progress[request_id]["finalization"] = finalization
                     page_state = _page_state(progress.get("page_state"))
                     if page_state:
                         _live_progress[request_id]["page_state"] = page_state
@@ -785,6 +888,20 @@ async def run_generation(
                         details[field] = value[:limit]
                 if signal_sources:
                     details["streaming_signal_sources"] = signal_sources
+                # Pourquoi ce run n'a pas conclu, dans le vocabulaire exact du
+                # content script : l'état de finalisation, la preuve qui a
+                # manqué et le signal bloquant. Aucun contenu, aucun texte.
+                finalization = _finalization_state(metadata.get("finalization"))
+                if finalization:
+                    details["finalization"] = finalization
+                evidence = _finalization_evidence(
+                    metadata.get("finalization_evidence")
+                )
+                if evidence:
+                    details["finalization_evidence"] = evidence
+                blocking_signal = _blocking_signal(metadata.get("blocking_signal"))
+                if blocking_signal:
+                    details["blocking_signal"] = blocking_signal
                 page_state = _page_state(metadata.get("page_state"))
                 if page_state:
                     details["page_state"] = page_state
@@ -861,13 +978,18 @@ async def run_generation(
                     reported_submission_state = reported_metadata.get("submission_state")
                     if completion_signal in {
                         "assistant_actions",
+                        "quiescent_stability",
+                        "output_stable",
                         "stop_button",
                         "streaming",
                         "reasoning",
                         "unknown",
                     }:
                         extension_metadata["completion_signal"] = completion_signal
-                    if completion_confidence in {"high", "low"}:
+                    # `medium` est la confiance d'une fin conclue sur stabilité
+                    # quiescente (aucune preuve terminale) : la refuser
+                    # reviendrait à effacer la seule trace de ce mode.
+                    if completion_confidence in {"high", "medium", "low"}:
                         extension_metadata["completion_confidence"] = completion_confidence
                     if isinstance(stable_for_ms, int) and 0 <= stable_for_ms <= 3_600_000:
                         extension_metadata["stable_for_ms"] = stable_for_ms

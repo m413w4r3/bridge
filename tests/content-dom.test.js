@@ -173,6 +173,14 @@ function page({
 
 const WATCHED = `document.querySelector("[data-testid='conversation-turn-3'] [data-message-author-role='assistant']")`;
 
+/**
+ * État de finalisation du tour surveillé, lu exactement comme `streamAnswer` :
+ * signaux scopés (ResponseRoot/wrapper, composer courant pour le Stop) puis
+ * machine à états. `output_chars` reflète le texte réellement sérialisé.
+ */
+const finalizationOf = (outputChars = 15) =>
+  `ChatGPTBridgeCompletion.finalizationState({ ...finalizationSignals(turnSignalScope(${WATCHED})), output_chars: ${outputChars} })`;
+
 function serializeMarkup(body) {
   const { run } = loadExtension(body);
   return run(
@@ -292,8 +300,8 @@ function recoverFencedCode(markdown) {
     page({ staleStreaming: true, strayStop: true, actions: true }),
   );
   assert.deepEqual(
-    state(`completionState(${WATCHED})`),
-    { finished: true, signal: "assistant_actions", confidence: "high" },
+    state(finalizationOf()),
+    { state: "final", mode: "terminal_action", signal: "assistant_actions", confidence: "high" },
     "un indicateur de streaming d'un ancien tour ne bloque pas la finalisation",
   );
 }
@@ -301,8 +309,8 @@ function recoverFencedCode(markdown) {
 {
   const { state } = loadExtension(page({ watchedStreaming: true }));
   assert.deepEqual(
-    state(`completionState(${WATCHED})`),
-    { finished: false, signal: "streaming", confidence: "high" },
+    state(finalizationOf()),
+    { state: "active", mode: null, signal: "streaming", confidence: "high" },
     "le streaming du tour surveillé, lui, interdit la finalisation",
   );
 }
@@ -311,8 +319,8 @@ function recoverFencedCode(markdown) {
 {
   const { state } = loadExtension(page({ strayStop: true, actions: true }));
   assert.deepEqual(
-    state(`completionState(${WATCHED})`),
-    { finished: true, signal: "assistant_actions", confidence: "high" },
+    state(finalizationOf()),
+    { state: "final", mode: "terminal_action", signal: "assistant_actions", confidence: "high" },
     "un bouton « Stop » hors composer ne maintient pas le tour en running",
   );
 }
@@ -320,8 +328,8 @@ function recoverFencedCode(markdown) {
 {
   const { state } = loadExtension(page({ strayStop: true }));
   assert.deepEqual(
-    state(`completionState(${WATCHED})`),
-    { finished: null, signal: "unknown", confidence: "low" },
+    state(finalizationOf()),
+    { state: "quiescent", mode: null, signal: "output_stable", confidence: "medium" },
     "un « Stop » hors composer n'est pas lu du tout",
   );
 }
@@ -329,8 +337,8 @@ function recoverFencedCode(markdown) {
 {
   const { state } = loadExtension(page({ composerStop: true }));
   assert.deepEqual(
-    state(`completionState(${WATCHED})`),
-    { finished: false, signal: "stop_button", confidence: "high" },
+    state(finalizationOf()),
+    { state: "active", mode: null, signal: "stop_button", confidence: "high" },
     "le Stop du composer reste un signal d'activité",
   );
 }
@@ -342,8 +350,8 @@ function recoverFencedCode(markdown) {
     page({ withComposer: false, strayStop: true }),
   );
   assert.deepEqual(
-    state(`completionState(${WATCHED})`),
-    { finished: null, signal: "unknown", confidence: "low" },
+    state(finalizationOf()),
+    { state: "quiescent", mode: null, signal: "output_stable", confidence: "medium" },
     "sans composer, aucun Stop n'est retenu",
   );
 }
@@ -576,7 +584,7 @@ function useVirtualClock(window) {
     assert.equal(contractLog?.composer_strategy, "named_selector");
     assert.equal(contractLog?.composer_selector, "[data-composer-markdown][contenteditable='true'][role='textbox']");
     assert.equal(contractLog?.send_selector, "button[aria-label*='Send']");
-    assert.equal(contractLog?.content_script_version, "37");
+    assert.equal(contractLog?.content_script_version, "38");
     assert.equal(JSON.stringify(contractLog).includes("bonjour moderne"), false);
     assert.equal(submit, form.querySelector("button[type='submit']"));
   }
@@ -600,7 +608,7 @@ function useVirtualClock(window) {
     );
     const current = await dispatch({ type: "dom_health" });
     assert.equal(current.ok, true);
-    assert.equal(current.content_script_version, "37");
+    assert.equal(current.content_script_version, "38");
     assert.equal(current.surface.temporary_status, "ok");
     assert.equal(current.composer.status, "ok");
     assert.equal(current.send.status, "ok");
@@ -865,7 +873,10 @@ function useVirtualClock(window) {
           `${testCase.name}: une ambiguïté n'est jamais résolue arbitrairement`,
         );
         // L'observation post-soumission n'en fait jamais une erreur de contrat.
-        assert.doesNotThrow(() => run("completionState(document.body)"), testCase.name);
+        assert.doesNotThrow(
+          () => run("finalizationSignals(turnSignalScope(document.body))"),
+          testCase.name,
+        );
       } else if (["ok", "degraded"].includes(health.composer.status)) {
         assert.equal(run("isVisibleElement(resolveComposer().element)"), true, `${testCase.name}: composer visible`);
       }
@@ -893,7 +904,7 @@ function useVirtualClock(window) {
     assert.equal(error?.submission_state, "pre_submission");
     assert.equal(error?.diagnostics?.ui_contract_error, "composer_missing");
     assert.equal(error?.diagnostics?.dom_health?.composer?.status, "missing");
-    assert.equal(error?.diagnostics?.dom_health?.content_script_version, "37");
+    assert.equal(error?.diagnostics?.dom_health?.content_script_version, "38");
     assert.equal(sent.some((message) => message.type === "done"), false);
   }
 
@@ -917,7 +928,7 @@ function useVirtualClock(window) {
     assert.equal(error?.diagnostics?.send_status, "missing");
     assert.equal(error?.diagnostics?.send_candidates, 0);
     assert.equal(error?.diagnostics?.form_found, true);
-    assert.equal(error?.diagnostics?.content_script_version, "37");
+    assert.equal(error?.diagnostics?.content_script_version, "38");
     assert.equal(JSON.stringify(error).includes("hello"), false);
   }
 
@@ -1811,7 +1822,7 @@ const PLACEHOLDER_ID =
       "l'identité doit venir du nœud courant, pas du placeholder détaché",
     );
     assert.equal(done.metadata?.initial_turn_id, "stable-assistant-42");
-    assert.equal(done.metadata?.content_script_version, "37");
+    assert.equal(done.metadata?.content_script_version, "38");
   }
 
   // Même remplacement, mais l'UI reste bloquée « en streaming » : le candidat
@@ -2160,8 +2171,8 @@ const RECHERCHE_FINALE = `# REFERENCES\n\n${RECHERCHE_FINALE_CORPS}`;
         </article>
       </main>`);
     assert.deepEqual(
-      state(`completionState(${WATCHED})`),
-      { finished: true, signal: "assistant_actions", confidence: "high" },
+      state(finalizationOf()),
+      { state: "final", mode: "terminal_action", signal: "assistant_actions", confidence: "high" },
       "assistant_actions reste le signal final le plus fort",
     );
   }
@@ -2543,7 +2554,7 @@ async function runPromptInjection({ id, prompt, files = null }) {
     })()`);
     assert.equal(diagnostics.composer_was_non_empty, true);
     assert.equal(diagnostics.composer_still_has_text, true);
-    assert.equal(diagnostics.content_script_version, "37");
+    assert.equal(diagnostics.content_script_version, "38");
 
     // Le snapshot ne transporte plus le texte du composer, seulement un booléen.
     const snapshot = run(`captureSubmissionSnapshot(${SEL})`);

@@ -173,6 +173,108 @@ async def test_three_http_retries_with_same_key_submit_one_prompt_and_replay_res
     assert first["metadata"]["content_script_version"] == "14"
 
 
+async def test_quiescent_finalization_survives_into_run_metadata(
+    runtime: BridgeApplication, tmp_path: Path
+) -> None:
+    """UI moderne : réponse complète, aucune barre Copy/actions jamais montrée.
+
+    Le mode de conclusion (`quiescent_stability`, confiance `medium`) doit
+    survivre jusqu'aux métadonnées du run — le refuser effacerait la seule trace
+    permettant de distinguer une fin prouvée par Copy d'une fin conclue sur
+    stabilité quiescente.
+    """
+    from bridge.generation import generation_progress
+
+    isolated_registry(runtime, tmp_path)
+    answer = "BRIDGE_OK"
+
+    class QuiescentExtension(FakeExtension):
+        async def _respond(self, payload: dict[str, Any]) -> None:
+            if payload["type"] != "prompt":
+                await super()._respond(payload)
+                return
+            self.prompt_count += 1
+            browser_target = payload.get("browser_target")
+            route = (
+                {"target_id": browser_target["id"], "tab_id": 1}
+                if isinstance(browser_target, dict)
+                else {}
+            )
+            self.runtime.bridge.dispatch(
+                {
+                    "type": "heartbeat",
+                    "id": payload["id"],
+                    "event_id": "1",
+                    "progress": {
+                        "phase": "generating",
+                        "output_chars": len(answer),
+                        "stable_for_ms": 16_000,
+                        "completion_signal": "output_stable",
+                        "completion_confidence": "medium",
+                        "finalization": {
+                            "finalization_state": "final",
+                            "signal": "quiescent_stability",
+                            "output_chars": len(answer),
+                            "stable_for_ms": 16_000,
+                            "stable_observations": 5,
+                            "streaming_visible": False,
+                            "reasoning_visible": False,
+                            "stop_visible": False,
+                            "terminal_action_visible": False,
+                            "response_strategy": "markdown_root_delta",
+                        },
+                    },
+                    **route,
+                }
+            )
+            self.runtime.bridge.dispatch(
+                {
+                    "type": "done",
+                    "id": payload["id"],
+                    "event_id": "2",
+                    "text": answer,
+                    "metadata": {
+                        "completion_signal": "quiescent_stability",
+                        "completion_confidence": "medium",
+                        "stable_for_ms": 16_000,
+                        "output_chars": len(answer),
+                        "visible_citation_count": 0,
+                        "content_script_version": "38",
+                    },
+                    **route,
+                }
+            )
+
+    extension = QuiescentExtension(runtime, prompt_delay=0)
+    runtime.bridge.ws = extension
+
+    result = await runtime.bridge_routes.create_bridge_run(
+        BridgeRunRequest(input="mission"), request_with_key("quiescent-final")
+    )
+
+    assert result["status"] == "completed"
+    assert result["output_text"] == answer
+    assert result["metadata"]["completion_signal"] == "quiescent_stability"
+    assert result["metadata"]["completion_confidence"] == "medium"
+    assert result["metadata"]["content_script_version"] == "38"
+    # Le dernier état observé reste lisible pendant le run, dans un vocabulaire
+    # fermé : même un contenu glissé dans un diagnostic serait écarté.
+    progress = generation_progress(result["id"])
+    assert progress["finalization"] == {
+        "finalization_state": "final",
+        "signal": "quiescent_stability",
+        "output_chars": len(answer),
+        "stable_for_ms": 16_000,
+        "stable_observations": 5,
+        "streaming_visible": False,
+        "reasoning_visible": False,
+        "stop_visible": False,
+        "terminal_action_visible": False,
+        "response_strategy": "markdown_root_delta",
+    }
+    assert extension.prompt_count == 1
+
+
 async def test_background_bridge_run_returns_immediately_and_is_polled_to_completion(
     runtime: BridgeApplication, tmp_path: Path
 ) -> None:
@@ -321,6 +423,25 @@ def _stalled_extension(
                                 "data_state": None,
                             }
                         ],
+                        # Dernier état de la machine de finalisation, tel que le
+                        # content script le publie : c'est lui, et rien d'autre,
+                        # qui explique pourquoi ce run n'a pas conclu.
+                        "finalization": {
+                            "finalization_state": "active",
+                            "signal": "streaming",
+                            "output_chars": len(text),
+                            "stable_for_ms": 300_000,
+                            "stable_observations": 4,
+                            "streaming_visible": True,
+                            "reasoning_visible": False,
+                            "stop_visible": False,
+                            "terminal_action_visible": False,
+                            "response_strategy": "markdown_root_delta",
+                            # Rejets attendus : hors vocabulaire, et jamais un
+                            # contenu qui se glisserait dans un diagnostic.
+                            "answer_text": "réponse confidentielle",
+                        },
+                        "blocking_signal": "streaming",
                     },
                     **route,
                 }
@@ -362,6 +483,24 @@ async def test_visible_answer_survives_active_signal_stall_and_lost_tab(
             "data_state": None,
         }
     ]
+    # Le diagnostic de blocage survit intact : état de finalisation borné, signal
+    # bloquant nommé, et aucun contenu malgré la clé hostile du fixture.
+    assert result["metadata"]["finalization"] == {
+        "finalization_state": "active",
+        "signal": "streaming",
+        "output_chars": len(answer),
+        "stable_for_ms": 300_000,
+        "stable_observations": 4,
+        "streaming_visible": True,
+        "reasoning_visible": False,
+        "stop_visible": False,
+        "terminal_action_visible": False,
+        "response_strategy": "markdown_root_delta",
+    }
+    assert result["error"]["details"]["blocking_signal"] == "streaming"
+    assert "réponse confidentielle" not in json.dumps(result)
+    # Rien n'a été conclu : aucune preuve de fin ne doit être annoncée.
+    assert "finalization_evidence" not in result["metadata"]
     # Le texte lui-même n'entre jamais dans les métadonnées d'erreur.
     assert answer not in json.dumps(result, ensure_ascii=False)
 
@@ -1232,10 +1371,10 @@ class _SelectorDriftExtension(FakeExtension):
                     "composer_strategy": "structural_fallback",
                     "composer_selector": "[contenteditable='true'][role='textbox']",
                     "composer_candidate_count": 0,
-                    "content_script_version": "37",
+                    "content_script_version": "38",
                     "dom_health": {
                         "ok": True,
-                        "content_script_version": "37",
+                        "content_script_version": "38",
                         "surface": {
                             "origin_ok": True,
                             "pathname": "/",
@@ -1296,7 +1435,7 @@ async def test_pre_submission_selector_drift_is_a_typed_502_with_dom_health(
     assert error["retryable"] is True
     details = error["details"]
     assert details["ui_contract_error"] == "composer_missing"
-    assert details["dom_health"]["content_script_version"] == "37"
+    assert details["dom_health"]["content_script_version"] == "38"
     # `_safe_diagnostics` drops null leaves (tag/role) and keeps the rest.
     assert details["dom_health"]["composer"] == {
         "status": "missing",
