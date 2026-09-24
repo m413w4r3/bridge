@@ -606,6 +606,27 @@ en FINAL par la durée seule : `WATCHED_TURN_ACTIVE_SIGNAL_STALL_MS` produit
 `FINALIZATION_STALL_MS` produit `incomplete/finalization_stalled`. L’exception
 `.streaming-animation` reste inchangée (cf. « Quatre bornes indépendantes »).
 
+### Sortie finale et identité de continuation
+
+Le succès du texte final est distinct de la réutilisation de la conversation.
+Le serveur exige un snapshot non vide, `finalization_state=final` et une preuve
+de finalisation cohérente. L’identité externe du tour n’est obligatoire que si
+la requête normalisée porte une cible Bridge `conversation` (`fresh` ou
+`continue`). Les trois façades déduisent cette exigence de la même donnée
+normalisée ; le caractère durable d’un run ne signifie pas qu’il est
+continuable.
+
+Un run stateless sans cible `conversation` peut donc réussir sans identifiant
+externe. La réponse conserve ses diagnostics de finalisation et indique
+`external_turn_id_verified=false` et `continuation_available=false`; la
+conversation Bridge reste vide. Si une cible `conversation` était demandée,
+l’absence d’identité reste `external_turn_identity_unavailable` et aucun
+identifiant n’est fabriqué. Les runs stateless réussis sont persistés comme
+`completed`, et leurs retries idempotents relisent ce résultat sans renvoyer
+le prompt au navigateur. `previous_response_id` n’est pas un handle pris en
+charge par cette façade : il est refusé en validation (`422`) au lieu d’être
+ignoré puis traité comme un run stateless.
+
 ## WebSocket churn
 
 Symptôme : `/ready` alterne entre `extension_available`, `extension_stale`

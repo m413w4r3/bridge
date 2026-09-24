@@ -1914,7 +1914,7 @@ const PLACEHOLDER_ID =
       );
     });
 
-    await run(`handlePrompt({ id: "req-placeholder-forever", prompt: "bonjour", conversation: { id: "conv-placeholder", mode: "fresh" } })`);
+    await run(`handlePrompt({ id: "req-placeholder-forever", prompt: "bonjour", conversation: { id: "conv-placeholder", mode: "fresh" }, requires_continuation_identity: true })`);
 
     const incomplete = sent.find((message) => message.type === "incomplete");
     assert.equal(submitEvents, 1);

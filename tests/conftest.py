@@ -25,6 +25,60 @@ from bridge.app import BridgeApplication
 from bridge.registry import RunRegistry
 
 
+def final_output_metadata(
+    text: str,
+    *,
+    mode: str = "terminal_action",
+    stable_for_ms: int | None = None,
+    stable_observations: int | None = None,
+    content_script_version: str = "14",
+) -> dict[str, Any]:
+    """Build metadata matching one of content.js's authoritative final proofs."""
+    terminal = mode == "terminal_action"
+    signal = "assistant_actions" if terminal else "quiescent_stability"
+    confidence = "high" if terminal else "medium"
+    stable_for_ms = stable_for_ms if stable_for_ms is not None else (2_100 if terminal else 15_104)
+    stable_observations = (
+        stable_observations
+        if stable_observations is not None
+        else (1 if terminal else 111)
+    )
+    flags = {
+        "streaming_visible": False,
+        "reasoning_visible": False,
+        "stop_visible": False,
+        "terminal_action_visible": terminal,
+    }
+    return {
+        "completion_signal": signal,
+        "completion_confidence": confidence,
+        "stable_for_ms": stable_for_ms,
+        "output_chars": len(text),
+        "visible_citation_count": 0,
+        "serializer_version": "chatgpt-dom-v3",
+        "content_script_version": content_script_version,
+        "finalization": {
+            "finalization_state": "final",
+            "mode": mode,
+            "signal": signal,
+            "confidence": confidence,
+            "output_chars": len(text),
+            "stable_for_ms": stable_for_ms,
+            "stable_observations": stable_observations,
+            **flags,
+            "response_strategy": "semantic_assistant" if terminal else "markdown_root_delta",
+        },
+        "finalization_evidence": {
+            "mode": mode,
+            "signal": signal,
+            "stable_for_ms": stable_for_ms,
+            "stable_observations": stable_observations,
+            "output_chars": len(text),
+            "candidate_strategy": "semantic_assistant" if terminal else "markdown_root_delta",
+        },
+    }
+
+
 @pytest.fixture
 def runtime() -> BridgeApplication:
     return BridgeApplication()
@@ -38,6 +92,10 @@ class FakeExtension:
         self.runtime = runtime
         self.prompt_delay = prompt_delay
         self.prompt_count = 0
+        self.answer_text = "ok"
+        self.final_metadata_overrides: dict[str, Any] = {}
+        self.omit_external_turn_id = False
+        self.stateless_external_turn_id: str | None = None
         self.sent: list[dict[str, Any]] = []
         self.tasks: set[asyncio.Task[None]] = set()
         self.closed: tuple[int, str] | None = None
@@ -133,7 +191,7 @@ class FakeExtension:
                 self.turn_ids[target["id"]] = new_turn_id
                 conversation = {
                     "id": target["id"],
-                    "turn_id": new_turn_id,
+                    "turn_id": None if self.omit_external_turn_id else new_turn_id,
                     "mode": target["mode"],
                     "verified": True,
                     "ephemeral": True,
@@ -141,20 +199,21 @@ class FakeExtension:
                     # URL on purpose, to prove routing never depends on it.
                     "external_locator": "https://chatgpt.com/?temporary-chat=true",
                 }
+            answer = self.answer_text
+            metadata = final_output_metadata(answer)
+            metadata["initial_turn_id"] = (
+                conversation.get("turn_id")
+                if conversation
+                else self.stateless_external_turn_id
+            )
+            metadata.update(self.final_metadata_overrides)
             self.runtime.bridge.dispatch(
                 {
                     "type": "done",
                     "id": payload["id"],
                     "event_id": "2",
-                    "text": "ok",
-                    "metadata": {
-                        "completion_signal": "assistant_actions",
-                        "completion_confidence": "high",
-                        "stable_for_ms": 2_100,
-                        "output_chars": 2,
-                        "visible_citation_count": 0,
-                        "content_script_version": "14",
-                    },
+                    "text": answer,
+                    "metadata": metadata,
                     "conversation": conversation,
                     **route,
                 }

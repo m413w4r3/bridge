@@ -14,7 +14,7 @@ import logging
 from typing import Any
 
 import pytest
-from conftest import request_with_key
+from conftest import final_output_metadata, request_with_key
 
 from bridge.app import BridgeApplication
 from bridge.contracts import BridgeBrowserTarget, ChatRequest
@@ -221,14 +221,9 @@ class HeartbeatingExtension:
                         "id": request_id,
                         "event_id": "done",
                         "text": "rapport final",
-                        "metadata": {
-                            "completion_signal": "assistant_actions",
-                            "completion_confidence": "high",
-                            "stable_for_ms": 2_100,
-                            "output_chars": len("rapport final"),
-                            "visible_citation_count": 0,
-                            "content_script_version": "16",
-                        },
+                        "metadata": final_output_metadata(
+                            "rapport final", content_script_version="16"
+                        ),
                     }
                 )
                 return
@@ -531,12 +526,9 @@ class HiddenTabExtension:
                 "event_id": "done",
                 "text": "rapport final",
                 "metadata": {
-                    "completion_signal": "assistant_actions",
-                    "completion_confidence": "high",
-                    "stable_for_ms": 2_100,
-                    "output_chars": len("rapport final"),
-                    "visible_citation_count": 0,
-                    "content_script_version": "31",
+                    **final_output_metadata(
+                        "rapport final", content_script_version="31"
+                    ),
                     "page_state": dict(self.PAGE_STATE),
                 },
             }

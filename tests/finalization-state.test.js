@@ -214,6 +214,9 @@ async function runPrompt({
   before,
   prompt = "bonjour",
   logs = null,
+  conversation = null,
+  requiresContinuationIdentity = false,
+  browserTarget = undefined,
 }) {
   // Les logs du content script sont un canal de fuite à part entière : quand un
   // test les collecte, ils sont enregistrés au lieu d'être jetés.
@@ -231,9 +234,15 @@ async function runPrompt({
   const observed = observeComposer(window, (transcript) => {
     render(transcript, clock);
   });
+  const target =
+    browserTarget === undefined
+      ? conversation
+        ? null
+        : { kind: "temporary_chat_run", id: `target-${id}` }
+      : browserTarget;
   if (before) before(clock, window);
   await run(
-    `handlePrompt({ id: ${JSON.stringify(id)}, prompt: ${JSON.stringify(prompt)}, conversation: { id: "conv-${id}", mode: "fresh" } })`,
+    `handlePrompt({ id: ${JSON.stringify(id)}, prompt: ${JSON.stringify(prompt)}, conversation: ${JSON.stringify(conversation)}, browser_target: ${JSON.stringify(target)}, requires_continuation_identity: ${JSON.stringify(requiresContinuationIdentity)} })`,
   );
   return { observed, virtual: clock };
 }
@@ -264,8 +273,9 @@ const heartbeats = (sent) =>
 
     const terminal = terminalMessages(sent);
     assert.equal(terminal.length, 1, "une seule fin, jamais deux");
-    assert.equal(terminal[0].type, "incomplete", "UI moderne : pas d'identité externe");
-    assert.equal(terminal[0].reason, "external_turn_identity_unavailable");
+    assert.equal(terminal[0].type, "done", "une finale stateless n'exige pas d'identité externe");
+    assert.equal(terminal[0].metadata.external_turn_id_verified, false);
+    assert.equal(terminal[0].metadata.continuation_available, false);
     assert.equal(terminal[0].text, "BRIDGE_OK", "le serializer rend la réponse entière");
     assert.equal(terminal[0].metadata.output_chars, "BRIDGE_OK".length);
     assert.equal(
@@ -336,6 +346,36 @@ const heartbeats = (sent) =>
       virtual.clock() >= renderedAt + run("SETTLE_UNKNOWN_MS"),
       `fin prématurée à t=${virtual.clock()} (rendu à ${renderedAt})`,
     );
+  }
+
+  // --- 1b. Preuve terminale sans identité : succès stateless ------------ //
+  {
+    const sent = [];
+    const { window, run } = loadExtension(LEGACY_PAGE);
+    await runPrompt({
+      window,
+      run,
+      sent,
+      id: "req-terminal-no-turn-id",
+      render: (transcript) => {
+        transcript.innerHTML = `
+          <article data-testid="conversation-turn-1">
+            <div data-message-author-role="assistant">
+              <div class="markdown"><p>FINAL_WITHOUT_ID</p></div>
+            </div>
+            ${COPY_BUTTON}
+          </article>`;
+      },
+    });
+    const terminal = terminalMessages(sent);
+    assert.equal(terminal.length, 1);
+    assert.equal(terminal[0].type, "done");
+    assert.equal(terminal[0].text, "FINAL_WITHOUT_ID");
+    assert.equal(terminal[0].metadata.initial_turn_id, null);
+    assert.equal(terminal[0].metadata.external_turn_id_verified, false);
+    assert.equal(terminal[0].metadata.continuation_available, false);
+    assert.equal(terminal[0].metadata.finalization.finalization_state, "final");
+    assert.equal(terminal[0].metadata.finalization_evidence.mode, "terminal_action");
   }
 
   // --- 2. Terminal action historique : finalisation rapide, sans régression - //
@@ -806,8 +846,8 @@ const heartbeats = (sent) =>
     );
     assert.equal(
       sent.filter((message) => message.type === "done").length,
-      0,
-      "aucun done n'est fabriqué après coup",
+      1,
+      "la mutation tardive ne fabrique pas un second done",
     );
     assert.equal(
       run("activeDomWatchers.size"),

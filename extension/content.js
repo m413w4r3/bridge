@@ -3982,6 +3982,7 @@ async function handlePrompt({
   files,
   conversation,
   browser_target: browserTarget,
+  requires_continuation_identity: requiresContinuationIdentity = false,
 }) {
   if (currentJob) {
     // L'observation post-clic garde l'onglet réservé : un second prompt ne doit
@@ -4279,14 +4280,12 @@ async function handlePrompt({
         responseBaseline,
       );
       console.log("bridge_run_phase", { phase: "generation" });
-      // Un `done` promet une conversation poursuivable : sans identité externe
-      // stable, cette promesse serait fausse. Mais détruire un texte final déjà
-      // sérialisé parce que l'UI n'a pas posé de `data-message-id` durable
-      // serait pire : on dégrade en `incomplete` typé, candidat joint, sans
-      // aucune identité de continuation fabriquée.
+      // La finalité de la sortie et l'identité réutilisable sont deux contrats
+      // séparés. Seule une requête explicitement normalisée comme continuable
+      // exige un id externe ; une réponse stateless reste une finale valide.
       let incomplete = serialized.incomplete === true;
       let reason = serialized.incomplete_reason;
-      if (!externalTurnId && !incomplete) {
+      if (!externalTurnId && !incomplete && requiresContinuationIdentity) {
         if (!serialized.text) {
           throw new BridgeError(
             "conversation_unavailable",
@@ -4314,6 +4313,10 @@ async function handlePrompt({
           content_script_version: VERSION,
           submission_state: "post_submission",
           initial_turn_id: externalTurnId,
+          external_turn_id_verified: Boolean(externalTurnId),
+          continuation_available: Boolean(
+            requiresContinuationIdentity && externalTurnId,
+          ),
           // Dernier état de la machine de finalisation, joint à TOUTE fin de
           // run (`done`, `incomplete` d'identité, stall) : exactement l'objet
           // du dernier heartbeat, jamais reconstruit après coup.

@@ -176,6 +176,20 @@ async def test_responses_background_preserves_needs_review_reason(
     assert needs_review["metadata"]["reason"] == "active_signal_stalled"
 
 
+async def test_responses_rejects_unsupported_previous_response_reference(
+    runtime: BridgeApplication,
+) -> None:
+    runtime.bridge.ws = object()
+    with pytest.raises(HTTPException) as caught:
+        await runtime.openai_routes.create_response(
+            ResponseRequest(input="continue", previous_response_id="resp_previous"),
+            _request(),
+        )
+    assert caught.value.status_code == 422
+    assert caught.value.detail["code"] == "unsupported_parameter"
+    assert caught.value.detail["param"] == "previous_response_id"
+
+
 async def test_responses_background_preserves_typed_timeout_and_retains_target(
     runtime: BridgeApplication, monkeypatch: pytest.MonkeyPatch
 ) -> None:

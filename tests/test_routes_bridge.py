@@ -12,14 +12,21 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import FakeExtension, isolated_registry, request_with_key
+from conftest import (
+    FakeExtension,
+    final_output_metadata,
+    isolated_registry,
+    request_with_key,
+)
 from fastapi import HTTPException
 from pydantic import ValidationError
 
 from bridge.app import BridgeApplication
-from bridge.contracts import BridgeRunRequest
+from bridge.contracts import BridgeRunRequest, ChatRequest, ResponseRequest
 from bridge.generation import _response_chat_request
+from bridge.routes_openai import _chat_response_request
 from bridge.registry import RunRegistry
+from bridge.run_service import requires_continuation_identity
 
 
 def test_native_bridge_contract_reports_honest_capabilities(runtime: BridgeApplication) -> None:
@@ -88,6 +95,140 @@ def test_conversation_contract_is_explicit_and_rejects_arbitrary_navigation(
                 "external_locator": "https://example.org/internal",
             },
         )
+
+
+def test_continuation_identity_requirement_is_normalized_across_facades(
+    runtime: BridgeApplication,
+) -> None:
+    fresh_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    chat_request = _chat_response_request(
+        ChatRequest(messages=[{"role": "user", "content": "one shot"}])
+    )
+    response_request = ResponseRequest(input="one shot")
+    bridge_request = runtime.bridge_routes._bridge_response_request(
+        BridgeRunRequest(input="one shot")
+    )
+    assert not requires_continuation_identity(chat_request)
+    assert not requires_continuation_identity(response_request)
+    assert not requires_continuation_identity(bridge_request)
+
+    response_continue = ResponseRequest(
+        input="continue", conversation={"mode": "fresh", "id": fresh_id}
+    )
+    bridge_continue = runtime.bridge_routes._bridge_response_request(
+        BridgeRunRequest(
+            input="continue",
+            conversation={"mode": "fresh", "id": fresh_id},
+        )
+    )
+    assert requires_continuation_identity(response_continue)
+    assert requires_continuation_identity(bridge_continue)
+
+
+async def test_requested_continuation_without_external_turn_id_stays_fail_closed(
+    runtime: BridgeApplication, tmp_path: Path
+) -> None:
+    isolated_registry(runtime, tmp_path)
+    extension = FakeExtension(runtime)
+    extension.answer_text = "BRIDGE_OK"
+    extension.omit_external_turn_id = True
+    runtime.bridge.ws = extension
+
+    result = await runtime.bridge_routes.create_bridge_run(
+        BridgeRunRequest(
+            input="continue this conversation",
+            conversation={
+                "mode": "fresh",
+                "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            },
+        ),
+        request_with_key("continuation-needs-turn-id"),
+    )
+
+    assert result["status"] == "needs_review"
+    assert result["error"]["code"] == "external_turn_identity_unavailable"
+    assert result["error"]["message"].startswith("La réponse finale existe")
+    assert result["metadata"]["candidate_output_present"] is True
+    assert result["metadata"]["external_turn_id_verified"] is False
+    record = runtime.registry.get_by_idempotency_key("continuation-needs-turn-id")
+    assert record["state"] == "needs_review"
+    assert extension.prompt_count == 1
+
+
+async def test_stateless_terminal_action_without_external_turn_id_succeeds(
+    runtime: BridgeApplication, tmp_path: Path
+) -> None:
+    isolated_registry(runtime, tmp_path)
+    extension = FakeExtension(runtime)
+    extension.answer_text = "terminal output"
+    runtime.bridge.ws = extension
+
+    result = await runtime.bridge_routes.create_bridge_run(
+        BridgeRunRequest(input="one shot"),
+        request_with_key("stateless-terminal-no-turn-id"),
+    )
+
+    assert result["status"] == "completed"
+    assert result["output_text"] == "terminal output"
+    assert result["metadata"]["external_turn_id"] is None
+    assert result["metadata"]["external_turn_id_verified"] is False
+    assert result["metadata"]["continuation_available"] is False
+    assert result["metadata"]["finalization"]["mode"] == "terminal_action"
+    assert result["metadata"]["finalization_evidence"]["mode"] == "terminal_action"
+    assert extension.prompt_count == 1
+
+
+async def test_stateless_external_turn_id_is_retained_without_reuse_claim(
+    runtime: BridgeApplication, tmp_path: Path
+) -> None:
+    isolated_registry(runtime, tmp_path)
+    extension = FakeExtension(runtime)
+    extension.stateless_external_turn_id = "verified-stateless-turn"
+    runtime.bridge.ws = extension
+
+    result = await runtime.bridge_routes.create_bridge_run(
+        BridgeRunRequest(input="one shot"),
+        request_with_key("stateless-with-optional-turn-id"),
+    )
+
+    assert result["status"] == "completed"
+    assert result["metadata"]["external_turn_id"] == "verified-stateless-turn"
+    assert result["metadata"]["external_turn_id_verified"] is True
+    assert result["metadata"]["continuation_available"] is False
+    assert result["metadata"]["conversation"] is None
+
+
+@pytest.mark.parametrize(
+    "metadata_override",
+    [
+        {"finalization": {"finalization_state": "quiescent"}},
+        {"finalization_evidence": {"mode": "quiescent_stability"}},
+    ],
+    ids=["non-final-state", "invalid-evidence"],
+)
+async def test_visible_candidate_without_final_evidence_is_never_success(
+    runtime: BridgeApplication, tmp_path: Path, metadata_override: dict[str, Any]
+) -> None:
+    isolated_registry(runtime, tmp_path)
+    extension = FakeExtension(runtime)
+    extension.answer_text = "visible candidate"
+    extension.final_metadata_overrides = metadata_override
+    runtime.bridge.ws = extension
+
+    result = await runtime.bridge_routes.create_bridge_run(
+        BridgeRunRequest(input="one shot"),
+        request_with_key("candidate-without-final-evidence"),
+    )
+
+    assert result["status"] == "needs_review"
+    assert result["error"]["code"] == "finalization_evidence_invalid"
+    assert result["metadata"]["candidate_output_present"] is True
+    assert result["output_text"] == ""
+    record = runtime.registry.get_by_idempotency_key(
+        "candidate-without-final-evidence"
+    )
+    assert record["state"] == "needs_review"
+    assert extension.prompt_count == 1
 
 
 def test_requested_model_is_a_label_and_only_ui_model_drives_the_interface(
@@ -233,14 +374,13 @@ async def test_quiescent_finalization_survives_into_run_metadata(
                     "id": payload["id"],
                     "event_id": "2",
                     "text": answer,
-                    "metadata": {
-                        "completion_signal": "quiescent_stability",
-                        "completion_confidence": "medium",
-                        "stable_for_ms": 16_000,
-                        "output_chars": len(answer),
-                        "visible_citation_count": 0,
-                        "content_script_version": "38",
-                    },
+                    "metadata": final_output_metadata(
+                        answer,
+                        mode="quiescent_stability",
+                        stable_for_ms=16_000,
+                        stable_observations=5,
+                        content_script_version="38",
+                    ),
                     **route,
                 }
             )
@@ -297,14 +437,7 @@ async def test_background_bridge_run_returns_immediately_and_is_polled_to_comple
                     "id": payload["id"],
                     "event_id": "1",
                     "text": "snapshot final unique",
-                    "metadata": {
-                        "completion_signal": "assistant_actions",
-                        "completion_confidence": "high",
-                        "stable_for_ms": 2_100,
-                        "output_chars": 21,
-                        "visible_citation_count": 0,
-                        "content_script_version": "14",
-                    },
+                    "metadata": final_output_metadata("snapshot final unique"),
                     "target_id": browser_target["id"],
                     "tab_id": 1,
                 }

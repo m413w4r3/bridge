@@ -510,7 +510,7 @@ function observeModernComposer(window, onRender) {
       transcript.innerHTML = answerRoot(inlineText("BRIDGE_OK"));
     });
 
-    await run(`handlePrompt({ id: "req-modern-root", prompt: "bonjour", conversation: { id: "conv-modern-root", mode: "fresh" } })`);
+    await run(`handlePrompt({ id: "req-modern-root", prompt: "bonjour", conversation: { id: "conv-modern-root", mode: "fresh" }, requires_continuation_identity: true })`);
 
     assert.equal(observed.pastedText, "bonjour", "prompt injecté dans le ProseMirror moderne");
     assert.equal(observed.submitEvents, 1, "une seule soumission");
@@ -520,9 +520,8 @@ function observeModernComposer(window, onRender) {
     assert.equal(answers[0].submission_state, "post_submission");
     assert.equal(answers[0].metadata.output_chars, "BRIDGE_OK".length);
     assert.equal(answers[0].metadata.content_script_version, "39");
-    // La nouvelle UI n'expose aucun identifiant externe : aucun `done` ne peut
-    // promettre une conversation poursuivable — contrat inchangé ici, la
-    // finalisation est traitée dans le commit suivant.
+    // Ce test demande une conversation Bridge réutilisable : la finale reste
+    // visible, mais elle ne peut pas devenir `done` sans identité externe.
     assert.equal(answers[0].type, "incomplete");
     assert.equal(answers[0].reason, "external_turn_identity_unavailable");
     assert.equal(answers[0].conversation?.turn_id, null);

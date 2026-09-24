@@ -121,7 +121,14 @@ def _tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
-def completion_body(cid: str, model: str, created: int, content: str, prompt_tokens: int) -> dict:
+def completion_body(
+    cid: str,
+    model: str,
+    created: int,
+    content: str,
+    prompt_tokens: int,
+    metadata: Optional[dict[str, Any]] = None,
+) -> dict:
     """Réponse non-streamée, au format `chat.completion` d'OpenAI."""
     completion_tokens = _tokens(content)
     return {
@@ -141,10 +148,18 @@ def completion_body(cid: str, model: str, created: int, content: str, prompt_tok
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
         },
+        **({"metadata": metadata} if metadata is not None else {}),
     }
 
 
-def sse_chunk(cid: str, model: str, created: int, delta: dict, finish: Optional[str]) -> str:
+def sse_chunk(
+    cid: str,
+    model: str,
+    created: int,
+    delta: dict,
+    finish: Optional[str],
+    metadata: Optional[dict[str, Any]] = None,
+) -> str:
     payload = {
         "id": cid,
         "object": "chat.completion.chunk",
@@ -152,6 +167,8 @@ def sse_chunk(cid: str, model: str, created: int, delta: dict, finish: Optional[
         "model": model,
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
     }
+    if metadata is not None:
+        payload["metadata"] = metadata
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
@@ -359,6 +376,10 @@ _FINALIZATION_SIGNALS = {
 }
 _FINALIZATION_MODES = {"terminal_action", "quiescent_stability"}
 _RESPONSE_STRATEGIES = {"semantic_assistant", "markdown_root_delta"}
+# Keep aligned with extension/content.js. These are evidence checks on an
+# already-final snapshot; they do not make a completion decision themselves.
+_QUIESCENT_FINAL_MIN_STABLE_MS = 15_000
+_QUIESCENT_FINAL_MIN_OBSERVATIONS = 3
 _FINALIZATION_FLAGS = (
     "streaming_visible",
     "reasoning_visible",
@@ -430,6 +451,48 @@ def _finalization_evidence(value: object) -> dict[str, Any]:
     return evidence
 
 
+def _has_valid_finalization_evidence(text: str, metadata: dict[str, Any]) -> bool:
+    """Check that a `done` packet carries the final proof produced by content.js."""
+    raw_state = metadata.get("finalization")
+    mode = raw_state.get("mode") if isinstance(raw_state, dict) else None
+    state = _finalization_state(raw_state)
+    evidence = _finalization_evidence(metadata.get("finalization_evidence"))
+    output_chars = len(text)
+    if (
+        state.get("finalization_state") != "final"
+        or metadata.get("output_chars") != output_chars
+        or state.get("output_chars") != output_chars
+        or evidence.get("output_chars") != output_chars
+        or mode not in _FINALIZATION_MODES
+        or evidence.get("mode") != mode
+        or state.get("signal") != evidence.get("signal")
+        or state.get("response_strategy") != evidence.get("candidate_strategy")
+        or metadata.get("completion_signal") != state.get("signal")
+        or not isinstance(evidence.get("stable_for_ms"), int)
+        or evidence.get("stable_for_ms") != state.get("stable_for_ms")
+        or not isinstance(evidence.get("stable_observations"), int)
+        or evidence.get("stable_observations") != state.get("stable_observations")
+    ):
+        return False
+
+    if mode == "terminal_action":
+        return (
+            state.get("signal") == "assistant_actions"
+            and state.get("terminal_action_visible") is True
+            and metadata.get("completion_confidence") == "high"
+        )
+    return (
+        state.get("signal") == "quiescent_stability"
+        and metadata.get("completion_confidence") == "medium"
+        and state.get("streaming_visible") is False
+        and state.get("reasoning_visible") is False
+        and state.get("stop_visible") is False
+        and state.get("terminal_action_visible") is False
+        and evidence["stable_for_ms"] >= _QUIESCENT_FINAL_MIN_STABLE_MS
+        and evidence["stable_observations"] >= _QUIESCENT_FINAL_MIN_OBSERVATIONS
+    )
+
+
 def _blocking_signal(value: object) -> Optional[str]:
     """Signal actif nommé qui a empêché la conclusion d'un run, ou None."""
     return value if value in _FINALIZATION_SIGNALS else None
@@ -459,6 +522,52 @@ def _incomplete_candidate(
         ),
     }
     return candidate, None
+
+
+def _final_snapshot_review_details(
+    packet: dict[str, Any],
+    metadata: dict[str, Any],
+    *,
+    reason: str,
+    conversation_result: Optional[dict],
+) -> tuple[Optional[dict[str, Any]], dict[str, Any]]:
+    """Describe a visible final snapshot that cannot be adopted as success."""
+    candidate, rejected = _incomplete_candidate(packet, metadata)
+    initial_turn_id = _stable_external_turn_id(metadata.get("initial_turn_id"))
+    details: dict[str, Any] = {
+        "reason": reason,
+        "conversation": dict(conversation_result or {}),
+        "completion_signal": metadata.get("completion_signal"),
+        "completion_confidence": metadata.get("completion_confidence"),
+        "initial_turn_id": initial_turn_id,
+        "output_chars": candidate["output_chars"] if candidate else metadata.get("output_chars", 0),
+        "phase": "generation",
+        "submission_state": "post_submission",
+        "candidate_output_present": candidate is not None,
+        "candidate_output_sha256": candidate["sha256"] if candidate else None,
+        "external_turn_id_verified": bool(candidate and candidate["turn_id"]),
+        "continuation_available": False,
+        "recovery_preview_available": False,
+    }
+    if rejected:
+        details["candidate_output_rejected"] = rejected
+    finalization = _finalization_state(metadata.get("finalization"))
+    raw_finalization = metadata.get("finalization")
+    if (
+        isinstance(raw_finalization, dict)
+        and raw_finalization.get("mode") in _FINALIZATION_MODES
+    ):
+        finalization["mode"] = raw_finalization["mode"]
+    if finalization:
+        details["finalization"] = finalization
+    evidence = _finalization_evidence(metadata.get("finalization_evidence"))
+    if evidence:
+        details["finalization_evidence"] = evidence
+    for field in ("serializer_version", "content_script_version"):
+        value = metadata.get(field)
+        if isinstance(value, str):
+            details[field] = value[:64]
+    return candidate, details
 
 
 def _sanitize_diagnostic_locator(value: object) -> Optional[str]:
@@ -526,10 +635,22 @@ async def run_generation(
     conversation: Optional[BridgeConversationTarget] = None,
     browser_target: Optional[BridgeBrowserTarget] = None,
     expected_tab_id: Optional[int] = None,
+    requires_continuation_identity: Optional[bool] = None,
     conversation_result: Optional[dict] = None,
     extension_metadata: Optional[dict] = None,
 ) -> AsyncIterator[str]:
     """Envoie le prompt et restitue uniquement le snapshot final autoritaire."""
+    if requires_continuation_identity is None:
+        # Direct callers still derive the contract from normalized request
+        # data, never from the route or from the returned external id.
+        requires_continuation_identity = conversation is not None
+    if requires_continuation_identity != (conversation is not None):
+        raise UpstreamError(
+            "contrat d'identité de continuation incohérent",
+            code="bridge_server_error",
+            phase="pre_submission",
+            submission_state="pre_submission",
+        )
     if conversation is not None and browser_target is not None:
         raise UpstreamError(
             "conversation et browser_target sont mutuellement exclusifs",
@@ -574,6 +695,7 @@ async def run_generation(
                     "new_chat": req.new_chat,
                     "files": [f.model_dump() for f in attachments],
                     "conversation": conversation.model_dump(mode="json") if conversation else None,
+                    "requires_continuation_identity": requires_continuation_identity,
                     "browser_target": (
                         browser_target.model_dump(mode="json") if browser_target else None
                     ),
@@ -926,7 +1048,7 @@ async def run_generation(
                         phase=submission_phase,
                         submission_state=submission_state,
                     )
-                if not final_text:
+                if not final_text.strip():
                     reported_metadata = packet.get("metadata")
                     metadata = (
                         reported_metadata if isinstance(reported_metadata, dict) else {}
@@ -963,6 +1085,36 @@ async def run_generation(
                         phase=submission_phase,
                         submission_state=submission_state,
                     )
+                if not _has_valid_finalization_evidence(final_text, reported_metadata):
+                    candidate, details = _final_snapshot_review_details(
+                        packet,
+                        reported_metadata,
+                        reason="finalization_evidence_invalid",
+                        conversation_result=conversation_result,
+                    )
+                    raise NeedsReviewError(
+                        "finalization_evidence_invalid", details, candidate=candidate
+                    )
+                initial_turn_id = _stable_external_turn_id(
+                    reported_metadata.get("initial_turn_id")
+                )
+                if extension_metadata is not None:
+                    extension_metadata["external_turn_id"] = initial_turn_id
+                    extension_metadata["external_turn_id_verified"] = initial_turn_id is not None
+                    extension_metadata["continuation_available"] = bool(
+                        requires_continuation_identity and initial_turn_id
+                    )
+                if requires_continuation_identity and initial_turn_id is None:
+                    candidate, details = _final_snapshot_review_details(
+                        packet,
+                        reported_metadata,
+                        reason="external_turn_identity_unavailable",
+                        conversation_result=conversation_result,
+                    )
+                    details["initial_turn_id"] = None
+                    raise NeedsReviewError(
+                        "external_turn_identity_unavailable", details, candidate=candidate
+                    )
                 if extension_metadata is not None:
                     citations = reported_metadata.get("visible_citations")
                     serializer_version = reported_metadata.get("serializer_version")
@@ -970,6 +1122,20 @@ async def run_generation(
                         extension_metadata["visible_citations"] = _visible_citations(citations)
                     if isinstance(serializer_version, str):
                         extension_metadata["serializer_version"] = serializer_version[:64]
+                    finalization = _finalization_state(reported_metadata.get("finalization"))
+                    raw_finalization = reported_metadata.get("finalization")
+                    if (
+                        isinstance(raw_finalization, dict)
+                        and raw_finalization.get("mode") in _FINALIZATION_MODES
+                    ):
+                        finalization["mode"] = raw_finalization["mode"]
+                    if finalization:
+                        extension_metadata["finalization"] = finalization
+                    finalization_evidence = _finalization_evidence(
+                        reported_metadata.get("finalization_evidence")
+                    )
+                    if finalization_evidence:
+                        extension_metadata["finalization_evidence"] = finalization_evidence
                     completion_signal = reported_metadata.get("completion_signal")
                     completion_confidence = reported_metadata.get("completion_confidence")
                     stable_for_ms = reported_metadata.get("stable_for_ms")
@@ -1283,6 +1449,17 @@ def _response_body(
             "conversation": conversation_result,
             "visible_citations": (extension_metadata or {}).get("visible_citations", []),
             "serializer_version": (extension_metadata or {}).get("serializer_version"),
+            **{
+                key: extension_metadata[key]
+                for key in (
+                    "finalization",
+                    "finalization_evidence",
+                    "external_turn_id",
+                    "external_turn_id_verified",
+                    "continuation_available",
+                )
+                if extension_metadata is not None and key in extension_metadata
+            },
             "completion_signal": (extension_metadata or {}).get("completion_signal"),
             "completion_confidence": (extension_metadata or {}).get(
                 "completion_confidence"
