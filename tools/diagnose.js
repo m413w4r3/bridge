@@ -22,10 +22,33 @@
       el.getAttribute("aria-label") || "-"
     }]${el.disabled ? "[disabled]" : ""}`;
 
+  const SELECTEURS_COMPOSER = [
+    "[data-composer-markdown][contenteditable='true'][role='textbox']",
+    "#prompt-textarea",
+    "[data-testid='prompt-textarea']",
+    "div[contenteditable='true'][id^='prompt']",
+    "textarea[data-id]",
+    "[contenteditable='true'][role='textbox']",
+  ];
+
+  function composerActuel() {
+    for (const selector of SELECTEURS_COMPOSER) {
+      const candidats = [...document.querySelectorAll(selector)].filter((el) => {
+        if (!el.isConnected) return false;
+        const style = globalThis.getComputedStyle?.(el);
+        if (style?.display === "none" || style?.visibility === "hidden") return false;
+        return typeof el.getClientRects !== "function" || el.getClientRects().length > 0;
+      });
+      if (candidats.length > 1) return null;
+      if (candidats.length === 1) return candidats[0];
+    }
+    return null;
+  }
+
   /** Boutons du composer : c'est parmi eux que vivent « envoyer » et « stop ». */
   function boutonsComposer() {
-    const champ = document.querySelector("#prompt-textarea");
-    if (!champ) return "composer absent";
+    const champ = composerActuel();
+    if (!champ) return "composer absent ou ambigu";
     const zone = champ.closest("form") || champ.parentElement?.parentElement?.parentElement;
     if (!zone) return "zone composer introuvable";
     return [...zone.querySelectorAll("button")].map(attrs).join("  ") || "aucun bouton";

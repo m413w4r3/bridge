@@ -483,6 +483,184 @@ function useVirtualClock(window) {
 
 (async () => {
   const temporaryComposer = `<div id="prompt-textarea" contenteditable="true"></div>`;
+  // Fixture de l'interface ChatGPT observée le 2026-09-24 : aucun ancien id
+  // prompt ni testid d'envoi ne doit être nécessaire pour la trouver.
+  const modernComposer = `<form>
+    <div
+      contenteditable="true"
+      aria-multiline="true"
+      role="textbox"
+      class="ProseMirror"
+      data-composer-markdown
+      aria-label="Ask ChatGPT">
+      <p data-empty-paragraph="true"
+         data-placeholder="Ask ChatGPT"
+         class="placeholder">
+        <br class="ProseMirror-trailingBreak">
+      </p>
+    </div>
+    <button
+      type="submit"
+      aria-label="Send">
+      Send
+    </button>
+  </form>`;
+
+  // A. Les signatures historiques restent prioritaires et fonctionnelles.
+  {
+    const { window, run } = loadExtension(
+      `<form><div id="prompt-textarea" contenteditable="true"></div>
+        <button data-testid="send-button">Send</button></form>`,
+      "https://chatgpt.com/?temporary-chat=true",
+    );
+    useVirtualClock(window);
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    const form = window.document.querySelector("form");
+    const composer = form.querySelector("#prompt-textarea");
+    let submitEvents = 0;
+    composer.addEventListener("paste", (event) => {
+      event.preventDefault();
+      composer.textContent = event.clipboardData.getData("text/plain");
+    });
+    form.addEventListener("submit", (event) => {
+      submitEvents += 1;
+      event.preventDefault();
+      composer.textContent = "";
+      window.document.body.insertAdjacentHTML("beforeend", `
+        <article data-testid="conversation-turn-1">
+          <div data-message-author-role="assistant" data-message-id="msg-legacy-1">
+            <div class="markdown"><p>réponse historique</p></div>
+          </div>${copyButton}
+        </article>`);
+    });
+    await run(`handlePrompt({ id: "req-legacy", prompt: "bonjour historique", conversation: { id: "conv-legacy", mode: "fresh" } })`);
+    assert.equal(run("resolveComposer().selector"), "#prompt-textarea");
+    assert.equal(run("resolveSendButton(resolveComposer().element).selector"), "button[data-testid='send-button']");
+    assert.equal(submitEvents, 1, "le chemin historique doit encore envoyer une fois");
+    assert.ok(sent.some((message) => message.type === "done"));
+  }
+
+  // B. Le DOM actuel accepte le paste, résout le submit dans son formulaire
+  // et n'envoie le prompt qu'une fois. Aucun contenu n'entre dans le journal.
+  {
+    const { window, run } = loadExtension(
+      modernComposer,
+      "https://chatgpt.com/?temporary-chat=true",
+    );
+    useVirtualClock(window);
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    const form = window.document.querySelector("form");
+    const composer = form.querySelector("[data-composer-markdown]");
+    const submit = form.querySelector("button[type='submit']");
+    let pasted = null;
+    let submitEvents = 0;
+    let outsideSubmitClicks = 0;
+    let contractLog = null;
+    window.console.log = (event, details) => {
+      if (event === "bridge_dom_contract") contractLog = details;
+    };
+    composer.addEventListener("paste", (event) => {
+      event.preventDefault();
+      pasted = event.clipboardData.getData("text/plain");
+      composer.textContent = pasted;
+    });
+    form.addEventListener("submit", (event) => {
+      submitEvents += 1;
+      event.preventDefault();
+      composer.textContent = "";
+      window.document.body.insertAdjacentHTML("beforeend", `
+        <article data-testid="conversation-turn-1">
+          <div data-message-author-role="assistant" data-message-id="msg-modern-1">
+            <div class="markdown"><p>réponse moderne</p></div>
+          </div>${copyButton}
+        </article>`);
+    });
+    const outside = window.document.createElement("button");
+    outside.type = "submit";
+    outside.addEventListener("click", () => { outsideSubmitClicks += 1; });
+    window.document.body.append(outside);
+
+    await run(`handlePrompt({ id: "req-modern", prompt: "bonjour moderne", conversation: { id: "conv-modern", mode: "fresh" } })`);
+    assert.equal(pasted, "bonjour moderne", "le prompt doit être injecté dans le ProseMirror moderne");
+    assert.equal(submitEvents, 1, "le form moderne doit être soumis exactement une fois");
+    assert.equal(outsideSubmitClicks, 0, "un submit hors form ne doit jamais être choisi");
+    assert.ok(sent.some((message) => message.type === "done"));
+    assert.equal(contractLog?.composer_strategy, "named_selector");
+    assert.equal(contractLog?.composer_selector, "[data-composer-markdown][contenteditable='true'][role='textbox']");
+    assert.equal(contractLog?.send_selector, "button[type='submit']");
+    assert.equal(contractLog?.content_script_version, "34");
+    assert.equal(JSON.stringify(contractLog).includes("bonjour moderne"), false);
+    assert.equal(submit, form.querySelector("button[type='submit']"));
+  }
+
+  // C. Les labels localisés ou absents ne participent pas à la détection.
+  {
+    const unlabelled = modernComposer
+      .replace('aria-label="Ask ChatGPT"', "")
+      .replace('data-placeholder="Ask ChatGPT"', 'data-placeholder="Demander"')
+      .replace('aria-label="Send"', "");
+    const { run } = loadExtension(unlabelled);
+    assert.equal(run("resolveComposer().element.getAttribute('data-composer-markdown')"), "");
+    assert.equal(run("resolveSendButton(resolveComposer().element).element.type"), "submit");
+  }
+
+  // D. Plusieurs textboxes visibles sans signature unique sont ambigus :
+  // aucun choix arbitraire et aucun Send.
+  {
+    const body = `<div contenteditable="true" role="textbox" aria-multiline="true" class="ProseMirror"></div>
+      <div contenteditable="true" role="textbox" aria-multiline="true" class="ProseMirror"></div>
+      <button type="submit">Send</button>`;
+    const { window, run } = loadExtension(body, "https://chatgpt.com/?temporary-chat=true");
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    let clicks = 0;
+    window.document.querySelector("button[type='submit']").addEventListener("click", () => { clicks += 1; });
+    await run(`handlePrompt({ id: "req-ambiguous", prompt: "bonjour", conversation: { id: "conv-ambiguous", mode: "fresh" } })`);
+    const error = sent.find((message) => message.type === "error");
+    assert.equal(error?.code, "bridge_ui_timeout");
+    assert.equal(error?.phase, "pre_submission");
+    assert.equal(error?.submission_state, "pre_submission");
+    assert.equal(error?.diagnostics?.ui_contract_error, "ambiguous_composer");
+    assert.equal(clicks, 0);
+  }
+
+  // E. Les éléments masqués sont ignorés lorsqu'un composer visible existe.
+  {
+    const body = `<div contenteditable="true" role="textbox" aria-multiline="true" class="ProseMirror" data-test-offscreen></div>
+      <form><div contenteditable="true" role="textbox" aria-multiline="true" class="ProseMirror"></div></form>`;
+    const { run } = loadExtension(body);
+    assert.equal(run("resolveComposer().element.closest('form') !== null"), true);
+    assert.equal(run("resolveComposer().candidate_count"), 1);
+    assert.equal(run("resolveComposer().strategy"), "structural_fallback");
+  }
+
+  // F. Le bouton submit extérieur ne masque ni ne remplace celui du composer.
+  {
+    const { window, run } = loadExtension(
+      `<button type="submit" id="outside-send">Other</button>${modernComposer}`,
+    );
+    assert.equal(
+      run("resolveSendButton(resolveComposer().element).element === document.querySelector('form button[type=submit]')"),
+      true,
+    );
+  }
+
+  // H. L'absence durable de composer conserve le timeout UI pré-submission.
+  {
+    const { window, run } = loadExtension("", "https://chatgpt.com/?temporary-chat=true");
+    useVirtualClock(window);
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    await run(`handlePrompt({ id: "req-no-composer", prompt: "bonjour", conversation: { id: "conv-no-composer", mode: "fresh" } })`);
+    const error = sent.find((message) => message.type === "error");
+    assert.equal(error?.code, "bridge_ui_timeout");
+    assert.equal(error?.phase, "pre_submission");
+    assert.equal(error?.submission_state, "pre_submission");
+    assert.equal(error?.diagnostics?.ui_contract_error, "composer_missing");
+    assert.equal(sent.some((message) => message.type === "done"), false);
+  }
 
   // 1. URL Temporary + composer, sans toggle : le markup de l'UI n'est pas
   // une preuve de confidentialité et n'est jamais requis.
@@ -1374,7 +1552,7 @@ const PLACEHOLDER_ID =
       "l'identité doit venir du nœud courant, pas du placeholder détaché",
     );
     assert.equal(done.metadata?.initial_turn_id, "stable-assistant-42");
-    assert.equal(done.metadata?.content_script_version, "33");
+    assert.equal(done.metadata?.content_script_version, "34");
   }
 
   // Même remplacement, mais l'UI reste bloquée « en streaming » : le candidat
@@ -2106,7 +2284,7 @@ async function runPromptInjection({ id, prompt, files = null }) {
     })()`);
     assert.equal(diagnostics.composer_was_non_empty, true);
     assert.equal(diagnostics.composer_still_has_text, true);
-    assert.equal(diagnostics.content_script_version, "33");
+    assert.equal(diagnostics.content_script_version, "34");
 
     // Le snapshot ne transporte plus le texte du composer, seulement un booléen.
     const snapshot = run(`captureSubmissionSnapshot(${SEL})`);
@@ -2392,8 +2570,11 @@ async function runPromptInjection({ id, prompt, files = null }) {
     });
 
     const replacement = doc.createElement("div");
-    replacement.id = "prompt-textarea";
-    replacement.contentEditable = "true";
+    replacement.setAttribute("contenteditable", "true");
+    replacement.setAttribute("role", "textbox");
+    replacement.setAttribute("aria-multiline", "true");
+    replacement.className = "ProseMirror";
+    replacement.setAttribute("data-composer-markdown", "");
     let pastesOnReplacement = 0;
     let pastedOnReplacement = null;
     replacement.addEventListener("paste", (event) => {

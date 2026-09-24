@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "33";
+const VERSION = "34";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -18,13 +18,17 @@ const DEBUG = false;
 
 const SELECTORS = {
   composer: [
+    "[data-composer-markdown][contenteditable='true'][role='textbox']",
     "#prompt-textarea",
+    "[data-testid='prompt-textarea']",
     "div[contenteditable='true'][id^='prompt']",
     "textarea[data-id]",
+    "[contenteditable='true'][role='textbox']",
   ],
   send: [
     "button[data-testid='send-button']",
     "#composer-submit-button",
+    "button[type='submit']",
     "button[aria-label*='Envoyer']",
     "button[aria-label*='Send']",
   ],
@@ -234,6 +238,186 @@ const $in = (root, list) => {
 };
 
 const $ = (list) => $in(document, list);
+
+const STRUCTURAL_COMPOSER_SELECTOR =
+  "[contenteditable='true'][role='textbox']";
+
+/** Visible in the current document, without reading or logging user content. */
+function isVisibleElement(el) {
+  if (!el || !el.isConnected) return false;
+  const style = globalThis.getComputedStyle?.(el);
+  if (style?.display === "none" || style?.visibility === "hidden") return false;
+  if (typeof el.getClientRects === "function" && el.getClientRects().length === 0) {
+    return false;
+  }
+  return true;
+}
+
+function isComposerElement(el) {
+  if (!el) return false;
+  const tag = el.tagName;
+  return (
+    tag === "TEXTAREA" ||
+    tag === "INPUT" ||
+    el.getAttribute("contenteditable") === "true"
+  );
+}
+
+function looksLikeStructuralComposer(el) {
+  return (
+    el.hasAttribute("data-composer-markdown") ||
+    el.getAttribute("aria-multiline") === "true" ||
+    el.classList?.contains("ProseMirror") ||
+    Boolean(el.querySelector("p[data-placeholder]"))
+  );
+}
+
+function uiResolution(strategy, selector, candidateCount, element) {
+  return {
+    element: element || null,
+    strategy,
+    selector,
+    candidate_count: candidateCount,
+  };
+}
+
+function uiContractError(kind, resolution, message) {
+  const error = new BridgeError("bridge_ui_timeout", message);
+  error.diagnostics = {
+    ui_contract_error: kind,
+    ...(kind.includes("composer")
+      ? {
+          composer_strategy: resolution.strategy,
+          composer_selector: resolution.selector,
+          composer_candidate_count: resolution.candidate_count,
+        }
+      : {
+          send_strategy: resolution.strategy,
+          send_selector: resolution.selector,
+          send_candidate_count: resolution.candidate_count,
+        }),
+    content_script_version: VERSION,
+  };
+  return error;
+}
+
+/** Resolve a unique, visible composer or report the UI contract ambiguity. */
+function resolveComposer(root = document) {
+  const namedSelectors = SELECTORS.composer.filter(
+    (selector) => selector !== STRUCTURAL_COMPOSER_SELECTOR,
+  );
+  for (const selector of namedSelectors) {
+    const candidates = [...root.querySelectorAll(selector)].filter(
+      (el) => isVisibleElement(el) && isComposerElement(el),
+    );
+    if (candidates.length > 1) {
+      const resolution = uiResolution("named_selector", selector, candidates.length);
+      throw uiContractError(
+        "ambiguous_composer",
+        resolution,
+        "plusieurs composers correspondent au même sélecteur",
+      );
+    }
+    if (candidates.length === 1) {
+      return uiResolution("named_selector", selector, candidates.length, candidates[0]);
+    }
+  }
+
+  const candidates = [...root.querySelectorAll(STRUCTURAL_COMPOSER_SELECTOR)].filter(
+    isVisibleElement,
+  );
+  const resolution = uiResolution(
+    "structural_fallback",
+    STRUCTURAL_COMPOSER_SELECTOR,
+    candidates.length,
+  );
+  if (candidates.length > 1) {
+    throw uiContractError(
+      "ambiguous_composer",
+      resolution,
+      "plusieurs zones de texte peuvent être le composer",
+    );
+  }
+  const candidate = candidates[0];
+  if (
+    candidate &&
+    (candidate.closest("form") || candidate.hasAttribute("data-composer-markdown")) &&
+    looksLikeStructuralComposer(candidate)
+  ) {
+    return uiResolution(
+      "structural_fallback",
+      STRUCTURAL_COMPOSER_SELECTOR,
+      candidates.length,
+      candidate,
+    );
+  }
+  return resolution;
+}
+
+/** Resolve Send inside the composer's form whenever the form is available. */
+function resolveSendButton(composer, root = document) {
+  const form = composer?.closest("form");
+  const searchRoot = form || root;
+  for (const selector of SELECTORS.send) {
+    const candidates = [...searchRoot.querySelectorAll(selector)].filter(
+      (el) => isVisibleElement(el) && el.tagName === "BUTTON",
+    );
+    if (candidates.length > 1) {
+      const resolution = uiResolution("named_selector", selector, candidates.length);
+      throw uiContractError(
+        "ambiguous_send_button",
+        resolution,
+        "plusieurs boutons Send correspondent au même sélecteur",
+      );
+    }
+    if (candidates.length === 1) {
+      return uiResolution("named_selector", selector, candidates.length, candidates[0]);
+    }
+  }
+
+  if (form) {
+    const candidates = [...form.querySelectorAll("button[type='submit']")].filter(
+      isVisibleElement,
+    );
+    if (candidates.length > 1) {
+      const resolution = uiResolution(
+        "structural_fallback",
+        "button[type='submit']",
+        candidates.length,
+      );
+      throw uiContractError(
+        "ambiguous_send_button",
+        resolution,
+        "plusieurs boutons submit sont présents dans le formulaire du composer",
+      );
+    }
+    if (candidates.length === 1) {
+      return uiResolution(
+        "structural_fallback",
+        "button[type='submit']",
+        candidates.length,
+        candidates[0],
+      );
+    }
+  }
+
+  return uiResolution("structural_fallback", "button[type='submit']", 0);
+}
+
+async function waitForComposer(timeout, label) {
+  const deadline = Date.now() + timeout;
+  let resolution = resolveComposer();
+  while (Date.now() < deadline) {
+    if (resolution.element) return resolution;
+    await sleep(100);
+    resolution = resolveComposer();
+  }
+  throw uiContractError(
+    "composer_missing",
+    resolution,
+    label || "composer introuvable",
+  );
+}
 
 /** Premier ancêtre de `el` correspondant à l'un des sélecteurs. */
 const closestOf = (el, list) => {
@@ -1033,7 +1217,7 @@ async function attachFileObjects(fileObjects) {
   input.files = dt.files;
   input.dispatchEvent(new Event("change", { bubbles: true }));
   // Repli : certaines versions de l'UI n'écoutent que le drop sur le composer.
-  const composer = $(SELECTORS.composer);
+  const composer = resolveComposer().element;
   if (composer) {
     composer.dispatchEvent(
       new DragEvent("drop", {
@@ -1149,7 +1333,7 @@ function completionState(turn) {
   // ne doit jamais maintenir ce tour en état « running ». Volontairement sans
   // `composerRoot()`, dont le repli sur document.body rendrait le scope inutile :
   // composer introuvable => pas de signal, plutôt qu'un signal de toute la page.
-  const composer = $(SELECTORS.composer);
+  const composer = resolveComposer().element;
   const generationControls =
     composer && (closestOf(composer, ["form"]) || composer.parentElement);
   const visible = (element) => {
@@ -1188,7 +1372,7 @@ function completionState(turn) {
       [...scope.querySelectorAll(selector)].some(visible),
     ),
     // Conservé uniquement comme observation : le moteur pur l'ignore volontairement.
-    sendVisible: Boolean($(SELECTORS.send)),
+    sendVisible: Boolean(composer && resolveSendButton(composer).element),
   });
 }
 
@@ -1266,7 +1450,7 @@ function pressedState(el) {
 
 /** Formulaire du composer : périmètre des boutons d'outils de l'envoi. */
 function composerRoot() {
-  const composer = $(SELECTORS.composer);
+  const composer = resolveComposer().element;
   return (
     (composer && (closestOf(composer, ["form"]) || composer.parentElement)) ||
     document.body
@@ -2223,13 +2407,22 @@ const TEMPORARY_CHAT_ORIGINS = new Set([
 ]);
 const TEMPORARY_SURFACE_TIMEOUT_MS = 15000;
 
-function temporaryVerificationFailure(reason, url, composerFound, toggleFound) {
+function temporaryVerificationFailure(
+  reason,
+  url,
+  composerFound,
+  toggleFound,
+  composerResolution = null,
+) {
   console.warn("temporary_chat_verification_failed", {
     reason,
     origin: url?.origin ?? null,
     pathname: url?.pathname ?? null,
     temporary_param: url?.searchParams.get("temporary-chat") ?? null,
     composer_found: composerFound,
+    composer_strategy: composerResolution?.strategy ?? null,
+    composer_selector: composerResolution?.selector ?? null,
+    composer_candidate_count: composerResolution?.candidate_count ?? 0,
     toggle_found: toggleFound,
     content_script_version: VERSION,
   });
@@ -2238,6 +2431,11 @@ function temporaryVerificationFailure(reason, url, composerFound, toggleFound) {
 async function ensureTemporaryChat() {
   const deadline = Date.now() + TEMPORARY_SURFACE_TIMEOUT_MS;
   let lastReason = "temporary_surface_origin_invalid";
+  let lastResolution = uiResolution(
+    "structural_fallback",
+    STRUCTURAL_COMPOSER_SELECTOR,
+    0,
+  );
   while (Date.now() < deadline) {
     let url;
     try {
@@ -2247,7 +2445,6 @@ async function ensureTemporaryChat() {
       throw new BridgeError("conversation_unavailable", "surface Temporary Chat invalide");
     }
 
-    const composer = $(SELECTORS.composer);
     const toggleFound = Boolean($(SELECTORS.temporaryChatToggle));
     if (!TEMPORARY_CHAT_ORIGINS.has(url.origin)) {
       lastReason = "temporary_surface_origin_invalid";
@@ -2257,17 +2454,20 @@ async function ensureTemporaryChat() {
       lastReason = "temporary_query_missing";
     } else if (url.searchParams.get("temporary-chat") !== "true") {
       lastReason = "temporary_query_not_true";
-    } else if (!composer) {
-      lastReason = "temporary_composer_missing";
     } else {
-      console.log("bridge_run_phase", { phase: "temporary_verification", state: "verified", content_script_version: VERSION });
-      return composer;
+      lastResolution = resolveComposer();
+      if (!lastResolution.element) {
+        lastReason = "temporary_composer_missing";
+      } else {
+        console.log("bridge_run_phase", { phase: "temporary_verification", state: "verified", content_script_version: VERSION });
+        return lastResolution.element;
+      }
     }
 
     // Origin/path/query violations are deterministic and must not become a
     // generic 15s timeout. Only a missing composer can be an SPA load race.
     if (lastReason !== "temporary_composer_missing") {
-      temporaryVerificationFailure(lastReason, url, Boolean(composer), toggleFound);
+      temporaryVerificationFailure(lastReason, url, Boolean(lastResolution.element), toggleFound, lastResolution);
       throw new BridgeError(
         lastReason === "temporary_surface_path_invalid" ? "conversation_unavailable" : "bridge_ui_timeout",
         `vérification Temporary Chat refusée (${lastReason})`,
@@ -2278,8 +2478,29 @@ async function ensureTemporaryChat() {
 
   let url = null;
   try { url = new URL(window.location.href); } catch { /* diagnostic below */ }
-  temporaryVerificationFailure(lastReason, url, Boolean($(SELECTORS.composer)), Boolean($(SELECTORS.temporaryChatToggle)));
-  throw new BridgeError("bridge_ui_timeout", "composer Temporary Chat introuvable");
+  try {
+    lastResolution = resolveComposer();
+  } catch (error) {
+    temporaryVerificationFailure(
+      "composer_contract_ambiguous",
+      url,
+      false,
+      Boolean($(SELECTORS.temporaryChatToggle)),
+    );
+    throw error;
+  }
+  temporaryVerificationFailure(
+    lastReason,
+    url,
+    Boolean(lastResolution.element),
+    Boolean($(SELECTORS.temporaryChatToggle)),
+    lastResolution,
+  );
+  throw uiContractError(
+    "composer_missing",
+    lastResolution,
+    "composer Temporary Chat introuvable",
+  );
 }
 
 function isBrowserTarget(value) {
@@ -2384,11 +2605,11 @@ async function handlePrompt({
       }
     }
 
-    let composer = await waitFor(
-      () => $(SELECTORS.composer),
+    let composerResolution = await waitForComposer(
       15000,
       "composer introuvable",
     );
+    let composer = composerResolution.element;
     console.log("bridge_run_phase", { phase: "composer" });
     const assistantTurnsBefore = document.querySelectorAll(SELECTORS.assistant).length;
     const before = assistantTurnsBefore;
@@ -2418,17 +2639,28 @@ async function handlePrompt({
       // L'ajout d'une pièce jointe provoque un rerender du composer :
       // ProseMirror/React peut avoir remplacé le nœud. On ne colle jamais dans
       // une référence potentiellement détachée du document.
-      composer = await waitFor(
-        () => $(SELECTORS.composer),
+      composerResolution = await waitForComposer(
         5000,
         "composer introuvable après ajout des pièces jointes",
       );
+      composer = composerResolution.element;
     }
 
     let injectionMethod = null;
     if (composerPrompt) {
       injectionMethod = await typePrompt(composer, composerPrompt);
     }
+    // Paste and attachment handling can cause a React render. Use the current
+    // composer for readiness, the baseline snapshot, and the one allowed Send.
+    composerResolution = resolveComposer();
+    if (!composerResolution.element) {
+      throw uiContractError(
+        "composer_missing",
+        composerResolution,
+        "composer introuvable après injection",
+      );
+    }
+    composer = composerResolution.element;
     // Volumétrie uniquement : ni le prompt, ni le contenu du fichier, ni le
     // DOM du composer ne doivent apparaître dans un log.
     console.log("bridge_run_phase", {
@@ -2450,16 +2682,31 @@ async function handlePrompt({
     // si un upload est possible, qu'une fois celui-ci terminé (bien plus long).
     // Ce délai long n'ajoute aucune latence : `waitFor` rend la main dès que
     // Send devient utilisable.
-    const sendBtn = await waitFor(
+    let sendResolution = null;
+    const resolvedSend = await waitFor(
       () => {
-        const b = $(SELECTORS.send);
-        return isSendButtonReady(b) ? b : null;
+        composerResolution = resolveComposer();
+        if (!composerResolution.element) return null;
+        composer = composerResolution.element;
+        sendResolution = resolveSendButton(composer);
+        return isSendButtonReady(sendResolution.element) ? sendResolution : null;
       },
       waitsForUpload ? UPLOAD_TIMEOUT_MS : 8000,
       waitsForUpload
         ? "contenu collé ou pièce jointe non prêt pour l'envoi"
         : "bouton d'envoi jamais actif",
     );
+    sendResolution = resolvedSend;
+    const sendBtn = sendResolution.element;
+    console.log("bridge_dom_contract", {
+      composer_strategy: composerResolution.strategy,
+      composer_selector: composerResolution.selector,
+      composer_candidate_count: composerResolution.candidate_count,
+      send_strategy: sendResolution.strategy,
+      send_selector: sendResolution.selector,
+      send_candidate_count: sendResolution.candidate_count,
+      content_script_version: VERSION,
+    });
     // Capture after typing/upload and immediately before the one allowed
     // trigger: the composer text and send state must describe the actual click.
     const submissionBaseline = captureSubmissionSnapshot(composer, sendBtn);
