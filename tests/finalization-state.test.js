@@ -204,9 +204,26 @@ function observeComposer(window, onRender) {
   return observed;
 }
 
-async function runPrompt({ window, run, sent, page, id, render, before }) {
-  window.console.log = () => {};
-  window.console.warn = () => {};
+async function runPrompt({
+  window,
+  run,
+  sent,
+  page,
+  id,
+  render,
+  before,
+  prompt = "bonjour",
+  logs = null,
+}) {
+  // Les logs du content script sont un canal de fuite à part entière : quand un
+  // test les collecte, ils sont enregistrés au lieu d'être jetés.
+  window.console.log = (...args) => {
+    if (logs) logs.push({ level: "log", args });
+  };
+  window.console.warn = (...args) => {
+    if (logs) logs.push({ level: "warn", args });
+  };
+  if (logs) window.console.error = (...args) => logs.push({ level: "error", args });
   window.chrome.runtime.sendMessage = async (message) => {
     sent.push(message);
   };
@@ -216,7 +233,7 @@ async function runPrompt({ window, run, sent, page, id, render, before }) {
   });
   if (before) before(clock, window);
   await run(
-    `handlePrompt({ id: ${JSON.stringify(id)}, prompt: "bonjour", conversation: { id: "conv-${id}", mode: "fresh" } })`,
+    `handlePrompt({ id: ${JSON.stringify(id)}, prompt: ${JSON.stringify(prompt)}, conversation: { id: "conv-${id}", mode: "fresh" } })`,
   );
   return { observed, virtual: clock };
 }
@@ -443,6 +460,128 @@ const heartbeats = (sent) =>
       virtual.clock() - streamingRemovedAt >= run("SETTLE_UNKNOWN_MS"),
       "aucune conclusion sur l'ancienne période",
     );
+  }
+
+  // --- 3bis. Diagnostic vivant : le popup lit l'état réel de la boucle ------ //
+  // « Pendant un run, le popup doit lire le state courant réellement maintenu
+  // par le content script. » On capture ici exactement ce que le message
+  // `run_state` renvoie au fil des itérations, sans jamais recalculer d'état.
+  {
+    const sent = [];
+    const { window, run, dispatch } = loadExtension(MODERN_PAGE);
+    const live = [];
+    let streaming = null;
+    let removedAt = null;
+    const { virtual } = await runPrompt({
+      window,
+      run,
+      sent,
+      id: "req-live-state",
+      before: (virtualClock, win) => {
+        // Le service worker lui-même n'appelle pas `run_state` : c'est le popup
+        // qui le fait à chaque rafraîchissement. On rejoue cet appel à chaque
+        // heartbeat, à l'instant où la boucle publie son état.
+        win.chrome.runtime.sendMessage = async (message) => {
+          sent.push(message);
+          if (message.type === "heartbeat") {
+            live.push(JSON.parse(JSON.stringify(run("runDiagnosticSnapshot()"))));
+          }
+        };
+        // On retire le streaming seulement une fois l'état ACTIVE réellement
+        // publié : le test ne parie sur aucun nombre de ticks du runtime.
+        const removeWhenActive = (ticks) => {
+          virtualClock.afterTicks(ticks, () => {
+            const active = live.some((state) => state.state === "active");
+            if (!active && live.length < 6) {
+              removeWhenActive(20);
+              return;
+            }
+            assert.ok(active, "ACTIVE est publié avant le retrait du streaming");
+            removedAt = virtualClock.clock();
+            streaming.remove();
+          });
+        };
+        removeWhenActive(20);
+      },
+      render: (transcript) => {
+        transcript.innerHTML = answerRoot(
+          `${inlineText("BRIDGE_OK")}<div class="result-streaming"></div>`,
+          "Live1",
+        );
+        streaming = transcript.querySelector(".result-streaming");
+      },
+    });
+
+    assert.ok(live.length >= 1, "l'état vivant est lisible pendant le run");
+    for (const state of live) {
+      assert.equal(state.active, true, "un run est en cours : jamais « idle »");
+      assert.equal(
+        state.serialization.serializer,
+        "chatgpt-dom-v3",
+        "la version du sérialiseur est celle qui a réellement sérialisé",
+      );
+      assert.equal(state.serialization.root_found, true);
+      assert.equal(state.serialization.last_serialize, "ok");
+      assert.deepEqual(
+        Object.keys(state.observation.last_wake).sort(),
+        ["mutation", "observe_tick", "timer"],
+        "les trois réveils sont exposés nommément",
+      );
+      for (const wake of Object.values(state.observation.last_wake)) {
+        assert.ok(Number.isInteger(wake) && wake >= 0, `réveil borné : ${wake}`);
+      }
+      assert.ok(
+        Number.isFinite(state.observation.ms_since_observation),
+        "la fraîcheur d'observation est mesurée",
+      );
+    }
+    const active = live.filter((state) => state.state === "active");
+    assert.ok(active.length >= 1, "ACTIVE est publié dans l'état vivant");
+    assert.ok(
+      active.every((state) => state.signal === "streaming"),
+      "le signal bloquant accompagne l'état ACTIVE",
+    );
+    assert.ok(
+      active.every((state) => state.signals.streaming === true),
+      "les quatre booléens de signal sont ceux de la décision",
+    );
+    assert.ok(
+      active.every(
+        (state) =>
+          state.stable_threshold_ms ===
+          run("WATCHED_TURN_ACTIVE_SIGNAL_STALL_MS"),
+      ),
+      "le seuil publié est celui que le runtime applique à cet état",
+    );
+    assert.ok(
+      active.some((state) => state.output_chars > 0),
+      "la sortie réellement sérialisée est comptée",
+    );
+    assert.ok(
+      active.some((state) => state.stable_for_ms > 0),
+      "la stabilité mesurée est publiée telle quelle",
+    );
+    assert.ok(removedAt !== null, "le streaming a bien été retiré pendant le run");
+
+    // Run terminé : l'état vivant redevient « aucun run », jamais l'état hérité.
+    const after = await dispatch({ type: "run_state" });
+    assert.equal(after.active, false);
+    assert.equal(after.state, "idle");
+    assert.equal(after.phase, "idle");
+    assert.equal(after.output_chars, 0);
+    assert.equal(after.stable_threshold_ms, null);
+    assert.equal(after.serialization.root_found, null);
+    assert.equal(after.serialization.last_serialize, null);
+    assert.equal(after.serialization.serializer, "chatgpt-dom-v3");
+    const health = await dispatch({ type: "dom_health" });
+    assert.equal(health.run.active, false);
+    assert.equal(health.run.state, "idle");
+    assert.equal(
+      JSON.stringify(after).includes("BRIDGE_OK"),
+      false,
+      "l'état vivant ne transporte jamais la réponse",
+    );
+    assert.ok(virtual.clock() > 0);
   }
 
   // --- 4. Stop du composer : ACTIVE tant qu'il est visible ------------------ //
@@ -676,6 +815,110 @@ const heartbeats = (sent) =>
       "aucun observateur ne survit au job",
     );
     assert.ok(virtual.clock() >= 60_000);
+  }
+
+  // --- 9. Secret injecté : ni dans les logs, ni dans le diagnostic ---------- //
+  // Les trois secrets du contrat de test (prompt, réponse, entête Bearer) sont
+  // réellement présents dans la page et dans le run. Le texte de la réponse
+  // part bien dans le `done` (c'est le produit), mais aucun canal de diagnostic
+  // — logs console, heartbeat, dom_health, run_state — ne doit en contenir un.
+  {
+    const sent = [];
+    const logs = [];
+    const liveStates = [];
+    const PROMPT_SECRET_123 = "PROMPT_SECRET_123";
+    const RESPONSE_SECRET_456 = "RESPONSE_SECRET_456";
+    const BEARER_SECRET_789 = "Bearer SECRET_789";
+    const secrets = [PROMPT_SECRET_123, RESPONSE_SECRET_456, BEARER_SECRET_789];
+    const { window, run, dispatch } = loadExtension(`
+      <main id="chat">
+        <div id="transcript"></div>
+        <form id="composer-form" data-authorization="Bearer SECRET_789">
+          <div
+            contenteditable="true"
+            aria-multiline="true"
+            role="textbox"
+            class="ProseMirror"
+            data-composer-markdown></div>
+          <button type="submit" aria-label="Send">Send</button>
+        </form>
+      </main>`);
+
+    const { virtual } = await runPrompt({
+      window,
+      run,
+      sent,
+      id: "req-secret",
+      prompt: PROMPT_SECRET_123,
+      logs,
+      before: (virtualClock, win) => {
+        // Secrets supplémentaires là où la page les porte réellement : cookies
+        // et stockage local. Aucun ne doit ressortir d'un diagnostic.
+        win.document.cookie = "bridge_secret=SECRET_789";
+        win.localStorage.setItem("bridge_authorization", BEARER_SECRET_789);
+        win.chrome.runtime.sendMessage = async (message) => {
+          sent.push(message);
+          if (message.type === "heartbeat") {
+            liveStates.push(JSON.parse(JSON.stringify(run("runDiagnosticSnapshot()"))));
+          }
+        };
+        virtualClock.afterTicks(0, () => {});
+      },
+      render: (transcript) => {
+        transcript.innerHTML =
+          `<div class="MarkdownRoot-Secret1" data-authorization="${BEARER_SECRET_789}">` +
+          `<p><span class="inline-markdown InlineMarkdownIsolate-S1">${RESPONSE_SECRET_456}</span></p>` +
+          `</div>`;
+      },
+    });
+
+    const health = await dispatch({ type: "dom_health" });
+    const live = await dispatch({ type: "run_state" });
+    const terminal = terminalMessages(sent);
+    assert.equal(terminal.length, 1);
+    assert.ok(
+      ["done", "incomplete"].includes(terminal[0].type),
+      "le run se conclut par un verdict unique",
+    );
+    // Preuve d'injection : le secret de réponse est bien le contenu sérialisé.
+    assert.equal(terminal[0].text, RESPONSE_SECRET_456);
+    const promptBytes = logs.find(
+      (entry) => entry.args[0] === "bridge_run_phase" && entry.args[1]?.phase === "prompt_injected",
+    );
+    assert.equal(promptBytes.args[1].prompt_bytes, PROMPT_SECRET_123.length);
+    assert.equal(Object.hasOwn(promptBytes.args[1], "prompt"), false);
+
+    // Tous les canaux de diagnostic sont inspectés, un par un.
+    const diagnosticMessages = sent.filter(
+      (message) => !["done", "incomplete", "error"].includes(message.type),
+    );
+    const channels = {
+      logs: JSON.stringify(logs),
+      heartbeats: JSON.stringify(heartbeats(sent)),
+      run_state_events: liveStates.map((state) => JSON.stringify(state)).join("|"),
+      dom_health: JSON.stringify(health),
+      run_state: JSON.stringify(live),
+      diagnostic_messages: JSON.stringify(diagnosticMessages),
+    };
+    for (const [channel, payload] of Object.entries(channels)) {
+      for (const secret of secrets) {
+        assert.equal(payload.includes(secret), false, `${channel}: ${secret}`);
+      }
+      for (const forbidden of ["innerText", "textContent", "innerHTML", "Authorization", "wsToken"]) {
+        assert.equal(
+          payload.includes(forbidden),
+          false,
+          `${channel}: clé interdite ${forbidden}`,
+        );
+      }
+    }
+    // Le diagnostic vivant reste exploitable : le run s'est bien conclu et
+    // l'état publié porte des comptages, jamais du contenu.
+    assert.equal(health.ok, true);
+    assert.equal(health.run.active, false);
+    assert.equal(live.active, false);
+    assert.ok(virtual.clock() > 0);
+    assert.ok(heartbeats(sent).length >= 1, "au moins un heartbeat pendant le run");
   }
 
   console.log("finalization state contract: ok");

@@ -348,6 +348,11 @@ make logs
 `make status` affiche l’état Compose puis health, ready et capabilities. Il
 construit l’en-tête Bearer dans le conteneur et n’affiche jamais le secret.
 
+Le popup de l’extension expose la même chaîne en un clic, sans DevTools :
+composer → Send → locator de réponse → finalisation → sérialisation, plus
+`Copy diagnostic` pour joindre un JSON complet et sûr. Voir
+« UI contract drift » pour la lecture ligne par ligne.
+
 ## UI contract drift
 
 Symptôme typique : les runs échouent en HTTP 502 avec
@@ -387,13 +392,35 @@ Procédure, dans cet ordre :
      disparu (0 partout) ou s’il y en a plusieurs (≥ 2).
    - **Content script v…** doit correspondre à `VERSION` dans
      `extension/content.js` ; sinon recharger l’extension **et** l’onglet.
-4. Cliquer **Copier le diagnostic** : le JSON copié ne contient que le
-   contrat fixe (statuts, stratégie, sélecteur connu, compteurs, préfixes
-   d’identifiants). Il peut être joint à un ticket tel quel.
+4. Cliquer **Copy diagnostic** : le JSON copié ne contient que le contrat
+   fixe (statuts, stratégie, sélecteur connu, compteurs, préfixes
+   d’identifiants). Il peut être joint à un ticket tel quel. Il couvre toute
+   la chaîne `target → input → response_locator → finalization →
+   serialization → connection`.
+   La ligne **Target** nomme toujours la source réellement diagnostiquée
+   (`Bridge inflight`, `Bridge browser target`, `Bridge conversation`,
+   `Bridge-owned tab`, `Generic ChatGPT tab`) et si elle appartient au bridge :
+   la priorité est *run inflight exact* → *browser target exact* →
+   *conversation retenue* → *onglet d’une fenêtre du bridge* → *onglet ChatGPT
+   quelconque en dernier recours*. Un onglet quelconque affiche
+   `Temporary Chat = N/A` : il ne déclenche jamais de fausse alarme.
    La section **Response locator** décrit le contrat de réponse : surface de
    conversation, stratégie (`semantic_assistant` ou `markdown_root_delta`),
    comptages de roots et de feuilles inline, verdict du candidat
-   (`FOUND` / `AMBIGUOUS` / `NONE`). Voir « Contrat de réponse (ResponseRoot) ».
+   (`FOUND` / `NONE` en attente / `BROKEN` / `—` hors run) et, en cas de dérive,
+   la raison bornée (`ambiguous_root`, `inline_without_root`, `surface_missing`).
+   Un refus de contrat affiche `Candidate = BROKEN`, la raison, et libelle la
+   ligne des roots « Markdown roots » avec les roots du DOM réel. Voir
+   « Contrat de réponse (ResponseRoot) ».
+   La section **Finalization** relit l’état vivant publié par la boucle du
+   content script (`ACTIVE` / `QUIESCENT` / `FINAL`), jamais une valeur
+   recalculée par le popup : signal bloquant (`Blocking signal`), caractères
+   sérialisés, stabilité mesurée / seuil réellement appliqué, observations,
+   actions/streaming/reasoning/Stop. La ligne de réveils expose
+   `mutation · observe_tick · timer` et l’âge de la dernière observation : c’est
+   ainsi qu’un onglet d’arrière-plan throttlé se distingue d’une réponse figée.
+   La section **Serialization** nomme le sérialiseur, la présence du root et le
+   dernier résultat (`OK` / `ERROR`).
    Le bouton **Copier la structure de réponse** joint un snapshot structurel
    borné (tag, tokens de classe, `data-testid`, dimensions, profondeur) quand
    il faut décrire un arbre réel sans jamais copier de texte.
@@ -449,8 +476,13 @@ Observabilité, sans contenu : la console de l’onglet journalise
 `bridge_response_locator` (`strategy`, `baseline_root_count`,
 `current_root_count`, `candidate_found`, `candidate_root_tag`, `markdown_root`,
 `inline_leaf_count`, `ambiguity_count`, `version`), et le popup affiche la
-section **Response locator** (Conversation surface / Strategy / Baseline roots
-/ Current roots / Candidate / Markdown root / Inline leaves). Le bouton
+section **Response locator** (Conversation / Strategy / Baseline roots /
+Current roots — libellée **Markdown roots** quand le locator refuse de
+conclure — / Candidate / Markdown root / Inline leaves / Reason). Le verdict du
+candidat (`candidate_state` : `idle`, `pending`, `found`, `broken`) et sa
+raison bornée (`ambiguous_root`, `inline_without_root`, `surface_missing`) sont
+produits par la décision réelle du locator, jamais re-dérivés par le popup : un
+onglet sans run reste `idle`, sans fausse alarme. Le bouton
 **Copier la structure de réponse** produit un snapshot structurel borné — tag,
 tokens de classe bornés, role, data-testid, data-* en liste blanche,
 profondeur, nombre d’enfants, dimensions, visibilité, stratégie de root — sans
@@ -534,6 +566,17 @@ fin conclue joint `finalization_evidence` : `mode` (`terminal_action` ou
 `quiescent_stability`), `signal`, `stable_for_ms`, `stable_observations`,
 `output_chars`, `candidate_strategy`.
 
+Le popup relit ce même état vivant sans rien recalculer : le content script
+publie `run_state` (`RUN_STATES`/`RUN_SIGNALS`, mêmes listes blanches que le
+worker) à chaque itération de la boucle, et `stable_threshold_ms` vient de
+`finalizationThresholdMs()` — le seuil publié est la borne de sortie réellement
+appliquée à cet état (`active_signal_stall_ms`, `finalization_stall_ms`,
+`settle_ms`/`empty_final_settle_ms`). Les réveils (`last_wake.mutation`,
+`observe_tick`, `timer`) et `ms_since_observation`/`ms_since_dom_mutation`
+distinguent une boucle vivante d’un onglet d’arrière-plan throttlé. Voir
+« UI contract drift » pour la lecture des sections **Finalization** et
+**Serialization**.
+
 Un signal ACTIVE qui reste allumé anormalement longtemps n’est jamais converti
 en FINAL par la durée seule : `WATCHED_TURN_ACTIVE_SIGNAL_STALL_MS` produit
 `incomplete/active_signal_stalled` (candidat joint, `blocking_signal` nommé),
@@ -606,7 +649,7 @@ cycle de vie de la fenêtre, **jamais** l’absence de dépendance au premier pl
 1. `make up`, puis vérifier le pont : `make status`.
 2. Recharger l’extension dans Chrome et vérifier la version du content script :
    dans la console de l’onglet ChatGPT, la ligne
-   `🔌 ChatGPT Mini-Bridge : content script prêt — version 38`. Une version plus
+   `🔌 ChatGPT Mini-Bridge : content script prêt — version 39`. Une version plus
    ancienne signifie que Chrome sert encore le code précédent.
 3. Lancer une génération qui occupe ChatGPT **au moins 6 à 10 minutes**
    (recherche approfondie), sans effet de bord de production.

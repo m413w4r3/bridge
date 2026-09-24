@@ -22,10 +22,27 @@ const diagnosticFields = {
   surface: document.getElementById("surface-status"),
   strategy: document.getElementById("response-strategy"),
   baselineRoots: document.getElementById("baseline-roots"),
+  rootsLabel: document.getElementById("roots-label"),
   currentRoots: document.getElementById("current-roots"),
   candidate: document.getElementById("candidate-status"),
   markdownRoot: document.getElementById("markdown-root"),
   inlineLeaves: document.getElementById("inline-leaves"),
+  reasonRow: document.getElementById("locator-reason-row"),
+  reason: document.getElementById("locator-reason"),
+  finalizationState: document.getElementById("finalization-state"),
+  finalizationSignalLabel: document.getElementById("finalization-signal-label"),
+  finalizationSignal: document.getElementById("finalization-signal"),
+  finalizationChars: document.getElementById("finalization-chars"),
+  finalizationStable: document.getElementById("finalization-stable"),
+  finalizationObservations: document.getElementById("finalization-observations"),
+  finalizationActions: document.getElementById("finalization-actions"),
+  finalizationStreaming: document.getElementById("finalization-streaming"),
+  finalizationReasoning: document.getElementById("finalization-reasoning"),
+  finalizationStop: document.getElementById("finalization-stop"),
+  wake: document.getElementById("wake-detail"),
+  serializationRoot: document.getElementById("serialization-root"),
+  serializationSerializer: document.getElementById("serialization-serializer"),
+  serializationLast: document.getElementById("serialization-last"),
   message: document.getElementById("diagnostic-message"),
   json: document.getElementById("diagnostic-json"),
 };
@@ -104,6 +121,12 @@ function safeResponseLocator(raw) {
     markdown_root: locator.markdown_root === true,
     inline_leaf_count: boundedCount(locator.inline_leaf_count),
     ambiguity_count: boundedCount(locator.ambiguity_count),
+    candidate_state: ["idle", "pending", "found", "broken"].includes(locator.candidate_state)
+      ? locator.candidate_state
+      : "idle",
+    reason: ["ambiguous_root", "inline_without_root", "surface_missing"].includes(locator.reason)
+      ? locator.reason
+      : null,
   };
 }
 
@@ -195,7 +218,7 @@ function safeResponseStructure(raw, tabId, diagnosticTarget) {
         : null,
     tab_id: Number.isInteger(tabId) ? tabId : null,
     diagnostic_target: {
-      source: ["inflight", "browser_target", "bridge_conversation", "temporary_chat", "generic_chatgpt_tab"].includes(diagnosticTarget?.source)
+      source: ["inflight", "browser_target", "bridge_conversation", "bridge_owned_tab", "generic_chatgpt_tab"].includes(diagnosticTarget?.source)
         ? diagnosticTarget.source
         : "generic_chatgpt_tab",
       bridge_owned: diagnosticTarget?.bridge_owned === true,
@@ -243,28 +266,43 @@ function safeConnection(raw) {
   };
 }
 
-/** Copy only the fixed diagnostic contract; never pass arbitrary message data through. */
+/**
+ * Rapport « un clic » : la chaîne complète du run, en liste blanche fermée.
+ *
+ *   target → input → response_locator → finalization → serialization
+ *
+ * Chaque section ne recopie que des comptages, des booléens, des durées, des
+ * noms de sélecteurs et des stratégies connues. Aucun prompt, aucun texte de
+ * réponse, aucun innerText/textContent/innerHTML, aucun jeton, jamais.
+ */
 function safeDiagnostic(raw) {
   const version = /^\d{1,4}$/.test(raw?.content_script_version || "")
     ? raw.content_script_version
     : null;
+  const target = {
+    source: ["inflight", "browser_target", "bridge_conversation", "bridge_owned_tab", "generic_chatgpt_tab"].includes(raw?.diagnostic_target?.source)
+      ? raw.diagnostic_target.source
+      : "generic_chatgpt_tab",
+    bridge_owned: raw?.diagnostic_target?.bridge_owned === true,
+  };
   const base = {
     ok: raw?.ok === true,
-    content_script_version: version,
+    version,
     tab_id: Number.isInteger(raw?.tab_id) ? raw.tab_id : null,
-    diagnostic_target: {
-      source: ["inflight", "browser_target", "bridge_conversation", "temporary_chat", "generic_chatgpt_tab"].includes(raw?.diagnostic_target?.source)
-        ? raw.diagnostic_target.source
-        : "generic_chatgpt_tab",
-      bridge_owned: raw?.diagnostic_target?.bridge_owned === true,
-    },
+    target,
     extension_state: raw?.extension_state === "active" ? "active" : "unknown",
     websocket_state: raw?.websocket_state === "connected" ? "connected" : "disconnected",
     connection: safeConnection(raw?.connection),
+    // Un run n'existe que dans un onglet qui appartient au bridge : un onglet
+    // ChatGPT quelconque ne doit jamais afficher un état de finalisation.
+    finalization: safeRunState(target.bridge_owned ? raw?.run : null),
   };
   if (raw?.ok !== true) {
     return {
       ...base,
+      input: null,
+      response_locator: null,
+      serialization: null,
       error: ["no_chatgpt_tab", "content_script_unavailable", "diagnostic_failed"].includes(raw?.error)
         ? raw.error
         : "diagnostic_failed",
@@ -277,47 +315,131 @@ function safeDiagnostic(raw) {
   const path = typeof surface.pathname === "string" && /^\/[A-Za-z0-9._~!$&'()*+,;=:@%/-]{0,127}$/.test(surface.pathname)
     ? surface.pathname
     : "";
+  const temporaryStatus = STATUSES.has(surface.temporary_status) ? surface.temporary_status : "invalid";
+  const locator = safeResponseLocator(raw.response_locator);
   return {
     ...base,
-    surface: {
-      origin_ok: surface.origin_ok === true,
-      pathname: path,
-      temporary_query: surface.temporary_query === true,
-      temporary_status: STATUSES.has(surface.temporary_status) ? surface.temporary_status : "invalid",
-      visibility_state: ["visible", "hidden", "prerender", "unloaded"].includes(surface.visibility_state)
-        ? surface.visibility_state
-        : "unknown",
-      has_focus: surface.has_focus === true,
+    input: {
+      // N/A (null) dès que l'onglet n'appartient pas au bridge : la question
+      // « ce chat est-il temporaire ? » ne concerne pas l'onglet de l'opérateur.
+      temporary_chat: target.bridge_owned ? temporaryStatus : null,
+      surface: {
+        origin_ok: surface.origin_ok === true,
+        pathname: path,
+        temporary_query: surface.temporary_query === true,
+        temporary_status: temporaryStatus,
+        visibility_state: ["visible", "hidden", "prerender", "unloaded"].includes(surface.visibility_state)
+          ? surface.visibility_state
+          : "unknown",
+        has_focus: surface.has_focus === true,
+      },
+      composer: {
+        status: STATUSES.has(composer.status) ? composer.status : "missing",
+        strategy: ["named_selector", "structural_fallback"].includes(composer.strategy) ? composer.strategy : null,
+        selector: COMPOSER_SELECTORS.has(composer.selector) ? composer.selector : null,
+        visible_candidates: boundedCount(composer.visible_candidates),
+        known_selector_candidates: boundedCount(composer.known_selector_candidates),
+        structural_candidates: boundedCount(composer.structural_candidates),
+        tag: ["DIV", "TEXTAREA", "INPUT"].includes(composer.tag) ? composer.tag : null,
+        role: composer.role === "textbox" ? "textbox" : null,
+        contenteditable: composer.contenteditable === true,
+        data_composer_markdown: composer.data_composer_markdown === true,
+        form_found: composer.form_found === true,
+      },
+      send: {
+        status: STATUSES.has(send.status) ? send.status : "missing",
+        strategy: ["named_selector", "structural_fallback"].includes(send.strategy) ? send.strategy : null,
+        selector: SEND_SELECTORS.has(send.selector) ? send.selector : null,
+        visible_candidates: boundedCount(send.visible_candidates),
+        type: ["button", "submit", "reset", "other"].includes(send.type) ? send.type : null,
+        disabled: send.disabled === true,
+        aria_disabled: send.aria_disabled === true,
+        same_form_as_composer: typeof send.same_form_as_composer === "boolean"
+          ? send.same_form_as_composer
+          : null,
+      },
     },
-    composer: {
-      status: STATUSES.has(composer.status) ? composer.status : "missing",
-      strategy: ["named_selector", "structural_fallback"].includes(composer.strategy) ? composer.strategy : null,
-      selector: COMPOSER_SELECTORS.has(composer.selector) ? composer.selector : null,
-      visible_candidates: boundedCount(composer.visible_candidates),
-      known_selector_candidates: boundedCount(composer.known_selector_candidates),
-      structural_candidates: boundedCount(composer.structural_candidates),
-      tag: ["DIV", "TEXTAREA", "INPUT"].includes(composer.tag) ? composer.tag : null,
-      role: composer.role === "textbox" ? "textbox" : null,
-      contenteditable: composer.contenteditable === true,
-      data_composer_markdown: composer.data_composer_markdown === true,
-      form_found: composer.form_found === true,
-    },
-    send: {
-      status: STATUSES.has(send.status) ? send.status : "missing",
-      strategy: ["named_selector", "structural_fallback"].includes(send.strategy) ? send.strategy : null,
-      selector: SEND_SELECTORS.has(send.selector) ? send.selector : null,
-      visible_candidates: boundedCount(send.visible_candidates),
-      type: ["button", "submit", "reset", "other"].includes(send.type) ? send.type : null,
-      disabled: send.disabled === true,
-      aria_disabled: send.aria_disabled === true,
-      same_form_as_composer: typeof send.same_form_as_composer === "boolean"
-        ? send.same_form_as_composer
-        : null,
-    },
-    response_locator: safeResponseLocator(raw.response_locator),
+    response_locator: locator,
+    serialization: base.finalization.serialization,
   };
 }
 
+const RUN_STATES = new Set(["idle", "waiting", "active", "quiescent", "final"]);
+const RUN_SIGNALS = new Set([
+  "unknown",
+  "streaming",
+  "reasoning",
+  "stop_button",
+  "assistant_actions",
+  "output_stable",
+  "quiescent_stability",
+]);
+const RUN_MODES = new Set(["terminal_action", "quiescent_stability"]);
+const RUN_CONFIDENCES = new Set(["low", "medium", "high"]);
+const RUN_PHASES = /^[a-z_]{1,32}$/;
+const RUN_SERIALIZER = /^[a-z][a-z0-9.-]{0,31}$/;
+
+/**
+ * État vivant du run (finalisation + sérialisation + réveils), en liste blanche
+ * fermée : comptages, booléens, durées, chaînes bornées. Jamais un contenu,
+ * jamais un nœud, jamais un identifiant d'onglet complet. Le worker et le popup
+ * ne recalculent aucune finalisation : ils recopient l'état que la boucle du
+ * content script a réellement maintenu et utilisé pour décider.
+ */
+function safeRunState(raw) {
+  const run = raw || {};
+  const bounded = (value) =>
+    Number.isInteger(value) && value >= 0 && value <= 1000000 ? value : 0;
+  const duration = (value) =>
+    Number.isFinite(value) ? Math.max(0, Math.round(value)) : null;
+  const signals = run.signals || {};
+  const serialization = run.serialization || {};
+  const observation = run.observation || {};
+  const lastWake = observation.last_wake || {};
+  const threshold = run.stable_threshold_ms;
+  return {
+    active: run.active === true,
+    phase: typeof run.phase === "string" && RUN_PHASES.test(run.phase) ? run.phase : "idle",
+    state: RUN_STATES.has(run.state) ? run.state : "idle",
+    mode: RUN_MODES.has(run.mode) ? run.mode : null,
+    signal: RUN_SIGNALS.has(run.signal) ? run.signal : null,
+    confidence: RUN_CONFIDENCES.has(run.confidence) ? run.confidence : null,
+    output_chars: bounded(run.output_chars),
+    stable_for_ms: bounded(run.stable_for_ms),
+    stable_threshold_ms: Number.isFinite(threshold) && threshold >= 0
+      ? Math.round(threshold)
+      : null,
+    stable_observations: bounded(run.stable_observations),
+    signals: {
+      actions: signals.actions === true,
+      streaming: signals.streaming === true,
+      reasoning: signals.reasoning === true,
+      stop: signals.stop === true,
+    },
+    serialization: {
+      root_found: typeof serialization.root_found === "boolean"
+        ? serialization.root_found
+        : null,
+      serializer: typeof serialization.serializer === "string" &&
+        RUN_SERIALIZER.test(serialization.serializer)
+        ? serialization.serializer
+        : null,
+      last_serialize: ["ok", "error"].includes(serialization.last_serialize)
+        ? serialization.last_serialize
+        : null,
+      ms: bounded(serialization.ms),
+    },
+    observation: {
+      last_wake: {
+        mutation: bounded(lastWake.mutation),
+        observe_tick: bounded(lastWake.observe_tick),
+        timer: bounded(lastWake.timer),
+      },
+      ms_since_observation: duration(observation.ms_since_observation),
+      ms_since_dom_mutation: duration(observation.ms_since_dom_mutation),
+    },
+  };
+}
 function setStatus(element, value, fallback = "BROKEN") {
   const display = {
     ok: ["OK", "contract-good"],
@@ -357,13 +479,148 @@ function describeStrategy(strategy) {
   }[strategy] || "";
 }
 
+const FINALIZATION_LABELS = {
+  idle: ["Idle", "contract-neutral"],
+  waiting: ["WAITING", "contract-neutral"],
+  active: ["ACTIVE", "contract-warn"],
+  quiescent: ["QUIESCENT", "contract-warn"],
+  final: ["FINAL", "contract-good"],
+};
+
+const TARGET_LABELS = {
+  inflight: "Bridge inflight",
+  browser_target: "Bridge browser target",
+  bridge_conversation: "Bridge conversation",
+  bridge_owned_tab: "Bridge-owned tab",
+  generic_chatgpt_tab: "Generic ChatGPT tab",
+};
+
+const LOCATOR_REASON_LABELS = {
+  ambiguous_root: "ambiguous_root",
+  inline_without_root: "inline_without_root",
+  surface_missing: "surface_missing",
+};
+
+/** Durée lisible et bornée : jamais un flottant brut, jamais un NaN. */
+function formatDuration(value) {
+  if (!Number.isFinite(value)) return "—";
+  if (value < 1000) return `${Math.round(value)} ms`;
+  // Secondes jusqu'à dix minutes : « 85 s / 300 s » se compare d'un coup d'œil,
+  // « 1.4 min / 5 min » non.
+  if (value < 600000) return `${Number((value / 1000).toFixed(1))} s`;
+  return `${Number((value / 60000).toFixed(1))} min`;
+}
+
+/** Oui/non borné : un état inconnu n'est jamais rendu comme « non ». */
+function yesNo(value, tone = "contract-warn") {
+  if (value === true) return ["yes", tone];
+  if (value === false) return ["no", "contract-neutral"];
+  return ["—", "contract-neutral"];
+}
+
+function setRow(element, text, className = "contract-neutral") {
+  element.textContent = text;
+  element.className = className;
+}
+
+/**
+ * Sections « Finalization » et « Serialization » : elles ne lisent que l'état
+ * vivant publié par la boucle du content script (aucune reconstruction, aucun
+ * seuil inventé — le seuil affiché est celui que le runtime applique).
+ */
+function renderRun(run) {
+  const finalization = run && typeof run === "object" ? run : null;
+  if (!finalization) {
+    setRow(diagnosticFields.finalizationState, "—");
+    diagnosticFields.finalizationSignalLabel.textContent = "Signal";
+    setRow(diagnosticFields.finalizationSignal, "—");
+    setRow(diagnosticFields.finalizationChars, "—");
+    setRow(diagnosticFields.finalizationStable, "—");
+    setRow(diagnosticFields.finalizationObservations, "—");
+    for (const field of [
+      diagnosticFields.finalizationActions,
+      diagnosticFields.finalizationStreaming,
+      diagnosticFields.finalizationReasoning,
+      diagnosticFields.finalizationStop,
+    ]) {
+      setRow(field, "—");
+    }
+    diagnosticFields.wake.textContent = "";
+    setRow(diagnosticFields.serializationRoot, "—");
+    setRow(diagnosticFields.serializationSerializer, "—");
+    setRow(diagnosticFields.serializationLast, "—");
+    return;
+  }
+  const [stateLabel, stateTone] = FINALIZATION_LABELS[finalization.state] || ["—", "contract-neutral"];
+  setRow(diagnosticFields.finalizationState, stateLabel, stateTone);
+  const active = finalization.active === true;
+  // Pendant ACTIVE, le signal est *la* raison pour laquelle la finalisation ne
+  // conclut pas : on le nomme comme tel plutôt que de le laisser deviner.
+  diagnosticFields.finalizationSignalLabel.textContent =
+    finalization.state === "active" ? "Blocking signal" : "Signal";
+  setRow(
+    diagnosticFields.finalizationSignal,
+    active && finalization.signal ? finalization.signal : "—",
+    finalization.state === "active" ? "contract-warn" : "contract-neutral",
+  );
+  setRow(diagnosticFields.finalizationChars, active ? String(finalization.output_chars) : "—");
+  setRow(
+    diagnosticFields.finalizationStable,
+    active
+      ? `${formatDuration(finalization.stable_for_ms)} / ${formatDuration(finalization.stable_threshold_ms)}`
+      : "—",
+    finalization.state === "active" ? "contract-warn" : "contract-neutral",
+  );
+  setRow(diagnosticFields.finalizationObservations, active ? String(finalization.stable_observations) : "—");
+  const signals = finalization.signals || {};
+  const [actionsText, actionsTone] = yesNo(active ? signals.actions : null, "contract-good");
+  setRow(diagnosticFields.finalizationActions, actionsText, actionsTone);
+  for (const [field, value] of [
+    [diagnosticFields.finalizationStreaming, signals.streaming],
+    [diagnosticFields.finalizationReasoning, signals.reasoning],
+    [diagnosticFields.finalizationStop, signals.stop],
+  ]) {
+    const [text, tone] = yesNo(active ? value : null);
+    setRow(field, text, tone);
+  }
+  const observation = finalization.observation || {};
+  const lastWake = observation.last_wake || {};
+  diagnosticFields.wake.textContent = active
+    ? `Réveils mutation ${lastWake.mutation} · tick ${lastWake.observe_tick} · timer ${lastWake.timer}` +
+      ` — dernière observation ${formatDuration(observation.ms_since_observation)}` +
+      `, dernière mutation DOM ${formatDuration(observation.ms_since_dom_mutation)}`
+    : "";
+
+  const serialization = finalization.serialization || {};
+  const rootFound = serialization.root_found;
+  setRow(
+    diagnosticFields.serializationRoot,
+    rootFound === true ? "yes" : rootFound === false ? "no" : "—",
+    rootFound === true ? "contract-good" : rootFound === false ? "contract-warn" : "contract-neutral",
+  );
+  setRow(
+    diagnosticFields.serializationSerializer,
+    serialization.serializer || "—",
+  );
+  const lastSerialize = serialization.last_serialize;
+  setRow(
+    diagnosticFields.serializationLast,
+    lastSerialize === "ok" ? "OK" : lastSerialize === "error" ? "ERROR" : "—",
+    lastSerialize === "ok"
+      ? "contract-good"
+      : lastSerialize === "error"
+        ? "contract-bad"
+        : "contract-neutral",
+  );
+}
+
 function renderDiagnostic(raw) {
   diagnostic = safeDiagnostic(raw);
   document.getElementById("copy-response-structure").disabled = true;
   document.getElementById("copy-diagnostic").disabled = false;
   diagnosticFields.json.textContent = JSON.stringify(diagnostic, null, 2);
   diagnosticFields.json.hidden = false;
-  const { connection } = diagnostic;
+  const { connection, target } = diagnostic;
   diagnosticFields.extension.textContent =
     `${diagnostic.extension_state} / WebSocket ${connection.state.toUpperCase()}`;
   diagnosticFields.extension.className = {
@@ -381,26 +638,20 @@ function renderDiagnostic(raw) {
     connection.conflict_reason ? `conflit ${connection.conflict_reason}` : null,
   ].filter(Boolean).join(" · ");
 
-  const targetLabels = {
-    inflight: "Bridge inflight",
-    browser_target: "Bridge browser target",
-    bridge_conversation: "Bridge conversation",
-    temporary_chat: "Temporary Chat",
-    generic_chatgpt_tab: "Generic ChatGPT tab",
-  };
-  diagnosticFields.target.textContent = targetLabels[diagnostic.diagnostic_target.source];
+  // La source et la propriété de la cible sont toujours affichées : c'est ce
+  // qui permet de savoir *quel* onglet a été diagnostiqué, sans DevTools.
+  diagnosticFields.target.textContent =
+    `${TARGET_LABELS[target.source]} · ${target.bridge_owned ? "bridge-owned" : "not owned"}`;
+  diagnosticFields.tab.textContent = diagnostic.tab_id == null ? "" : `Onglet #${diagnostic.tab_id}`;
+
+  renderRun(diagnostic.finalization);
 
   if (!diagnostic.ok) {
-    if (diagnostic.diagnostic_target.source === "generic_chatgpt_tab") {
-      diagnosticFields.temporary.textContent = "N/A";
-      diagnosticFields.temporary.className = "contract-neutral";
-    } else {
-      setStatus(diagnosticFields.temporary, "invalid");
-    }
+    diagnosticFields.temporary.textContent = target.bridge_owned ? "—" : "N/A";
+    diagnosticFields.temporary.className = "contract-neutral";
     setStatus(diagnosticFields.composer, "missing");
     setStatus(diagnosticFields.send, "missing");
     diagnosticFields.version.textContent = "—";
-    diagnosticFields.tab.textContent = diagnostic.tab_id == null ? "" : `Onglet #${diagnostic.tab_id}`;
     diagnosticFields.composerSelector.textContent = "—";
     diagnosticFields.composerStrategy.textContent = "";
     diagnosticFields.composerCandidates.textContent = "";
@@ -411,29 +662,33 @@ function renderDiagnostic(raw) {
     diagnosticFields.surface.className = "contract-neutral";
     diagnosticFields.strategy.textContent = "—";
     diagnosticFields.baselineRoots.textContent = "—";
+    diagnosticFields.rootsLabel.textContent = "Current roots";
     diagnosticFields.currentRoots.textContent = "—";
     setStatus(diagnosticFields.candidate, "missing", "NONE");
     diagnosticFields.markdownRoot.textContent = "—";
     diagnosticFields.inlineLeaves.textContent = "—";
+    diagnosticFields.reasonRow.hidden = true;
     diagnosticFields.message.textContent = diagnostic.error === "no_chatgpt_tab"
       ? "Aucun onglet ChatGPT ouvert."
       : "Content script absent ou indisponible. Recharge l’onglet ChatGPT.";
     return;
   }
 
-  const { surface, composer, send, response_locator: locator } = diagnostic;
-  if (diagnostic.diagnostic_target.source === "generic_chatgpt_tab") {
+  const { surface, composer, send } = diagnostic.input;
+  const locator = diagnostic.response_locator;
+  // Un onglet qui n'appartient pas au bridge ne doit jamais déclencher de
+  // fausse alarme « Temporary Chat » : la question ne le concerne pas.
+  if (target.bridge_owned) {
+    setStatus(diagnosticFields.temporary, diagnostic.input.temporary_chat, "INVALID");
+  } else {
     diagnosticFields.temporary.textContent = "N/A";
     diagnosticFields.temporary.className = "contract-neutral";
-  } else {
-    setStatus(diagnosticFields.temporary, surface.temporary_status, "INVALID");
   }
   setStatus(diagnosticFields.composer, composer.status);
   setStatus(diagnosticFields.send, send.status);
-  diagnosticFields.version.textContent = diagnostic.content_script_version
-    ? `v${diagnostic.content_script_version}`
+  diagnosticFields.version.textContent = diagnostic.version
+    ? `v${diagnostic.version}`
     : "inconnue";
-  diagnosticFields.tab.textContent = diagnostic.tab_id == null ? "" : `Onglet #${diagnostic.tab_id}`;
   diagnosticFields.composerSelector.textContent = composer.selector || "Aucun sélecteur trouvé";
   diagnosticFields.composerStrategy.textContent = describeStrategy(composer.strategy);
   diagnosticFields.composerCandidates.textContent =
@@ -443,21 +698,28 @@ function renderDiagnostic(raw) {
   diagnosticFields.sendCandidates.textContent = send.status === "not_rendered_idle"
     ? `${send.visible_candidates} visible · bouton non rendu tant que le composer est vide`
     : `${send.visible_candidates} visible · type ${send.type || "unknown"} · disabled ${send.disabled ? "yes" : "no"} · aria-disabled ${send.aria_disabled ? "yes" : "no"} · same form ${send.same_form_as_composer == null ? "unknown" : send.same_form_as_composer ? "yes" : "no"}`;
-  // Response locator : surface, stratégie et comptages — jamais un contenu.
-  diagnosticFields.surface.textContent = locator.conversation_surface
-    ? `OK${locator.surface_strategy ? ` (${locator.surface_strategy})` : ""}`
-    : "ABSENTE";
-  diagnosticFields.surface.className = locator.conversation_surface
-    ? "contract-good"
-    : "contract-bad";
+  // Response locator : surface, stratégie, comptages et raison bornée d'un
+  // refus — jamais un contenu, jamais un nœud.
+  setRow(
+    diagnosticFields.surface,
+    locator.conversation_surface
+      ? `OK${locator.surface_strategy ? ` (${locator.surface_strategy})` : ""}`
+      : "ABSENTE",
+    locator.conversation_surface ? "contract-good" : "contract-bad",
+  );
   diagnosticFields.strategy.textContent = locator.strategy || "—";
   diagnosticFields.baselineRoots.textContent = String(locator.baseline_root_count);
+  // Dérive de contrat : les roots affichés sont ceux du DOM *réel*, mesurés
+  // contre le baseline du run (`Markdown roots`), pas une valeur de candidat.
+  diagnosticFields.rootsLabel.textContent =
+    locator.candidate_state === "broken" ? "Markdown roots" : "Current roots";
   diagnosticFields.currentRoots.textContent = String(locator.current_root_count);
-  const candidateLabel = locator.ambiguity_count > 0
-    ? ["AMBIGUOUS", "contract-bad"]
-    : locator.candidate_found
-      ? ["FOUND", "contract-good"]
-      : ["NONE", "contract-neutral"];
+  const candidateLabel = {
+    found: ["FOUND", "contract-good"],
+    pending: ["NONE", "contract-neutral"],
+    broken: ["BROKEN", "contract-bad"],
+    idle: ["—", "contract-neutral"],
+  }[locator.candidate_state] || ["—", "contract-neutral"];
   diagnosticFields.candidate.textContent = candidateLabel[0];
   diagnosticFields.candidate.className = candidateLabel[1];
   diagnosticFields.markdownRoot.textContent = locator.markdown_root ? "YES" : "NO";
@@ -465,8 +727,48 @@ function renderDiagnostic(raw) {
     ? "contract-good"
     : "contract-neutral";
   diagnosticFields.inlineLeaves.textContent = String(locator.inline_leaf_count);
+  const reason = LOCATOR_REASON_LABELS[locator.reason] || null;
+  diagnosticFields.reasonRow.hidden = reason === null;
+  diagnosticFields.reason.textContent = reason || "—";
+  diagnosticFields.reason.className = reason === null ? "contract-neutral" : "contract-bad";
   document.getElementById("copy-response-structure").disabled = false;
   diagnosticFields.message.textContent = "Diagnostic terminé. Aucun contenu de conversation n’a été lu.";
+}
+
+/**
+ * État vivant poussé par le service worker pendant qu'un run est en cours : le
+ * même contrat borné que `run` dans le diagnostic complet, et la même source
+ * que le run (inflight → browser target → conversation retenue → onglet
+ * bridge → onglet ChatGPT générique en dernier recours).
+ */
+function safeLiveRun(raw) {
+  const source = ["inflight", "browser_target", "bridge_conversation", "bridge_owned_tab", "generic_chatgpt_tab"].includes(raw?.diagnostic_target?.source)
+    ? raw.diagnostic_target.source
+    : "generic_chatgpt_tab";
+  const bridgeOwned = raw?.diagnostic_target?.bridge_owned === true;
+  return {
+    ok: raw?.ok === true,
+    target: { source, bridge_owned: bridgeOwned },
+    // Un run n'appartient qu'au bridge : un onglet générique rend un état vide.
+    run: safeRunState(bridgeOwned ? raw?.run : null),
+  };
+}
+
+function applyLiveRun(live) {
+  const run = live?.run || null;
+  renderRun(run);
+  if (!diagnostic) return;
+  diagnostic.finalization = run;
+  diagnostic.serialization = run?.serialization || null;
+  diagnosticFields.json.textContent = JSON.stringify(diagnostic, null, 2);
+}
+
+async function refreshLiveRun() {
+  try {
+    applyLiveRun(safeLiveRun(await chrome.runtime.sendMessage({ type: "run_state" })));
+  } catch {
+    applyLiveRun(null);
+  }
 }
 
 /**
@@ -487,6 +789,9 @@ function describe(state) {
 }
 
 async function refresh() {
+  // État vivant du run en parallèle du reste : le popup ouvert pendant une
+  // génération voit ACTIVE / QUIESCENT / FINAL évoluer sans clic.
+  void refreshLiveRun();
   const status = await chrome.runtime.sendMessage({ type: "status" });
   dot.classList.toggle("on", Boolean(status?.connected));
   state.textContent = status?.connected ? "Connecté au serveur" : "Déconnecté";
@@ -549,7 +854,7 @@ document.getElementById("copy-response-structure").addEventListener("click", asy
     const structure = safeResponseStructure(
       await chrome.runtime.sendMessage({ type: "response_structure" }),
       diagnostic?.tab_id ?? null,
-      diagnostic?.diagnostic_target ?? null,
+      diagnostic?.target ?? null,
     );
     if (structure.ok !== true) {
       diagnosticFields.message.textContent =

@@ -95,9 +95,38 @@
     };
   }
 
+  /**
+   * Borne de durée réellement applicable à l'état courant : c'est *ce* seuil
+   * que le diagnostic affiche à côté de la stabilité mesurée, pour que
+   * l'opérateur compare la durée observée à la règle que le runtime applique —
+   * jamais à un seuil inventé par le popup.
+   *
+   * Le seuil publié est la borne de SORTIE de l'état, celle après laquelle le
+   * runtime rend la main au lieu d'attendre encore :
+   *
+   *   ACTIVE     -> `active_signal_stall_ms`  (`active_signal_stalled`)
+   *   QUIESCENT  -> `finalization_stall_ms`   (`finalization_stalled`)
+   *   FINAL      -> `settle_ms` / `empty_final_settle_ms` (fenêtre de conclusion)
+   *
+   * QUIESCENT conclut par une durée *et* des observations réelles : aucune
+   * durée seule ne le résume. `waiting`/`idle` n'ont aucune borne et rendent
+   * `null` — jamais un seuil qui ne serait appliqué par personne.
+   */
+  function finalizationThresholdMs({ state, outputChars, thresholds }) {
+    const limits = thresholds || {};
+    const value = (key) => (Number.isFinite(limits[key]) ? limits[key] : null);
+    if (state === "final") {
+      return outputChars > 0 ? value("settle_ms") : value("empty_final_settle_ms");
+    }
+    if (state === "quiescent") return value("finalization_stall_ms");
+    if (state === "active") return value("active_signal_stall_ms");
+    return null;
+  }
+
   root.ChatGPTBridgeFinalOutput = {
     createAccumulator,
     outputChars,
     finalizationOutcome,
+    finalizationThresholdMs,
   };
 })(globalThis);

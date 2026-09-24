@@ -584,7 +584,7 @@ function useVirtualClock(window) {
     assert.equal(contractLog?.composer_strategy, "named_selector");
     assert.equal(contractLog?.composer_selector, "[data-composer-markdown][contenteditable='true'][role='textbox']");
     assert.equal(contractLog?.send_selector, "button[aria-label*='Send']");
-    assert.equal(contractLog?.content_script_version, "38");
+    assert.equal(contractLog?.content_script_version, "39");
     assert.equal(JSON.stringify(contractLog).includes("bonjour moderne"), false);
     assert.equal(submit, form.querySelector("button[type='submit']"));
   }
@@ -608,7 +608,7 @@ function useVirtualClock(window) {
     );
     const current = await dispatch({ type: "dom_health" });
     assert.equal(current.ok, true);
-    assert.equal(current.content_script_version, "38");
+    assert.equal(current.content_script_version, "39");
     assert.equal(current.surface.temporary_status, "ok");
     assert.equal(current.composer.status, "ok");
     assert.equal(current.send.status, "ok");
@@ -904,7 +904,7 @@ function useVirtualClock(window) {
     assert.equal(error?.submission_state, "pre_submission");
     assert.equal(error?.diagnostics?.ui_contract_error, "composer_missing");
     assert.equal(error?.diagnostics?.dom_health?.composer?.status, "missing");
-    assert.equal(error?.diagnostics?.dom_health?.content_script_version, "38");
+    assert.equal(error?.diagnostics?.dom_health?.content_script_version, "39");
     assert.equal(sent.some((message) => message.type === "done"), false);
   }
 
@@ -928,7 +928,7 @@ function useVirtualClock(window) {
     assert.equal(error?.diagnostics?.send_status, "missing");
     assert.equal(error?.diagnostics?.send_candidates, 0);
     assert.equal(error?.diagnostics?.form_found, true);
-    assert.equal(error?.diagnostics?.content_script_version, "38");
+    assert.equal(error?.diagnostics?.content_script_version, "39");
     assert.equal(JSON.stringify(error).includes("hello"), false);
   }
 
@@ -1822,7 +1822,7 @@ const PLACEHOLDER_ID =
       "l'identité doit venir du nœud courant, pas du placeholder détaché",
     );
     assert.equal(done.metadata?.initial_turn_id, "stable-assistant-42");
-    assert.equal(done.metadata?.content_script_version, "38");
+    assert.equal(done.metadata?.content_script_version, "39");
   }
 
   // Même remplacement, mais l'UI reste bloquée « en streaming » : le candidat
@@ -2554,7 +2554,7 @@ async function runPromptInjection({ id, prompt, files = null }) {
     })()`);
     assert.equal(diagnostics.composer_was_non_empty, true);
     assert.equal(diagnostics.composer_still_has_text, true);
-    assert.equal(diagnostics.content_script_version, "38");
+    assert.equal(diagnostics.content_script_version, "39");
 
     // Le snapshot ne transporte plus le texte du composer, seulement un booléen.
     const snapshot = run(`captureSubmissionSnapshot(${SEL})`);

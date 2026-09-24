@@ -685,6 +685,20 @@ async function findChatTab() {
   return tabs.find((t) => t.active) || tabs[tabs.length - 1];
 }
 
+/**
+ * Onglet diagnostiqué : la priorité suit la chaîne réelle du run, du plus
+ * exact au plus générique. Un onglet ChatGPT quelconque n'est JAMAIS préféré à
+ * une cible du bridge, et le diagnostic dit toujours de quelle source il parle
+ * (`diagnostic_target.source` + `bridge_owned`).
+ *
+ *   1. inflight      : l'onglet exact du run en cours (Map `inflight`) ;
+ *   2. browser_target: la target exacte réservée pour un run stateless ;
+ *   3. bridge_conversation : le binding retenu (KEEP / recovery) d'une
+ *      conversation live, retrouvé par `tabs.get` exact ;
+ *   4. bridge_owned_tab : un onglet ChatGPT vivant dans une fenêtre possédée
+ *      par le bridge — la propriété est prouvée, l'onglet ne l'est pas ;
+ *   5. generic_chatgpt_tab : dernier recours assumé, `bridge_owned: false`.
+ */
 async function findDiagnosticChatTab() {
   const exact = async (tabId, source, bridgeOwned) => {
     try {
@@ -710,24 +724,26 @@ async function findDiagnosticChatTab() {
   const browserTarget = await bound([...browserTargetRegistry.values()].reverse(), "browser_target");
   if (browserTarget) return browserTarget;
   const conversation = await bound(
-    [...conversationRegistry.values()].filter((entry) => entry?.state === "live").reverse(),
+    [...conversationRegistry.values()].reverse(),
     "bridge_conversation",
   );
   if (conversation) return conversation;
-  const tabs = await chrome.tabs.query({
-    url: ["https://chatgpt.com/*", "https://chat.openai.com/*"],
-  });
+  // Le filtre d'URL est refait ici : le diagnostic ne dépend pas de la
+  // sémantique exacte de `chrome.tabs.query({ url })` côté navigateur.
+  const tabs = (
+    await chrome.tabs.query({
+      url: ["https://chatgpt.com/*", "https://chat.openai.com/*"],
+    })
+  ).filter((tab) => isAllowedChatOrigin(tab.url));
   if (tabs.length === 0) return null;
-  const temporaryChat = tabs.find((tab) => {
-    try {
-      const url = new URL(tab.url);
-      return url.pathname === "/" && url.searchParams.get("temporary-chat") === "true";
-    } catch {
-      return false;
-    }
-  });
-  if (temporaryChat) {
-    return { tab: temporaryChat, source: "temporary_chat", bridge_owned: false };
+  const ownedWindows = new Set();
+  for (const entry of [...browserTargetRegistry.values(), ...conversationRegistry.values()]) {
+    if (entry?.bridge_owned_window !== true || !Number.isInteger(entry.window_id)) continue;
+    ownedWindows.add(entry.window_id);
+  }
+  const ownedTab = tabs.find((tab) => ownedWindows.has(tab.windowId));
+  if (ownedTab) {
+    return { tab: ownedTab, source: "bridge_owned_tab", bridge_owned: true };
   }
   const active = tabs.find((tab) => tab.active);
   if (active) return { tab: active, source: "generic_chatgpt_tab", bridge_owned: false };
@@ -804,6 +820,12 @@ function safeResponseLocator(raw) {
     markdown_root: locator.markdown_root === true,
     inline_leaf_count: diagnosticCount(locator.inline_leaf_count),
     ambiguity_count: diagnosticCount(locator.ambiguity_count),
+    candidate_state: ["idle", "pending", "found", "broken"].includes(locator.candidate_state)
+      ? locator.candidate_state
+      : "idle",
+    reason: ["ambiguous_root", "inline_without_root", "surface_missing"].includes(locator.reason)
+      ? locator.reason
+      : null,
   };
 }
 
@@ -846,7 +868,7 @@ function safeDomHealth(raw, tabId, diagnosticTarget) {
         : null,
     tab_id: Number.isInteger(tabId) ? tabId : null,
     diagnostic_target: {
-      source: ["inflight", "browser_target", "bridge_conversation", "temporary_chat", "generic_chatgpt_tab"].includes(diagnosticTarget?.source)
+      source: ["inflight", "browser_target", "bridge_conversation", "bridge_owned_tab", "generic_chatgpt_tab"].includes(diagnosticTarget?.source)
         ? diagnosticTarget.source
         : "generic_chatgpt_tab",
       bridge_owned: diagnosticTarget?.bridge_owned === true,
@@ -892,6 +914,8 @@ function safeDomHealth(raw, tabId, diagnosticTarget) {
         : null,
     },
     response_locator: safeResponseLocator(raw?.response_locator),
+    // État vivant du run : le worker le recopie filtré, il ne le recompute pas.
+    run: safeRunState(raw?.run),
   };
 }
 
@@ -1078,7 +1102,7 @@ function safeResponseStructure(raw, tabId, diagnosticTarget) {
         : null,
     tab_id: Number.isInteger(tabId) ? tabId : null,
     diagnostic_target: {
-      source: ["inflight", "browser_target", "bridge_conversation", "temporary_chat", "generic_chatgpt_tab"].includes(diagnosticTarget?.source)
+      source: ["inflight", "browser_target", "bridge_conversation", "bridge_owned_tab", "generic_chatgpt_tab"].includes(diagnosticTarget?.source)
         ? diagnosticTarget.source
         : "generic_chatgpt_tab",
       bridge_owned: diagnosticTarget?.bridge_owned === true,
@@ -1100,6 +1124,122 @@ function safeResponseStructure(raw, tabId, diagnosticTarget) {
       }))
       .filter((root) => root.node !== null),
   };
+}
+
+const RUN_STATES = new Set(["idle", "waiting", "active", "quiescent", "final"]);
+const RUN_SIGNALS = new Set([
+  "unknown",
+  "streaming",
+  "reasoning",
+  "stop_button",
+  "assistant_actions",
+  "output_stable",
+  "quiescent_stability",
+]);
+const RUN_MODES = new Set(["terminal_action", "quiescent_stability"]);
+const RUN_CONFIDENCES = new Set(["low", "medium", "high"]);
+const RUN_PHASES = /^[a-z_]{1,32}$/;
+const RUN_SERIALIZER = /^[a-z][a-z0-9.-]{0,31}$/;
+
+/**
+ * État vivant du run (finalisation + sérialisation + réveils), en liste blanche
+ * fermée : comptages, booléens, durées, chaînes bornées. Jamais un contenu,
+ * jamais un nœud, jamais un identifiant d'onglet complet. Le worker et le popup
+ * ne recalculent aucune finalisation : ils recopient l'état que la boucle du
+ * content script a réellement maintenu et utilisé pour décider.
+ */
+function safeRunState(raw) {
+  const run = raw || {};
+  const bounded = (value) =>
+    Number.isInteger(value) && value >= 0 && value <= 1000000 ? value : 0;
+  const duration = (value) =>
+    Number.isFinite(value) ? Math.max(0, Math.round(value)) : null;
+  const signals = run.signals || {};
+  const serialization = run.serialization || {};
+  const observation = run.observation || {};
+  const lastWake = observation.last_wake || {};
+  const threshold = run.stable_threshold_ms;
+  return {
+    active: run.active === true,
+    phase: typeof run.phase === "string" && RUN_PHASES.test(run.phase) ? run.phase : "idle",
+    state: RUN_STATES.has(run.state) ? run.state : "idle",
+    mode: RUN_MODES.has(run.mode) ? run.mode : null,
+    signal: RUN_SIGNALS.has(run.signal) ? run.signal : null,
+    confidence: RUN_CONFIDENCES.has(run.confidence) ? run.confidence : null,
+    output_chars: bounded(run.output_chars),
+    stable_for_ms: bounded(run.stable_for_ms),
+    stable_threshold_ms: Number.isFinite(threshold) && threshold >= 0
+      ? Math.round(threshold)
+      : null,
+    stable_observations: bounded(run.stable_observations),
+    signals: {
+      actions: signals.actions === true,
+      streaming: signals.streaming === true,
+      reasoning: signals.reasoning === true,
+      stop: signals.stop === true,
+    },
+    serialization: {
+      root_found: typeof serialization.root_found === "boolean"
+        ? serialization.root_found
+        : null,
+      serializer: typeof serialization.serializer === "string" &&
+        RUN_SERIALIZER.test(serialization.serializer)
+        ? serialization.serializer
+        : null,
+      last_serialize: ["ok", "error"].includes(serialization.last_serialize)
+        ? serialization.last_serialize
+        : null,
+      ms: bounded(serialization.ms),
+    },
+    observation: {
+      last_wake: {
+        mutation: bounded(lastWake.mutation),
+        observe_tick: bounded(lastWake.observe_tick),
+        timer: bounded(lastWake.timer),
+      },
+      ms_since_observation: duration(observation.ms_since_observation),
+      ms_since_dom_mutation: duration(observation.ms_since_dom_mutation),
+    },
+  };
+}
+/**
+ * État vivant seul, pour le popup ouvert pendant un run : même sélection de
+ * cible que le diagnostic complet, même liste blanche, aucune observation de
+ * plus. Un onglet sans run rend `active: false` — jamais un état hérité.
+ */
+async function handleRunState() {
+  const target = await findDiagnosticChatTab();
+  if (!target) {
+    return {
+      ok: false,
+      error: "no_chatgpt_tab",
+      diagnostic_target: { source: "generic_chatgpt_tab", bridge_owned: false },
+      run: safeRunState(null),
+    };
+  }
+  const { tab } = target;
+  const diagnostic_target = {
+    source: target.source,
+    bridge_owned: target.bridge_owned === true,
+  };
+  try {
+    const run = await chrome.tabs.sendMessage(tab.id, { type: "run_state" });
+    return {
+      ok: true,
+      error: null,
+      tab_id: Number.isInteger(tab.id) ? tab.id : null,
+      diagnostic_target,
+      run: safeRunState(run),
+    };
+  } catch {
+    return {
+      ok: false,
+      error: "content_script_unavailable",
+      tab_id: Number.isInteger(tab.id) ? tab.id : null,
+      diagnostic_target,
+      run: safeRunState(null),
+    };
+  }
 }
 
 async function handleResponseStructure() {
@@ -1938,6 +2078,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg?.type === "status") {
     sendResponse({ ...status, connection: connectionDiagnostic() });
+    return true;
+  }
+  if (msg?.type === "run_state") {
+    // État vivant du run (finalisation / sérialisation / réveils), relu à
+    // chaque rafraîchissement du popup : le popup n'invente aucun état.
+    void handleRunState().then(
+      sendResponse,
+      () => sendResponse({
+        ok: false,
+        error: "diagnostic_failed",
+        diagnostic_target: { source: "generic_chatgpt_tab", bridge_owned: false },
+        run: safeRunState(null),
+      }),
+    );
     return true;
   }
   if (msg?.type === "response_structure") {

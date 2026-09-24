@@ -1605,7 +1605,7 @@ async function main() {
       contentMessage = { tabId, message };
       return {
         ok: true,
-        content_script_version: "38",
+        content_script_version: "39",
         surface: {
           origin_ok: true,
           pathname: "/",
@@ -1699,6 +1699,200 @@ async function main() {
     assert.equal(result.diagnostic_target.bridge_owned, true);
     assert.notEqual(diagnosedTab, active.id);
     assert.notEqual(diagnosedTab, otherTemporary.id);
+  }
+
+  // 27bis. Échelle de priorité du diagnostic, vérifiée de bout en bout : run
+  // inflight exact -> browser target exact -> conversation retenue -> onglet
+  // d'une fenêtre du bridge -> onglet ChatGPT quelconque, en dernier recours.
+  // « Plusieurs tabs ChatGPT ouverts, un run inflight utilise tab X » : le
+  // popup doit diagnostiquer X, jamais le tab actif quelconque.
+  {
+    const mock = makeChromeMock();
+    const { run } = loadBackground(mock.chrome);
+    // L'onglet visible de l'opérateur : actif, mais étranger au bridge.
+    const generic = await mock.chrome.tabs.create({
+      url: "https://chatgpt.com/c/user-visible",
+      active: true,
+    });
+    const inflightWindow = await mock.chrome.windows.create({
+      url: "https://chatgpt.com/?temporary-chat=true",
+      type: "normal",
+      focused: false,
+      state: "normal",
+    });
+    const inflightTab = inflightWindow.tabs[0];
+    const conversationWindow = await mock.chrome.windows.create({
+      url: "https://chatgpt.com/?temporary-chat=true",
+      type: "normal",
+      focused: false,
+      state: "normal",
+    });
+    const conversationTab = conversationWindow.tabs[0];
+    // Fenêtre du bridge dont la cible enregistrée a disparu : seul le repli
+    // `bridge_owned_tab` peut encore la retrouver, jamais l'onglet actif.
+    const recoveryWindow = await mock.chrome.windows.create({
+      url: "https://chatgpt.com/?temporary-chat=true",
+      type: "normal",
+      focused: false,
+      state: "normal",
+    });
+    const ownedTab = recoveryWindow.tabs[0];
+
+    await run("browserTargetRegistryReady");
+    await run("conversationRegistryReady");
+    await run(`inflight.set("run-inflight", ${inflightTab.id})`);
+    await run(
+      `browserTargetRegistry.set("run-inflight", { target_id: "run-inflight", tab_id: ${inflightTab.id}, bridge_owned_window: true, window_id: ${inflightWindow.id}, state: "live" })`,
+    );
+    await run(
+      `browserTargetRegistry.set("run-recovery", { target_id: "run-recovery", tab_id: 987654321, bridge_owned_window: true, window_id: ${recoveryWindow.id}, state: "recoverable" })`,
+    );
+    await run(
+      `conversationRegistry.set("conv-A", { id: "conv-A", tab_id: ${conversationTab.id}, bridge_owned_window: true, window_id: ${conversationWindow.id} })`,
+    );
+
+    // Le contenu réel d'un run : les trois secrets du contrat de diagnostic
+    // sont injectés à chaque niveau pour prouver qu'aucun ne traverse.
+    const runStatePayload = () => ({
+      active: true,
+      phase: "generation",
+      state: "active",
+      mode: "watched_turn",
+      confidence: "high",
+      signal: "streaming",
+      output_chars: 42,
+      stable_for_ms: 85000,
+      stable_threshold_ms: 300000,
+      stable_observations: 12,
+      signals: { actions: false, streaming: true, reasoning: false, stop: false },
+      serialization: {
+        root_found: true,
+        serializer: "chatgpt-dom-v3",
+        last_serialize: "ok",
+        ms: 3,
+      },
+      observation: {
+        last_wake: { mutation: 4, observe_tick: 2, timer: 1 },
+        ms_since_observation: 120,
+        ms_since_dom_mutation: 250,
+      },
+      prompt: "PROMPT_SECRET_123",
+      response_text: "RESPONSE_SECRET_456",
+      innerText: "RESPONSE_SECRET_456",
+      textContent: "RESPONSE_SECRET_456",
+      wsToken: "Bearer SECRET_789",
+      Authorization: "Bearer SECRET_789",
+      cookie: "PROMPT_SECRET_123",
+      localStorage: "RESPONSE_SECRET_456",
+    });
+    let sent = [];
+    mock.chrome.tabs.sendMessage = async (tabId, message) => {
+      sent.push({ tabId, type: message.type });
+      if (message.type === "run_state") return runStatePayload();
+      // Réponse de diagnostic empoisonnée : les secrets sont injectés à chaque
+      // niveau, y compris hors contrat, pour prouver qu'aucun ne traverse la
+      // liste blanche du service worker.
+      return {
+        ok: true,
+        content_script_version: "39",
+        prompt: "PROMPT_SECRET_123",
+        response: "RESPONSE_SECRET_456",
+        response_text: "RESPONSE_SECRET_456",
+        innerText: "RESPONSE_SECRET_456",
+        textContent: "RESPONSE_SECRET_456",
+        innerHTML: "RESPONSE_SECRET_456",
+        Authorization: "Bearer SECRET_789",
+        wsToken: "Bearer SECRET_789",
+        cookie: "PROMPT_SECRET_123",
+        surface: { title: "RESPONSE_SECRET_456" },
+        composer: { status: "ok", text: "PROMPT_SECRET_123" },
+        send: { status: "not_rendered_idle", label: "RESPONSE_SECRET_456" },
+        response_locator: { element: "RESPONSE_SECRET_456" },
+        run: runStatePayload(),
+      };
+    };
+    const diagnosticFor = async () => {
+      sent = [];
+      const result = await run("handleUiDiagnostic()");
+      return { result, calls: sent };
+    };
+    const runStateFor = async () => {
+      sent = [];
+      const result = await run("handleRunState()");
+      return { result, calls: sent };
+    };
+    const secrets = ["PROMPT_SECRET_123", "RESPONSE_SECRET_456", "SECRET_789"];
+    const assertClean = (label, value) => {
+      const json = JSON.stringify(value);
+      for (const secret of secrets) {
+        assert.equal(json.includes(secret), false, `${label}: ${secret}`);
+      }
+    };
+
+    // 1. Run inflight exact : il gagne sur l'onglet actif et sur tout le reste.
+    const first = await diagnosticFor();
+    assert.equal(first.result.diagnostic_target.source, "inflight");
+    assertClean("inflight", first.result);
+    assert.equal(first.result.diagnostic_target.bridge_owned, true);
+    assert.equal(first.result.tab_id, inflightTab.id);
+    assert.equal(first.calls.length, 1);
+    assert.equal(first.calls[0].tabId, inflightTab.id);
+    assert.equal(first.calls[0].type, "dom_health");
+    assert.notEqual(first.calls[0].tabId, generic.id);
+    assert.equal(mock.tabsById.get(generic.id).active, true);
+
+    // Le popup qui rafraîchit l'état vivant interroge exactement le même tab.
+    const liveRun = await runStateFor();
+    assert.equal(liveRun.calls[0].type, "run_state");
+    assert.equal(liveRun.calls[0].tabId, inflightTab.id);
+    assert.equal(liveRun.result.diagnostic_target.source, "inflight");
+    assert.equal(liveRun.result.run.state, "active");
+    assert.equal(liveRun.result.run.signal, "streaming");
+    assert.equal(liveRun.result.run.stable_threshold_ms, 300000);
+    assert.equal(liveRun.result.run.observation.last_wake.observe_tick, 2);
+    assert.equal(liveRun.result.run.serialization.serializer, "chatgpt-dom-v3");
+    assertClean("run_state", liveRun.result);
+    assert.equal(liveRun.result.run.active, true);
+    assert.equal(liveRun.result.run.state, "active");
+    for (const forbidden of ["prompt", "response_text", "innerText", "textContent", "wsToken", "Authorization"]) {
+      assert.equal(Object.hasOwn(liveRun.result.run, forbidden), false, forbidden);
+    }
+
+    // 2. Plus de run inflight : la browser target exacte prend le relais.
+    await run('inflight.delete("run-inflight")');
+    const second = await diagnosticFor();
+    assert.equal(second.result.diagnostic_target.source, "browser_target");
+    assertClean("browser_target", second.result);
+    assert.equal(second.result.tab_id, inflightTab.id);
+
+    // 3. La cible a disparu : la conversation retenue reste prioritaire sur
+    //    l'onglet actif de l'opérateur.
+    await mock.chrome.tabs.remove(inflightTab.id);
+    const third = await diagnosticFor();
+    assert.equal(third.result.diagnostic_target.source, "bridge_conversation");
+    assertClean("bridge_conversation", third.result);
+    assert.equal(third.result.tab_id, conversationTab.id);
+    assert.notEqual(third.result.tab_id, generic.id);
+
+    // 4. Plus aucune cible exacte : l'onglet de la fenêtre du bridge est
+    //    retrouvé par sa fenêtre, jamais par l'onglet actif.
+    await mock.chrome.tabs.remove(conversationTab.id);
+    const fourth = await diagnosticFor();
+    assert.equal(fourth.result.diagnostic_target.source, "bridge_owned_tab");
+    assertClean("bridge_owned_tab", fourth.result);
+    assert.equal(fourth.result.diagnostic_target.bridge_owned, true);
+    assert.equal(fourth.result.tab_id, ownedTab.id);
+    assert.notEqual(fourth.result.tab_id, generic.id);
+
+    // 5. Dernier recours seulement : l'onglet ChatGPT de l'opérateur, annoncé
+    //    comme non possédé pour que le popup n'affiche aucun faux état de run.
+    await mock.chrome.windows.remove(recoveryWindow.id);
+    const fifth = await diagnosticFor();
+    assert.equal(fifth.result.diagnostic_target.source, "generic_chatgpt_tab");
+    assertClean("generic_chatgpt_tab", fifth.result);
+    assert.equal(fifth.result.diagnostic_target.bridge_owned, false);
+    assert.equal(fifth.result.tab_id, generic.id);
+    assertClean("generic tab", fifth.result);
   }
 
   // Without a bridge binding or Temporary Chat, fallback is explicit.

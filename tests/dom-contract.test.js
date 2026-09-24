@@ -93,6 +93,63 @@ const sorted = (values) => [...new Set(values)].sort();
   assert.ok(DIAGNOSE.includes(`"${STRUCTURAL_SEND}"`), "diagnose.js garde le repli Send structurel");
 }
 
+// 1bis. Listes blanches du diagnostic vivant : recopiées à l'identique entre
+//       le service worker et le popup, elles ne peuvent pas diverger.
+{
+  const TARGET_SOURCES = [
+    "inflight",
+    "browser_target",
+    "bridge_conversation",
+    "bridge_owned_tab",
+    "generic_chatgpt_tab",
+  ];
+  const targetSourceLists = (source) => {
+    const lists = [];
+    for (const match of source.matchAll(/\[("inflight"(?:\s*,\s*"[a-z_]+")*)\]/g)) {
+      lists.push([...match[1].matchAll(/"([a-z_]+)"/g)].map((item) => item[1]));
+    }
+    return lists;
+  };
+  const backgroundSources = targetSourceLists(BACKGROUND);
+  const popupSources = targetSourceLists(POPUP);
+  assert.ok(backgroundSources.length >= 2, "background : toutes les listes sont inspectées");
+  assert.ok(popupSources.length >= 3, "popup : toutes les listes sont inspectées");
+  for (const list of [...backgroundSources, ...popupSources]) {
+    assert.deepEqual(list, TARGET_SOURCES, "source de cible : liste blanche identique partout");
+  }
+
+  // Mêmes états, mêmes signaux, mêmes modes : le popup affiche exactement ce
+  // que la boucle du content script a le droit de publier.
+  const setNames = ["RUN_STATES", "RUN_SIGNALS", "RUN_MODES", "RUN_CONFIDENCES"];
+  for (const name of setNames) {
+    assert.deepEqual(
+      stringsAfter(BACKGROUND, `const ${name} = new Set(`).sort(),
+      stringsAfter(POPUP, `const ${name} = new Set(`).sort(),
+      `${name}: worker et popup partagent la même liste`,
+    );
+  }
+  const regexLiteral = (source, name) => {
+    const match = source.match(new RegExp(`const ${name} = (/[^/]+/[a-z]*);`));
+    assert.ok(match, `expression introuvable : ${name}`);
+    return match[1];
+  };
+  for (const name of ["RUN_PHASES", "RUN_SERIALIZER"]) {
+    assert.equal(
+      regexLiteral(BACKGROUND, name),
+      regexLiteral(POPUP, name),
+      `${name}: worker et popup partagent le même filtre`,
+    );
+  }
+
+  // Le popup ne calcule aucun seuil : le seuil affiché vient du runtime, jamais
+  // d'une règle locale qui pourrait diverger de la décision réelle.
+  assert.equal(
+    /finalizationThresholdMs|settle_unknown_ms|active_signal_stall_ms/.test(POPUP),
+    false,
+    "le popup n'invente aucun seuil de finalisation",
+  );
+}
+
 // 2. tools/diagnose.js donne le même verdict que le runtime sur chaque variante
 //    de la matrice de dérive (le runtime est jugé sur la même table dans
 //    content-dom.test.js).
@@ -121,12 +178,20 @@ const sorted = (values) => [...new Set(values)].sort();
 
 // 3. Rapport « un clic » du popup : chaque état se lit sans ambiguïté, et
 //    rien d'autre que le contrat fixe ne traverse la liste blanche.
-function loadPopup() {
+function loadPopup({ onCopy = null } = {}) {
   const dom = new JSDOM(POPUP_HTML.replace(/<script[^>]*><\/script>/, ""), {
     runScripts: "outside-only",
     url: "chrome-extension://bridge/popup.html",
   });
   const { window } = dom;
+  if (onCopy) {
+    // jsdom n'implémente pas le presse-papiers : on capture le texte copié par
+    // le vrai gestionnaire du bouton, sans le remplacer.
+    Object.defineProperty(window.navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: async (value) => onCopy(String(value)) },
+    });
+  }
   const pending = () => new Promise(() => {});
   window.chrome = {
     runtime: { sendMessage: pending },
@@ -167,10 +232,11 @@ function rawReport({
   surface = {},
   diagnostic_target = {},
   response_locator = {},
+  run = {},
 } = {}) {
   return {
     ok: true,
-    content_script_version: "38",
+    content_script_version: "39",
     tab_id: 7,
     diagnostic_target: { source: "generic_chatgpt_tab", bridge_owned: false, ...diagnostic_target },
     extension_state: "active",
@@ -179,6 +245,11 @@ function rawReport({
     prompt: SECRET,
     text: SECRET,
     wsToken: SECRET,
+    response_text: SECRET,
+    innerText: SECRET,
+    textContent: SECRET,
+    innerHTML: SECRET,
+    Authorization: `Bearer ${SECRET}`,
     connection: {
       state: "stable",
       instance_id_prefix: "11111111",
@@ -237,10 +308,40 @@ function rawReport({
       markdown_root: true,
       inline_leaf_count: 46,
       ambiguity_count: 0,
+      candidate_state: "found",
+      reason: null,
       // Champs hors contrat : ne doivent jamais apparaître dans le rapport.
       element: SECRET,
       text: SECRET,
       ...response_locator,
+    },
+    // État vivant du run : celui que la boucle du content script maintient.
+    run: {
+      active: true,
+      phase: "stabilizing",
+      state: "quiescent",
+      signal: "output_stable",
+      mode: null,
+      confidence: "medium",
+      output_chars: 1234,
+      stable_for_ms: 9000,
+      stable_threshold_ms: 45000,
+      stable_observations: 4,
+      signals: { actions: false, streaming: false, reasoning: false, stop: false },
+      serialization: {
+        root_found: true,
+        serializer: "chatgpt-dom-v3",
+        last_serialize: "ok",
+        ms: 12,
+      },
+      observation: {
+        last_wake: { mutation: 3, observe_tick: 7, timer: 1 },
+        ms_since_observation: 120,
+        ms_since_dom_mutation: 4000,
+      },
+      prompt: SECRET,
+      response: SECRET,
+      ...run,
     },
   };
 }
@@ -258,10 +359,10 @@ function rawReport({
   for (const [composer, label] of composerCases) {
     const report = popup.render(rawReport({ composer }));
     assert.equal(popup.text("composer-status"), label, `composer ${composer.status}`);
-    assert.equal(report.composer.status, composer.status);
+    assert.equal(report.input.composer.status, composer.status);
     assert.equal(JSON.stringify(report).includes(SECRET), false, `composer ${composer.status}: aucun contenu`);
   }
-  assert.equal(popup.render(rawReport({ composer: { selector: `#${SECRET}` } })).composer.selector, null);
+  assert.equal(popup.render(rawReport({ composer: { selector: `#${SECRET}` } })).input.composer.selector, null);
 
   const sendCases = [
     [{ status: "ok" }, "OK"],
@@ -274,27 +375,39 @@ function rawReport({
     assert.equal(popup.text("send-status"), label, `send ${send.status}`);
     assert.equal(JSON.stringify(report).includes(SECRET), false, `send ${send.status}: aucun contenu`);
   }
+
+  // Onglet générique : Temporary Chat = N/A, jamais une fausse alarme, et
+  // aucune finalisation inventée pour un run qui n'appartient pas au bridge.
   const genericIdle = popup.render(rawReport({
     surface: { temporary_status: "invalid" },
     composer: { status: "ok" },
     send: { status: "not_rendered_idle", visible_candidates: 0, same_form_as_composer: null },
+    run: { active: false, state: "idle" },
   }));
   assert.equal(genericIdle.ok, true);
-  assert.equal(genericIdle.diagnostic_target.source, "generic_chatgpt_tab");
-  assert.equal(popup.text("target-status"), "Generic ChatGPT tab");
+  assert.equal(genericIdle.target.source, "generic_chatgpt_tab");
+  assert.equal(genericIdle.target.bridge_owned, false);
+  assert.equal(popup.text("target-status"), "Generic ChatGPT tab · not owned");
   assert.equal(popup.text("temporary-status"), "N/A");
+  assert.equal(genericIdle.input.temporary_chat, null);
   assert.equal(popup.text("composer-status"), "OK");
   assert.equal(popup.text("send-status"), "Idle / not rendered");
+  assert.equal(popup.text("finalization-state"), "Idle");
+  assert.equal(popup.text("finalization-chars"), "—");
+  assert.equal(popup.text("serialization-root"), "—");
 
+  // Onglet bridge-owned : Temporary Chat est jugé pour de vrai.
   const inflightTarget = popup.render(rawReport({
     diagnostic_target: { source: "inflight", bridge_owned: true },
     surface: { temporary_status: "ok" },
     composer: { status: "ok" },
     send: { status: "ok" },
+    run: { active: true, state: "active", signal: "streaming" },
   }));
-  assert.equal(inflightTarget.diagnostic_target.source, "inflight");
-  assert.equal(popup.text("target-status"), "Bridge inflight");
+  assert.equal(inflightTarget.target.source, "inflight");
+  assert.equal(popup.text("target-status"), "Bridge inflight · bridge-owned");
   assert.equal(popup.text("temporary-status"), "OK");
+  assert.equal(inflightTarget.input.temporary_chat, "ok");
 
   const connectionCases = [
     [{ state: "stable" }, "STABLE", null],
@@ -328,12 +441,16 @@ function rawReport({
   assert.equal(JSON.stringify(failed).includes(SECRET), false);
   assert.deepEqual(Object.keys(failed).sort(), [
     "connection",
-    "content_script_version",
-    "diagnostic_target",
     "error",
     "extension_state",
+    "finalization",
+    "input",
     "ok",
+    "response_locator",
+    "serialization",
     "tab_id",
+    "target",
+    "version",
     "websocket_state",
   ]);
 }
@@ -348,10 +465,12 @@ function rawReport({
     "baseline_root_count",
     "candidate_found",
     "candidate_root_tag",
+    "candidate_state",
     "conversation_surface",
     "current_root_count",
     "inline_leaf_count",
     "markdown_root",
+    "reason",
     "strategy",
     "surface_strategy",
   ]);
@@ -359,36 +478,71 @@ function rawReport({
   assert.equal(popup.text("response-strategy"), "markdown_root_delta");
   assert.equal(popup.text("baseline-roots"), "0");
   assert.equal(popup.text("current-roots"), "1");
+  assert.equal(popup.text("roots-label"), "Current roots");
   assert.equal(popup.text("candidate-status"), "FOUND");
   assert.equal(popup.text("markdown-root"), "YES");
   assert.equal(popup.text("inline-leaves"), "46");
+  assert.equal(
+    popup.window.document.getElementById("locator-reason-row").hidden,
+    true,
+    "sans dérive de contrat, aucune raison n'est affichée",
+  );
+  assert.equal(report.response_locator.reason, null);
   assert.equal(JSON.stringify(report).includes(SECRET), false);
 
-  const ambiguous = popup.render(rawReport({
-    response_locator: {
-      candidate_found: false,
-      ambiguity_count: 2,
-      current_root_count: 2,
-    },
-  }));
-  assert.equal(popup.text("candidate-status"), "AMBIGUOUS");
-  assert.equal(popup.text("current-roots"), "2");
-  assert.equal(ambiguous.response_locator.ambiguity_count, 2);
-
+  // Dérive de contrat : ambiguïté de roots. Le verdict affiché est BROKEN, la
+  // raison est bornée, et les roots affichés sont ceux du DOM réel.
   const drifted = popup.render(rawReport({
     response_locator: {
-      conversation_surface: false,
-      surface_strategy: null,
-      strategy: null,
+      candidate_found: false,
+      candidate_state: "broken",
+      reason: "ambiguous_root",
+      ambiguity_count: 0,
+      current_root_count: 1,
+      inline_leaf_count: 46,
+    },
+  }));
+  assert.equal(popup.text("candidate-status"), "BROKEN");
+  assert.equal(popup.text("roots-label"), "Markdown roots");
+  assert.equal(popup.text("current-roots"), "1");
+  assert.equal(popup.text("inline-leaves"), "46");
+  assert.equal(
+    popup.window.document.getElementById("locator-reason-row").hidden,
+    false,
+    "une dérive de contrat affiche sa raison",
+  );
+  assert.equal(popup.text("locator-reason"), "ambiguous_root");
+  assert.equal(drifted.response_locator.reason, "ambiguous_root");
+
+  const noRoot = popup.render(rawReport({
+    response_locator: {
+      candidate_state: "broken",
+      reason: "inline_without_root",
       candidate_found: false,
       markdown_root: false,
       current_root_count: 0,
     },
   }));
+  assert.equal(popup.text("candidate-status"), "BROKEN");
+  assert.equal(popup.text("locator-reason"), "inline_without_root");
+  assert.equal(noRoot.response_locator.current_root_count, 0);
+
+  // Aucun run décidé dans cet onglet : le locator ne crie pas BROKEN.
+  const idleLocator = popup.render(rawReport({
+    response_locator: {
+      candidate_state: "idle",
+      reason: null,
+      candidate_found: false,
+      conversation_surface: false,
+      surface_strategy: null,
+      strategy: null,
+      markdown_root: false,
+      current_root_count: 0,
+    },
+  }));
+  assert.equal(popup.text("candidate-status"), "—");
+  assert.equal(idleLocator.response_locator.candidate_state, "idle");
   assert.equal(popup.text("surface-status"), "ABSENTE");
-  assert.equal(popup.text("response-strategy"), "—");
-  assert.equal(popup.text("candidate-status"), "NONE");
-  assert.equal(popup.text("markdown-root"), "NO");
 
   // Valeur hors contrat (texte injecté, nœud, stratégie inconnue) : jamais
   // recopiée, et les comptages restent bornés.
@@ -397,6 +551,8 @@ function rawReport({
       strategy: SECRET,
       surface_strategy: SECRET,
       candidate_root_tag: SECRET,
+      candidate_state: SECRET,
+      reason: SECRET,
       current_root_count: SECRET,
       inline_leaf_count: 100000,
     },
@@ -404,6 +560,8 @@ function rawReport({
   assert.equal(injected.response_locator.strategy, null);
   assert.equal(injected.response_locator.surface_strategy, null);
   assert.equal(injected.response_locator.candidate_root_tag, null);
+  assert.equal(injected.response_locator.candidate_state, "idle");
+  assert.equal(injected.response_locator.reason, null);
   assert.equal(injected.response_locator.current_root_count, 0);
   assert.equal(injected.response_locator.inline_leaf_count, 999);
   assert.equal(JSON.stringify(injected).includes(SECRET), false);
@@ -417,6 +575,237 @@ function rawReport({
   assert.equal(popup.text("candidate-status"), "NONE");
   assert.equal(popup.text("surface-status"), "—");
   assert.equal(JSON.stringify(failed).includes(SECRET), false);
+}
+
+// 4bis. Finalisation et sérialisation : le popup affiche l'état vivant du run
+//       sans le recalculer — la même décision que celle du content script.
+{
+  const popup = loadPopup();
+  const BRIDGE_TARGET = { source: "inflight", bridge_owned: true };
+  const report = popup.render(rawReport({ diagnostic_target: BRIDGE_TARGET }));
+  assert.deepEqual(Object.keys(report.finalization).sort(), [
+    "active",
+    "confidence",
+    "mode",
+    "observation",
+    "output_chars",
+    "phase",
+    "serialization",
+    "signal",
+    "signals",
+    "stable_for_ms",
+    "stable_observations",
+    "stable_threshold_ms",
+    "state",
+  ]);
+  assert.deepEqual(report.finalization.observation, {
+    last_wake: { mutation: 3, observe_tick: 7, timer: 1 },
+    ms_since_observation: 120,
+    ms_since_dom_mutation: 4000,
+  });
+  assert.equal(popup.text("finalization-state"), "QUIESCENT");
+  assert.equal(popup.text("finalization-signal-label"), "Signal");
+  assert.equal(popup.text("finalization-signal"), "output_stable");
+  assert.equal(popup.text("finalization-chars"), "1234");
+  // Stable s'affiche « durée observée / seuil réellement appliqué ».
+  assert.equal(popup.text("finalization-stable"), "9 s / 45 s");
+  assert.equal(popup.text("finalization-observations"), "4");
+  assert.equal(popup.text("finalization-actions"), "no");
+  assert.equal(popup.text("finalization-streaming"), "no");
+  assert.equal(popup.text("serialization-root"), "yes");
+  assert.equal(popup.text("serialization-serializer"), "chatgpt-dom-v3");
+  assert.equal(popup.text("serialization-last"), "OK");
+  assert.equal(report.serialization.root_found, true);
+  assert.ok(popup.text("wake-detail").includes("tick 7"), popup.text("wake-detail"));
+
+  // Finalisation bloquée : ACTIVE, signal bloquant nommé, stabilité mesurée.
+  const blocked = popup.render(rawReport({
+    diagnostic_target: BRIDGE_TARGET,
+    run: {
+      active: true,
+      phase: "generating",
+      state: "active",
+      signal: "streaming",
+      output_chars: 2048,
+      stable_for_ms: 85000,
+      stable_threshold_ms: 300000,
+      stable_observations: 5,
+      signals: { actions: false, streaming: true, reasoning: false, stop: true },
+    },
+  }));
+  assert.equal(popup.text("finalization-state"), "ACTIVE");
+  assert.equal(popup.text("finalization-signal-label"), "Blocking signal");
+  assert.equal(popup.text("finalization-signal"), "streaming");
+  assert.equal(popup.text("finalization-stable"), "85 s / 300 s");
+  assert.equal(popup.text("finalization-streaming"), "yes");
+  assert.equal(popup.text("finalization-stop"), "yes");
+  assert.equal(popup.text("finalization-actions"), "no");
+  assert.equal(blocked.finalization.output_chars, 2048);
+
+  // Une sérialisation en erreur est nommée, pas avalée.
+  popup.render(rawReport({
+    diagnostic_target: BRIDGE_TARGET,
+    run: {
+      active: true,
+      state: "waiting",
+      serialization: { root_found: false, serializer: "chatgpt-dom-v3", last_serialize: "error", ms: 0 },
+    },
+  }));
+  assert.equal(popup.text("serialization-root"), "no");
+  assert.equal(popup.text("serialization-last"), "ERROR");
+
+  // Valeurs hors contrat : bornées, jamais recopiées.
+  const injected = popup.render(rawReport({
+    diagnostic_target: BRIDGE_TARGET,
+    run: {
+      state: SECRET,
+      phase: SECRET,
+      signal: SECRET,
+      confidence: SECRET,
+      mode: SECRET,
+      output_chars: SECRET,
+      stable_for_ms: -5,
+      stable_threshold_ms: SECRET,
+      stable_observations: 1e9,
+      serialization: { serializer: SECRET, last_serialize: SECRET, root_found: SECRET },
+      observation: { last_wake: { mutation: SECRET }, ms_since_observation: SECRET },
+    },
+  }));
+  assert.equal(injected.finalization.state, "idle");
+  assert.equal(injected.finalization.signal, null);
+  assert.equal(injected.finalization.confidence, null);
+  assert.equal(injected.finalization.mode, null);
+  assert.equal(injected.finalization.output_chars, 0);
+  assert.equal(injected.finalization.stable_for_ms, 0);
+  assert.equal(injected.finalization.stable_threshold_ms, null);
+  assert.equal(injected.finalization.stable_observations, 0);
+  assert.equal(injected.finalization.serialization.serializer, null);
+  assert.equal(injected.finalization.serialization.last_serialize, null);
+  assert.equal(injected.finalization.serialization.root_found, null);
+  assert.equal(injected.finalization.observation.last_wake.mutation, 0);
+  assert.equal(injected.finalization.observation.ms_since_observation, null);
+  assert.equal(JSON.stringify(injected).includes(SECRET), false);
+}
+
+// 4ter. Secret injecté : les trois valeurs du contrat de diagnostic ne
+//       traversent ni le rendu, ni le JSON copié, à aucun niveau de la chaîne.
+{
+  const PROMPT_SECRET_123 = "PROMPT_SECRET_123";
+  const RESPONSE_SECRET_456 = "RESPONSE_SECRET_456";
+  const BEARER_SECRET_789 = "Bearer SECRET_789";
+  const secrets = [PROMPT_SECRET_123, RESPONSE_SECRET_456, BEARER_SECRET_789];
+  const copied = [];
+  const popup = loadPopup({ onCopy: (value) => copied.push(value) });
+
+  const poisoned = rawReport({
+    diagnostic_target: { source: "inflight", bridge_owned: true },
+    connection: {
+      instance_id: `11111111-${PROMPT_SECRET_123}`,
+      wsToken: BEARER_SECRET_789,
+    },
+    surface: { title: RESPONSE_SECRET_456 },
+    composer: { text: PROMPT_SECRET_123 },
+    send: { label: RESPONSE_SECRET_456 },
+    response_locator: { element: RESPONSE_SECRET_456, text: RESPONSE_SECRET_456 },
+    run: {
+      prompt: PROMPT_SECRET_123,
+      response_text: RESPONSE_SECRET_456,
+      innerText: RESPONSE_SECRET_456,
+      textContent: RESPONSE_SECRET_456,
+      innerHTML: RESPONSE_SECRET_456,
+      Authorization: BEARER_SECRET_789,
+      wsToken: BEARER_SECRET_789,
+      cookie: PROMPT_SECRET_123,
+      localStorage: RESPONSE_SECRET_456,
+    },
+  });
+  poisoned.prompt = PROMPT_SECRET_123;
+  poisoned.response_text = RESPONSE_SECRET_456;
+  poisoned.Authorization = BEARER_SECRET_789;
+  poisoned.wsToken = BEARER_SECRET_789;
+  poisoned.cookie = PROMPT_SECRET_123;
+  poisoned.localStorage = RESPONSE_SECRET_456;
+
+  const report = popup.render(poisoned);
+  const reportJson = JSON.stringify(report);
+  const rendered = popup.window.document.body.textContent;
+  for (const secret of secrets) {
+    assert.equal(reportJson.includes(secret), false, `rapport: ${secret}`);
+    assert.equal(rendered.includes(secret), false, `popup: ${secret}`);
+  }
+  // L'état vivant reste lisible : le filtrage n'efface pas le diagnostic utile.
+  assert.equal(report.target.source, "inflight");
+  assert.equal(report.response_locator.candidate_state, "found");
+  assert.equal(rendered.includes("QUIESCENT"), true, "la finalisation reste rendue");
+
+  assert.equal(
+    popup.window.document.getElementById("copy-diagnostic").textContent.trim(),
+    "Copy diagnostic",
+    "le bouton du contrat porte son nom",
+  );
+  // « Copy diagnostic » copie le JSON complet sûr, jamais le contenu filtré.
+  // Le presse-papiers capturé est appelé synchroniquement par le vrai
+  // gestionnaire de clic : aucune attente n'est nécessaire pour l'observer.
+  popup.window.document.getElementById("copy-diagnostic").click();
+  assert.equal(copied.length, 1, "le bouton copie exactement un document");
+  const copiedJson = copied[0];
+  for (const secret of secrets) {
+    assert.equal(copiedJson.includes(secret), false, `copie: ${secret}`);
+  }
+  const parsed = JSON.parse(copiedJson);
+  assert.deepEqual(
+    Object.keys(parsed).sort(),
+    [
+      "connection",
+      "extension_state",
+      "finalization",
+      "input",
+      "ok",
+      "response_locator",
+      "serialization",
+      "tab_id",
+      "target",
+      "version",
+      "websocket_state",
+    ],
+    "le JSON copié expose toute la chaîne, et rien d'autre",
+  );
+  // Aucune clé de contenu, à aucun niveau du document copié.
+  const forbiddenKeys = [
+    "prompt",
+    "response",
+    "response_text",
+    "text",
+    "innerText",
+    "textContent",
+    "innerHTML",
+    "Authorization",
+    "wsToken",
+    "cookie",
+    "localStorage",
+  ];
+  const walk = (value, path = "json") => {
+    if (Array.isArray(value)) {
+      value.forEach((item, index) => walk(item, `${path}[${index}]`));
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    for (const [key, item] of Object.entries(value)) {
+      assert.equal(
+        forbiddenKeys.includes(key),
+        false,
+        `clé interdite dans la copie : ${path}.${key}`,
+      );
+      walk(item, `${path}.${key}`);
+    }
+  };
+  walk(parsed);
+  assert.equal(parsed.version, "39");
+  assert.equal(parsed.target.source, "inflight");
+  assert.equal(parsed.target.bridge_owned, true);
+  assert.equal(parsed.finalization.state, "quiescent");
+  assert.equal(parsed.serialization.serializer, "chatgpt-dom-v3");
+  assert.equal(parsed.serialization.last_serialize, "ok");
 }
 
 // 5. Snapshot structurel borné (« Copy response structure ») : liste blanche
@@ -454,7 +843,7 @@ function rawReport({
   const structure = popup.structure(
     {
       ok: true,
-      content_script_version: "38",
+      content_script_version: "39",
       conversation_surface: { found: true, strategy: "composer_main", node },
       strategy: "markdown_root_delta",
       markdown_root_matches: 1,
@@ -468,7 +857,7 @@ function rawReport({
     { source: "inflight", bridge_owned: true },
   );
   assert.equal(structure.ok, true);
-  assert.equal(structure.content_script_version, "38");
+  assert.equal(structure.content_script_version, "39");
   assert.equal(structure.tab_id, 7);
   assert.equal(structure.diagnostic_target.source, "inflight");
   assert.equal(structure.diagnostic_target.bridge_owned, true);

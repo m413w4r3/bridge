@@ -44,31 +44,51 @@
     <section class="contract" aria-labelledby="contract-title">
       <h2 id="contract-title">UI contract</h2>
       <div class="contract-row"><span>Target</span><strong id="target-status">—</strong></div>
-      <div class="contract-row"><span>Temporary Chat</span><strong id="temporary-status">—</strong></div>
-      <div class="contract-row"><span>Composer</span><strong id="composer-status">—</strong></div>
-      <div class="contract-row"><span>Send</span><strong id="send-status">—</strong></div>
       <div class="contract-row"><span>Content script</span><strong id="content-version">—</strong></div>
       <div class="contract-row"><span>Extension / WebSocket</span><strong id="extension-state">—</strong></div>
       <div class="muted" id="connection-detail"></div>
       <div class="muted" id="diagnostic-tab"></div>
-      <p class="muted">Composer</p>
-      <code class="contract-code" id="composer-selector">—</code>
+
+      <p class="muted">Input</p>
+      <div class="contract-row"><span>Temporary Chat</span><strong id="temporary-status">—</strong></div>
+      <div class="contract-row"><span>Composer</span><strong id="composer-status">—</strong></div>
+      <div class="contract-row"><span>Send</span><strong id="send-status">—</strong></div>
       <div class="muted" id="composer-strategy"></div>
+      <code class="contract-code" id="composer-selector">—</code>
       <div class="muted" id="composer-candidates"></div>
-      <p class="muted">Send</p>
-      <code class="contract-code" id="send-selector">—</code>
       <div class="muted" id="send-strategy"></div>
+      <code class="contract-code" id="send-selector">—</code>
       <div class="muted" id="send-candidates"></div>
+
       <p class="muted">Response locator</p>
-      <div class="contract-row"><span>Conversation surface</span><strong id="surface-status">—</strong></div>
+      <div class="contract-row"><span>Conversation</span><strong id="surface-status">—</strong></div>
       <div class="contract-row"><span>Strategy</span><strong id="response-strategy">—</strong></div>
       <div class="contract-row"><span>Baseline roots</span><strong id="baseline-roots">—</strong></div>
-      <div class="contract-row"><span>Current roots</span><strong id="current-roots">—</strong></div>
+      <div class="contract-row"><span id="roots-label">Current roots</span><strong id="current-roots">—</strong></div>
       <div class="contract-row"><span>Candidate</span><strong id="candidate-status">—</strong></div>
       <div class="contract-row"><span>Markdown root</span><strong id="markdown-root">—</strong></div>
       <div class="contract-row"><span>Inline leaves</span><strong id="inline-leaves">—</strong></div>
+      <div class="contract-row" id="locator-reason-row" hidden><span>Reason</span><strong id="locator-reason">—</strong></div>
+
+      <p class="muted">Finalization</p>
+      <div class="contract-row"><span>State</span><strong id="finalization-state">—</strong></div>
+      <div class="contract-row"><span id="finalization-signal-label">Signal</span><strong id="finalization-signal">—</strong></div>
+      <div class="contract-row"><span>Output chars</span><strong id="finalization-chars">—</strong></div>
+      <div class="contract-row"><span>Stable</span><strong id="finalization-stable">—</strong></div>
+      <div class="contract-row"><span>Observations</span><strong id="finalization-observations">—</strong></div>
+      <div class="contract-row"><span>Actions</span><strong id="finalization-actions">—</strong></div>
+      <div class="contract-row"><span>Streaming</span><strong id="finalization-streaming">—</strong></div>
+      <div class="contract-row"><span>Reasoning</span><strong id="finalization-reasoning">—</strong></div>
+      <div class="contract-row"><span>Stop</span><strong id="finalization-stop">—</strong></div>
+      <div class="muted" id="wake-detail"></div>
+
+      <p class="muted">Serialization</p>
+      <div class="contract-row"><span>Root found</span><strong id="serialization-root">—</strong></div>
+      <div class="contract-row"><span>Serializer</span><strong id="serialization-serializer">—</strong></div>
+      <div class="contract-row"><span>Last serialize</span><strong id="serialization-last">—</strong></div>
+
       <button id="diagnose">Diagnostiquer l’UI ChatGPT</button>
-      <button id="copy-diagnostic" class="secondary" disabled>Copier le diagnostic</button>
+      <button id="copy-diagnostic" class="secondary" disabled>Copy diagnostic</button>
       <button id="copy-response-structure" class="secondary" disabled>Copier la structure de réponse</button>
       <div class="muted" id="diagnostic-message" role="status"></div>
       <pre class="muted" id="diagnostic-json" hidden></pre>

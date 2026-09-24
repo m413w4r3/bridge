@@ -2,14 +2,20 @@ const assert = require("node:assert/strict");
 
 require("../extension/final-output.js");
 
-const { createAccumulator, outputChars, finalizationOutcome } =
-  globalThis.ChatGPTBridgeFinalOutput;
+const {
+  createAccumulator,
+  outputChars,
+  finalizationOutcome,
+  finalizationThresholdMs,
+} = globalThis.ChatGPTBridgeFinalOutput;
 
 const thresholds = {
   settle_ms: 2_000,
   settle_unknown_ms: 15_000,
   empty_final_settle_ms: 10_000,
   min_quiescent_observations: 3,
+  finalization_stall_ms: 45_000,
+  active_signal_stall_ms: 300_000,
 };
 
 const outcome = (fields) =>
@@ -166,5 +172,51 @@ fiveSubjects.observe(
 const finalReport = fiveSubjects.final();
 assert.equal((finalReport.match(/^## SUBJECT S\d+$/gm) || []).length, 5);
 assert.equal(finalReport.includes("A\n\n## SUBJECT S2\nB"), false);
+
+// --- Seuil publié : celui que le runtime applique à cet état ---------------- //
+// Le diagnostic vivant affiche « Stable X / threshold » : ce seuil doit être
+// la borne de sortie réellement appliquée par `finalizationOutcome`, jamais un
+// nombre choisi par le popup.
+const threshold = (fields) => finalizationThresholdMs({ thresholds, ...fields });
+assert.equal(
+  threshold({ state: "active", outputChars: 120 }),
+  300_000,
+  "ACTIVE sort au bout de `active_signal_stall_ms`",
+);
+assert.equal(
+  outcome({ state: "active", stableForMs: 300_000, stableObservations: 5 }),
+  "pending",
+  "la durée seule ne convertit jamais ACTIVE en FINAL",
+);
+assert.equal(
+  threshold({ state: "quiescent", outputChars: 120 }),
+  45_000,
+  "QUIESCENT sort au bout de `finalization_stall_ms`",
+);
+assert.equal(
+  threshold({ state: "final", outputChars: 120 }),
+  2_000,
+  "une fin terminale avec texte conclut sur `settle_ms`",
+);
+assert.equal(
+  threshold({ state: "final", outputChars: 0 }),
+  10_000,
+  "une fin terminale sans texte attend `empty_final_settle_ms`",
+);
+assert.equal(
+  threshold({ state: "waiting", outputChars: 0 }),
+  null,
+  "aucune borne n'est inventée pour un état sans borne",
+);
+assert.equal(
+  threshold({ state: "idle", outputChars: 0 }),
+  null,
+  "hors run, aucun seuil n'est publié",
+);
+assert.equal(
+  finalizationThresholdMs({ state: "active", outputChars: 1 }),
+  null,
+  "sans seuils fournis, rien n'est inventé",
+);
 
 console.log("final-only output contract: ok");

@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "38";
+const VERSION = "39";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -254,6 +254,54 @@ const WATCHED_TURN_ACTIVE_SIGNAL_STALL_MS = 300000;
 //     persister avant de conclure. Aucun choix arbitraire n'est jamais fait.
 const RESPONSE_CONTRACT_DRIFT_MS = 20000;
 const RESPONSE_AMBIGUITY_HOLD_MS = 1500;
+
+// Raisons bornées d'un locator qui refuse de conclure. Elles sont produites par
+// la décision réelle du runtime (jamais re-dérivées par le popup) et voyagent
+// telles quelles dans le diagnostic : « ligne rouge » lisible sans DevTools.
+const RESPONSE_LOCATOR_REASONS = new Set([
+  "ambiguous_root",
+  "inline_without_root",
+  "surface_missing",
+]);
+
+// Les bornes de finalisation, dans un seul objet : la même référence sert à la
+// décision (`finalizationOutcome`) et au diagnostic (`stable / threshold`). Le
+// popup ne peut donc pas afficher un seuil que le runtime n'applique pas.
+const FINALIZATION_THRESHOLDS = {
+  settle_ms: SETTLE_MS,
+  settle_unknown_ms: SETTLE_UNKNOWN_MS,
+  empty_final_settle_ms: EMPTY_FINAL_SETTLE_MS,
+  min_quiescent_observations: MIN_QUIESCENT_OBSERVATIONS,
+  finalization_stall_ms: FINALIZATION_STALL_MS,
+  active_signal_stall_ms: WATCHED_TURN_ACTIVE_SIGNAL_STALL_MS,
+};
+
+// --------------------------------------------------------------------------- //
+// État vivant du run : la boucle d'observation en est la seule autrice.
+//
+// Le popup ne reconstruit jamais un état de finalisation « à lui » : il lit cet
+// objet, écrit par les mêmes itérations qui émettent les heartbeats et qui
+// décident (ou refusent de décider) la fin. Borné et sans contenu — comptages,
+// booléens, durées, jamais un caractère de prompt ni de réponse.
+// --------------------------------------------------------------------------- //
+/** Version du sérialiseur chargé avant ce script (`serializer.js`). */
+function serializerVersion() {
+  return globalThis.ChatGPTBridgeSerializer?.SERIALIZER_VERSION || null;
+}
+
+const liveRun = {
+  active: false,
+  phase: "idle",
+  progress: null,
+  page_state: null,
+  serialization: {
+    root_found: null,
+    serializer: serializerVersion(),
+    last_serialize: null,
+    ms: 0,
+  },
+};
+
 // Bornes de taille : une signature ou un snapshot structurel ne doivent jamais
 // pouvoir être gonflés par une page pathologique.
 const RESPONSE_SIGNATURE_MAX_TOKENS = 6;
@@ -473,22 +521,154 @@ function inspectSendButton(composer, root = document) {
 
 /**
  * État du contrat de réponse pour le diagnostic, sans contenu : surface,
- * comptages de roots et dernière décision du locator pendant un run.
+ * comptages de roots, verdict et raison bornée de la dernière décision réelle
+ * du locator pendant un run.
+ *
+ * Un onglet où le locator n'a rien eu à décider (onglet ChatGPT générique,
+ * aucun run) rend `idle` : jamais une fausse alarme BROKEN. Un verdict
+ * `broken` vient toujours d'une décision du runtime — ambiguïté de roots,
+ * feuilles inline sans root, surface absente — jamais d'une reconstruction
+ * côté popup.
  */
 function responseLocatorHealth() {
   const collected = resolveResponseRoots();
   const last = lastResponseLocatorDiagnostic;
+  const failure = lastResponseLocatorFailure;
+  const roots = collected.markdown.length;
+  const leaves = collected.inline_leaf_count;
+  const surface = Boolean(collected.surface_element);
+  let candidateState = "idle";
+  let reason = null;
+  if (failure) {
+    candidateState = "broken";
+    reason = failure;
+  } else if (last) {
+    if ((last.ambiguity_count ?? 0) > 0) {
+      candidateState = "broken";
+      reason = "ambiguous_root";
+    } else if (!surface) {
+      candidateState = "broken";
+      reason = "surface_missing";
+    } else if (last.candidate_found === true) {
+      candidateState = "found";
+    } else if (leaves > 0 && roots === 0) {
+      candidateState = "broken";
+      reason = "inline_without_root";
+    } else {
+      candidateState = "pending";
+    }
+  }
   return {
-    conversation_surface: Boolean(collected.surface_element),
+    conversation_surface: surface,
     surface_strategy: collected.surface_strategy || null,
     strategy: last?.strategy ?? null,
-    baseline_root_count: last?.baseline_root_count ?? collected.markdown.length,
-    current_root_count: collected.markdown.length,
+    baseline_root_count: last?.baseline_root_count ?? roots,
+    current_root_count: roots,
     candidate_found: last?.candidate_found === true,
     candidate_root_tag: last?.candidate_root_tag ?? null,
-    markdown_root: last ? last.markdown_root : collected.markdown.length > 0,
-    inline_leaf_count: collected.inline_leaf_count,
+    markdown_root: last ? last.markdown_root : roots > 0,
+    inline_leaf_count: leaves,
     ambiguity_count: last?.ambiguity_count ?? 0,
+    candidate_state: candidateState,
+    reason: RESPONSE_LOCATOR_REASONS.has(reason) ? reason : null,
+  };
+}
+
+/** Compteur borné du diagnostic vivant : jamais un NaN, jamais un négatif. */
+function boundedRunMetric(value) {
+  return Number.isInteger(value) && value >= 0 && value <= 1000000 ? value : 0;
+}
+
+/** Durée bornée du diagnostic vivant : jamais un NaN, jamais un négatif. */
+function boundedRunDuration(value) {
+  return Number.isFinite(value) ? Math.max(0, Math.round(value)) : null;
+}
+
+/**
+ * État vivant du run, tel que la boucle l'a réellement maintenu.
+ *
+ * `finalization_state`, `signal`, `output_chars`, `stable_for_ms` et les
+ * signaux sont ceux qui ont servi à décider la fin (ou à refuser de la
+ * décider) — une observation figée pendant une recherche web est donc lisible
+ * ici sans DevTools. Aucun contenu, aucun nœud, aucun identifiant complet.
+ */
+function runDiagnosticSnapshot() {
+  const active = liveRun.active === true && currentJob !== null;
+  const progress = active ? liveRun.progress : null;
+  const page = active ? liveRun.page_state : null;
+  const finalization = progress?.finalization || {};
+  const state = active ? finalization.finalization_state || "waiting" : "idle";
+  const serialization = active
+    ? liveRun.serialization
+    : { root_found: null, serializer: serializerVersion(), last_serialize: null, ms: 0 };
+  const thresholdMs = active
+    ? globalThis.ChatGPTBridgeFinalOutput.finalizationThresholdMs({
+        state,
+        outputChars: boundedRunMetric(finalization.output_chars),
+        thresholds: FINALIZATION_THRESHOLDS,
+      })
+    : null;
+  return {
+    active,
+    phase: active ? progress?.phase || liveRun.phase : "idle",
+    state,
+    signal: active ? finalization.signal || "unknown" : null,
+    mode: finalization.mode || null,
+    confidence: finalization.confidence || null,
+    output_chars: boundedRunMetric(finalization.output_chars),
+    stable_for_ms: boundedRunMetric(finalization.stable_for_ms),
+    stable_threshold_ms: Number.isFinite(thresholdMs) ? thresholdMs : null,
+    stable_observations: boundedRunMetric(finalization.stable_observations),
+    signals: {
+      actions: finalization.terminal_action_visible === true,
+      streaming: finalization.streaming_visible === true,
+      reasoning: finalization.reasoning_visible === true,
+      stop: finalization.stop_visible === true,
+    },
+    serialization: {
+      root_found:
+        serialization.root_found === true
+          ? true
+          : serialization.root_found === false
+            ? false
+            : null,
+      serializer:
+        typeof serialization.serializer === "string"
+          ? serialization.serializer.slice(0, 40)
+          : null,
+      last_serialize: ["ok", "error"].includes(serialization.last_serialize)
+        ? serialization.last_serialize
+        : null,
+      ms: boundedRunMetric(serialization.ms),
+    },
+    // Réveils et fraîcheur d'observation : c'est ici qu'un onglet throttlé
+    // (minuterie d'arrière-plan) se distingue d'une réponse réellement figée.
+    observation: {
+      last_wake: {
+        mutation: boundedRunMetric(page?.wake_mutation),
+        observe_tick: boundedRunMetric(page?.wake_tick),
+        timer: boundedRunMetric(page?.wake_timer),
+      },
+      ms_since_observation: boundedRunDuration(page?.ms_since_observation),
+      ms_since_dom_mutation: boundedRunDuration(page?.ms_since_dom_mutation),
+    },
+  };
+}
+
+/** Publie l'état vivant du run. Appelé par la boucle, jamais par le popup. */
+function publishRunProgress(progress, pageState) {
+  liveRun.progress = progress || null;
+  if (pageState) liveRun.page_state = pageState;
+  if (currentJob) liveRun.phase = currentJob.phase;
+}
+
+/** Publie le dernier résultat de sérialisation (root trouvé, ok/erreur, durée). */
+function publishRunSerialization({ rootFound, lastSerialize, ms }) {
+  liveRun.serialization = {
+    root_found: typeof rootFound === "boolean" ? rootFound : null,
+    serializer: serializerVersion(),
+    last_serialize: ["ok", "error"].includes(lastSerialize) ? lastSerialize : null,
+    ms: boundedRunMetric(ms),
   };
 }
 
@@ -536,6 +716,8 @@ function domHealthSnapshot() {
   return {
     ok: true,
     content_script_version: VERSION,
+    // État vivant du run courant : lu dans la boucle, jamais recalculé.
+    run: runDiagnosticSnapshot(),
     surface: {
       origin_ok: originOk,
       pathname,
@@ -1300,6 +1482,8 @@ function responseContractDriftDetails(reason, candidate) {
  * resoumission, et surtout pas de réponse inventée.
  */
 function responseContractDriftError(reason, candidate) {
+  lastResponseLocatorFailure =
+    reason === "ambiguous_response_roots" ? "ambiguous_root" : "inline_without_root";
   const details = responseContractDriftDetails(reason, candidate);
   console.warn("bridge_response_contract_drift", details);
   const error = new BridgeError(
@@ -1360,6 +1544,19 @@ async function waitForResponseCandidate(
     while (!job.aborted) {
       await watcher.wait(POLL_MS);
       const now = Date.now();
+      // Réveils et fraîcheur d'observation de CETTE itération : publiés même
+      // quand aucun heartbeat n'est dû, pour que le diagnostic vivant du popup
+      // distingue « boucle vivante » de « boucle throttlée » sans DevTools.
+      const page = pageStateDiagnostics(now, {
+        watcher,
+        lastObservationAt,
+        lastHeartbeatAt,
+        run,
+      });
+      publishRunProgress(
+        { phase: "waiting_answer", output_chars: 0, stable_for_ms: 0 },
+        page,
+      );
 
       if (now - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) {
         reply({
@@ -1371,12 +1568,7 @@ async function waitForResponseCandidate(
             stable_for_ms: 0,
             completion_signal: "unknown",
             completion_confidence: "low",
-            page_state: pageStateDiagnostics(now, {
-              watcher,
-              lastObservationAt,
-              lastHeartbeatAt,
-              run,
-            }),
+            page_state: page,
           },
         });
         lastHeartbeatAt = now;
@@ -1800,7 +1992,9 @@ function finalizationDiagnostics(
   const scope = signals || {};
   return {
     finalization_state: finalization?.state || "waiting",
+    mode: finalization?.mode || null,
     signal: finalization?.signal || "unknown",
+    confidence: finalization?.confidence || "low",
     output_chars: outputChars || 0,
     stable_for_ms: stableForMs || 0,
     stable_observations: stableObservations || 0,
@@ -2244,6 +2438,10 @@ function locateResponseCandidate(locator, baseline, root = document) {
 
 // Dernière décision du locator : observabilité sans contenu, exposée au popup.
 let lastResponseLocatorDiagnostic = null;
+// Raison bornée du dernier refus de locator (`ambiguous_root`,
+// `inline_without_root`). Posée par la décision qui a échoué, elle survit à
+// l'erreur pour être lisible dans le diagnostic sans DevTools.
+let lastResponseLocatorFailure = null;
 let recordedResponseLocatorSignature = null;
 
 /** Charge utile de log § « bridge_response_locator » : aucun contenu. */
@@ -3133,6 +3331,7 @@ async function streamAnswer(job, locator, responseBaseline, run) {
       0,
     ),
   };
+  publishRunProgress(lastProgress, pageState());
 
   try {
     while (!job.aborted) {
@@ -3201,6 +3400,7 @@ async function streamAnswer(job, locator, responseBaseline, run) {
           ),
           ...sampledRuntimeMetrics(now),
         };
+        publishRunProgress(lastProgress, pageState());
         continue;
       }
       const turn = candidate.element;
@@ -3217,12 +3417,18 @@ async function streamAnswer(job, locator, responseBaseline, run) {
           Date.now() - debut > NO_MARKDOWN_FALLBACK_MS,
       );
       const serializationStartedAt = globalThis.performance?.now?.();
-      // Le dernier bloc de code reste « ouvert » tant qu'AUCUNE preuve
-      // terminale n'est visible : la réponse peut encore s'écrire (sémantique
-      // historique, cf. `dernierPre`).
-      const snapshot = root
-        ? readAnswer(root, !signals.terminal_action_visible)
-        : null;
+      let snapshot = null;
+      try {
+        // Le dernier bloc de code reste « ouvert » tant qu'AUCUNE preuve
+        // terminale n'est visible : la réponse peut encore s'écrire
+        // (sémantique historique, cf. `dernierPre`).
+        snapshot = root ? readAnswer(root, !signals.terminal_action_visible) : null;
+      } catch (error) {
+        // Une sérialisation qui échoue est un fait de diagnostic à part
+        // entière : le popup doit pouvoir la nommer, pas seulement la subir.
+        publishRunSerialization({ rootFound: Boolean(root), lastSerialize: "error", ms: 0 });
+        throw error;
+      }
       const serializationFinishedAt = globalThis.performance?.now?.();
       if (
         Number.isFinite(serializationStartedAt) &&
@@ -3233,6 +3439,11 @@ async function streamAnswer(job, locator, responseBaseline, run) {
           Math.round(serializationFinishedAt - serializationStartedAt),
         );
       }
+      publishRunSerialization({
+        rootFound: Boolean(root),
+        lastSerialize: "ok",
+        ms: lastSerializationMs,
+      });
       full = snapshot ? snapshot.text : "";
       output.observe(full);
       outputChars = globalThis.ChatGPTBridgeFinalOutput.outputChars(full);
@@ -3290,12 +3501,9 @@ async function streamAnswer(job, locator, responseBaseline, run) {
         text: full,
         stableForMs,
         stableObservations,
-        thresholds: {
-          settle_ms: SETTLE_MS,
-          settle_unknown_ms: SETTLE_UNKNOWN_MS,
-          empty_final_settle_ms: EMPTY_FINAL_SETTLE_MS,
-          min_quiescent_observations: MIN_QUIESCENT_OBSERVATIONS,
-        },
+        // Même objet que celui publié dans le diagnostic : le seuil affiché
+        // par le popup est celui qui vient d'être appliqué ici.
+        thresholds: FINALIZATION_THRESHOLDS,
       });
 
       const diagnostics = finalizationDiagnostics(
@@ -3343,6 +3551,7 @@ async function streamAnswer(job, locator, responseBaseline, run) {
           : {}),
         ...sampledRuntimeMetrics(now),
       };
+      publishRunProgress(lastProgress, pageState());
 
       const incompleteFields = {
         snapshot,
@@ -3773,8 +3982,26 @@ async function handlePrompt({
   const runDiagnostics = captureRunStartDiagnostics();
   let promptInjected = false;
   currentJob = job;
+  // Nouveau run : le diagnostic vivant repart de zéro. Aucune raison de la
+  // dérive précédente, aucune décision du locator précédent ne sont réutilisées.
+  liveRun.active = true;
+  liveRun.phase = job.phase;
+  liveRun.progress = null;
+  liveRun.page_state = null;
+  liveRun.serialization = {
+    root_found: null,
+    serializer: serializerVersion(),
+    last_serialize: null,
+    ms: 0,
+  };
+  lastResponseLocatorDiagnostic = null;
+  lastResponseLocatorFailure = null;
   if (!(await claimPrompt(id))) {
     if (currentJob === job) currentJob = null;
+    // Requête déjà réclamée : aucun run n'a réellement démarré ici, le
+    // diagnostic vivant ne doit pas prétendre le contraire.
+    liveRun.active = false;
+    liveRun.phase = "idle";
     reply({ type: "ack", id, state: "duplicate", duplicate: true });
     return;
   }
@@ -4115,6 +4342,12 @@ async function handlePrompt({
     }
   } finally {
     if (currentJob === job) currentJob = null;
+    // Le diagnostic vivant redevient « aucun run » : la dernière observation
+    // d'un run terminé n'est jamais présentée comme un état courant.
+    liveRun.active = false;
+    liveRun.phase = "idle";
+    liveRun.progress = null;
+    liveRun.page_state = null;
     // Aucun observateur ne survit à un job : ni fuite entre deux runs, ni
     // réveil d'une boucle qui n'existe plus.
     disconnectDomWatchers();
@@ -4244,6 +4477,13 @@ async function captureLaterResponse(msg) {
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === "dom_health") {
     sendResponse(domHealthSnapshot());
+    return true;
+  }
+  if (msg?.type === "run_state") {
+    // État vivant seul : lu dans la boucle du run exact, jamais recalculé par
+    // le popup. Un onglet sans run répond `active: false`, jamais un état
+    // hérité d'un run terminé.
+    sendResponse(runDiagnosticSnapshot());
     return true;
   }
   if (msg?.type === "ui_state" || msg?.type === "ui_control") {
