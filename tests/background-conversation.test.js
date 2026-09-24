@@ -19,18 +19,50 @@ const vm = require("node:vm");
 const EXTENSION = path.join(__dirname, "..", "extension");
 const BACKGROUND_SOURCE = fs.readFileSync(path.join(EXTENSION, "background.js"), "utf8");
 
-class FakeWebSocket {
-  constructor(url) {
-    this.url = url;
-    this.readyState = FakeWebSocket.CONNECTING;
+function createFakeWebSocket() {
+  class FakeWebSocket {
+    constructor(url) {
+      this.url = url;
+      this.readyState = FakeWebSocket.CONNECTING;
+      this.sent = [];
+      FakeWebSocket.instances.push(this);
+    }
+    send(data) {
+      this.sent.push(data);
+    }
+    close() {}
   }
-  send() {}
-  close() {}
+  FakeWebSocket.instances = [];
+  FakeWebSocket.CONNECTING = 0;
+  FakeWebSocket.OPEN = 1;
+  FakeWebSocket.CLOSING = 2;
+  FakeWebSocket.CLOSED = 3;
+  return FakeWebSocket;
 }
-FakeWebSocket.CONNECTING = 0;
-FakeWebSocket.OPEN = 1;
-FakeWebSocket.CLOSING = 2;
-FakeWebSocket.CLOSED = 3;
+
+function makeFakeTimers() {
+  let nextId = 1;
+  const pending = new Map();
+  const callbacks = new Map();
+  return {
+    setTimeout(callback, delay) {
+      const id = nextId++;
+      pending.set(id, { callback, delay });
+      callbacks.set(id, callback);
+      return id;
+    },
+    clearTimeout(id) {
+      pending.delete(id);
+    },
+    pending,
+    fire(id, { evenIfCleared = false } = {}) {
+      const timer = pending.get(id);
+      if (!timer && !evenIfCleared) throw new Error(`Timer ${id} is not pending`);
+      pending.delete(id);
+      callbacks.get(id)?.();
+    },
+  };
+}
 
 /** In-memory chrome.* mock: tabs are a real Map so tests can assert on them
  * directly, storage.session/local are plain objects a test can inspect. */
@@ -182,11 +214,38 @@ function makeChromeMock() {
  * `chrome` mock (and therefore the same tabsById/sessionStore) across two
  * calls simulates a service-worker suspension/restart: browser-owned state
  * (tabs, chrome.storage.session) survives, in-memory module state doesn't. */
-function loadBackground(chrome) {
-  const sandbox = { chrome, console, URL, setTimeout, clearTimeout, WebSocket: FakeWebSocket };
+function loadBackground(chrome, timers = { setTimeout, clearTimeout }) {
+  const WebSocket = createFakeWebSocket();
+  const sandbox = {
+    chrome,
+    console,
+    URL,
+    setTimeout: timers.setTimeout,
+    clearTimeout: timers.clearTimeout,
+    WebSocket,
+  };
   const context = vm.createContext(sandbox);
   vm.runInContext(BACKGROUND_SOURCE, context, { filename: "background.js" });
-  return { run: (expression) => vm.runInContext(expression, context) };
+  return {
+    run: (expression) => vm.runInContext(expression, context),
+    WebSocket,
+    webSockets: WebSocket.instances,
+  };
+}
+
+async function makeTransportHarness() {
+  const mock = makeChromeMock();
+  const timers = makeFakeTimers();
+  const loaded = loadBackground(mock.chrome, timers);
+  // background.js starts connect() at load; let its storage promises settle.
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(loaded.webSockets.length, 1, "startup creates one WebSocket");
+  return { ...loaded, mock, timers };
+}
+
+function openFakeSocket(socket, WebSocket) {
+  socket.readyState = WebSocket.OPEN;
+  socket.onopen();
 }
 
 async function main() {
@@ -195,6 +254,108 @@ async function main() {
     /chrome\.runtime\.onMessage\.addListener\(async/,
     "runtime.onMessage listener must remain synchronous",
   );
+
+  // WebSocket callbacks belong to the instance that registered them. A late
+  // 4000 close from A must not clear or mark a healthy current socket B down.
+  {
+    const { run, WebSocket, webSockets, timers } = await makeTransportHarness();
+    const socketA = webSockets[0];
+    openFakeSocket(socketA, WebSocket);
+    run("staleSocketForTest = socket");
+    socketA.readyState = WebSocket.CLOSING;
+
+    // Reproduce an overlap where another path has released A and installed B.
+    run("socket = null");
+    await run("connect()");
+    const socketB = run("socket");
+    assert.notEqual(socketB, socketA);
+    openFakeSocket(socketB, WebSocket);
+    const suppressBefore = run("suppressUntil");
+    const connectedBefore = run("status.connected");
+    const lastErrorBefore = run("status.lastError");
+    const timersBefore = timers.pending.size;
+
+    socketA.readyState = WebSocket.CLOSED;
+    socketA.onerror();
+    socketA.onclose({ code: 4000 });
+
+    assert.equal(run("socket"), socketB);
+    assert.equal(socketB.readyState, WebSocket.OPEN);
+    assert.equal(run("suppressUntil"), suppressBefore);
+    assert.equal(run("status.connected"), connectedBefore);
+    assert.equal(run("status.lastError"), lastErrorBefore);
+    assert.equal(timers.pending.size, timersBefore, "stale callbacks add no reconnect timer");
+    assert.equal(run("scheduleReconnect(staleSocketForTest, 'stale owner')"), false);
+    assert.equal(run("socket"), socketB, "scheduleReconnect enforces owner identity itself");
+    assert.equal(run("status.connected"), true);
+    assert.equal(timers.pending.size, timersBefore);
+  }
+
+  // send() queues during CLOSING and leaves reconnect ownership to A's close.
+  {
+    const { run, WebSocket, webSockets, timers } = await makeTransportHarness();
+    const socketA = webSockets[0];
+    openFakeSocket(socketA, WebSocket);
+    run("enAttente.length = 0");
+    socketA.readyState = WebSocket.CLOSING;
+
+    run("send({ type: 'pong' })");
+    await run("connect()");
+    assert.equal(webSockets.length, 1, "CLOSING does not create a second socket");
+    assert.equal(run("socket"), socketA);
+    assert.deepEqual(JSON.parse(JSON.stringify(run("enAttente"))), [{ type: "pong" }]);
+    assert.equal(timers.pending.size, 0);
+
+    socketA.readyState = WebSocket.CLOSED;
+    socketA.onclose({ code: 1006 });
+    socketA.onclose({ code: 1006 });
+    assert.equal(run("socket"), null);
+    assert.equal(timers.pending.size, 1, "current close schedules only one reconnect");
+  }
+
+  // A canceled timer may already be queued by the event loop. Its generation
+  // check must make it inert after B has become current and healthy.
+  {
+    const { run, WebSocket, webSockets, timers } = await makeTransportHarness();
+    const socketA = webSockets[0];
+    socketA.readyState = WebSocket.CLOSED;
+    socketA.onclose({ code: 1006 });
+    const [oldTimerId] = timers.pending.keys();
+    assert.ok(oldTimerId);
+
+    await run("connect()");
+    const socketB = run("socket");
+    openFakeSocket(socketB, WebSocket);
+    assert.equal(timers.pending.size, 0, "new connection cancels the old timer");
+
+    timers.fire(oldTimerId, { evenIfCleared: true });
+    assert.equal(webSockets.length, 2, "stale timer does not create socket C");
+    assert.equal(run("socket"), socketB);
+    assert.equal(run("status.connected"), true);
+  }
+
+  // A current 4000 close owns the 60-second suppression. Sends during that
+  // window queue without taking the connection back from the other client.
+  {
+    const { run, WebSocket, webSockets, timers } = await makeTransportHarness();
+    const socketA = webSockets[0];
+    openFakeSocket(socketA, WebSocket);
+    socketA.readyState = WebSocket.CLOSED;
+    socketA.onclose({ code: 4000 });
+    const [timerId, timer] = [...timers.pending.entries()][0];
+
+    assert.equal(run("socket"), null);
+    assert.equal(run("status.connected"), false);
+    assert.equal(run("suppressUntil - Date.now()"), 60000);
+    assert.equal(timer.delay, 60000);
+    run("send({ type: 'queued-during-suppression' })");
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(run("enAttente"))),
+      [{ type: "queued-during-suppression" }],
+    );
+    assert.equal(webSockets.length, 1, "send during suppression does not reconnect early");
+    assert.deepEqual([...timers.pending.keys()], [timerId], "suppression timer remains the sole timer");
+  }
 
   // 1. FRESH A creates exactly one inactive tab at the Temporary Chat URL.
   {

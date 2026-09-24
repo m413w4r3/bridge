@@ -20,6 +20,8 @@ const TEMPORARY_CHAT_URL = "https://chatgpt.com/?temporary-chat=true";
 const ALLOWED_CHAT_ORIGINS = ["https://chatgpt.com", "https://chat.openai.com"];
 
 let socket = null;
+let connectionGeneration = 0;
+let connectAttempt = null;
 let reconnectDelay = RECONNECT_MIN;
 let reconnectTimer = null;
 let suppressUntil = 0;
@@ -310,77 +312,111 @@ function setStatus(patch) {
   chrome.storage.local.set({ status });
 }
 
+function socketIsOwned(socketToCheck) {
+  return (
+    socketToCheck &&
+    (socketToCheck.readyState === WebSocket.OPEN ||
+      socketToCheck.readyState === WebSocket.CONNECTING ||
+      socketToCheck.readyState === WebSocket.CLOSING)
+  );
+}
+
 async function connect() {
-  if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+  if (socketIsOwned(socket) || connectAttempt) {
     return;
   }
   // Un autre client détient volontairement le pont : ne pas le lui reprendre
   // en boucle (sinon les deux se volent la connexion indéfiniment).
   if (Date.now() < suppressUntil) return;
   clearTimeout(reconnectTimer);
-  const displayUrl = await serverUrl();
-  const url = await authenticatedServerUrl();
-  setStatus({ url: displayUrl });
-
+  reconnectTimer = null;
+  const attempt = {};
+  const startingGeneration = connectionGeneration;
+  connectAttempt = attempt;
   try {
-    socket = new WebSocket(url);
-  } catch (err) {
-    scheduleReconnect(String(err));
-    return;
-  }
+    const displayUrl = await serverUrl();
+    const url = await authenticatedServerUrl();
+    if (connectAttempt !== attempt) return;
+    if (socketIsOwned(socket)) return;
+    if (Date.now() < suppressUntil) return;
+    setStatus({ url: displayUrl });
 
-  socket.onopen = () => {
-    reconnectDelay = RECONNECT_MIN;
-    setStatus({ connected: true, lastError: null });
-    send({ type: "hello", client: "extension-chrome" });
-    flush(); // rejoue ce qui a été produit pendant la coupure
-    console.log("🤖 Connecté au Mini-Bridge", displayUrl, enAttente.length ? "(file non vidée)" : "");
-  };
-
-  socket.onmessage = (event) => {
-    let msg;
+    if (socket && socket.readyState === WebSocket.CLOSED) socket = null;
+    let ws;
     try {
-      msg = JSON.parse(event.data);
-    } catch {
+      ws = new WebSocket(url);
+    } catch (err) {
+      scheduleReconnect(null, String(err), { generation: startingGeneration, attempt });
       return;
     }
-    if (msg.type === "ping") {
-      send({ type: "pong" }); // maintient aussi le service worker éveillé
-      pumpObservationTicks();
-      return;
-    }
-    if (msg.type === "prompt") {
-      handlePrompt(msg);
-    } else if (msg.type === "ui_state" || msg.type === "ui_control") {
-      handleUiRequest(msg);
-    } else if (msg.type === "conversation_archive") {
-      handleConversationArchive(msg);
-    } else if (msg.type === "recovery_capture") {
-      handleRecoveryCapture(msg);
-    } else if (msg.type === "browser_target_retain") {
-      handleBrowserTargetRetain(msg);
-    } else if (msg.type === "browser_target_release") {
-      handleBrowserTargetRelease(msg);
-    } else if (msg.type === "abort") {
-      const tabId = inflight.get(msg.id);
-      inflight.delete(msg.id);
-      if (tabId !== undefined) {
-        chrome.tabs.sendMessage(tabId, { type: "abort", id: msg.id }).catch(() => {});
-      }
-    }
-  };
+    const generation = ++connectionGeneration;
+    socket = ws;
+    connectAttempt = null;
 
-  socket.onclose = (event) => {
-    if (event.code === 4000) {
-      // Le serveur nous a remplacés par un autre client (fake_extension.py,
-      // un second profil Chrome…). On s'efface au lieu de reprendre la main.
-      suppressUntil = Date.now() + REPLACED_BACKOFF;
-      scheduleReconnect("remplacé par un autre client du pont");
-      return;
-    }
-    scheduleReconnect(null);
-  };
-  socket.onerror = () => setStatus({ lastError: "serveur injoignable" });
+    ws.onopen = () => {
+      if (socket !== ws) return;
+      reconnectDelay = RECONNECT_MIN;
+      setStatus({ connected: true, lastError: null });
+      send({ type: "hello", client: "extension-chrome" });
+      flush(); // rejoue ce qui a été produit pendant la coupure
+      console.log("🤖 Connecté au Mini-Bridge", displayUrl, enAttente.length ? "(file non vidée)" : "");
+    };
+
+    ws.onmessage = (event) => {
+      if (socket !== ws) return;
+      let msg;
+      try {
+        msg = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      if (msg.type === "ping") {
+        send({ type: "pong" }); // maintient aussi le service worker éveillé
+        pumpObservationTicks();
+        return;
+      }
+      if (msg.type === "prompt") {
+        handlePrompt(msg);
+      } else if (msg.type === "ui_state" || msg.type === "ui_control") {
+        handleUiRequest(msg);
+      } else if (msg.type === "conversation_archive") {
+        handleConversationArchive(msg);
+      } else if (msg.type === "recovery_capture") {
+        handleRecoveryCapture(msg);
+      } else if (msg.type === "browser_target_retain") {
+        handleBrowserTargetRetain(msg);
+      } else if (msg.type === "browser_target_release") {
+        handleBrowserTargetRelease(msg);
+      } else if (msg.type === "abort") {
+        const tabId = inflight.get(msg.id);
+        inflight.delete(msg.id);
+        if (tabId !== undefined) {
+          chrome.tabs.sendMessage(tabId, { type: "abort", id: msg.id }).catch(() => {});
+        }
+      }
+    };
+
+    ws.onclose = (event) => {
+      if (socket !== ws) {
+        console.debug("stale_socket_close_ignored", { generation, code: event.code });
+        return;
+      }
+      if (event.code === 4000) {
+        // Le serveur nous a remplacés par un autre client (fake_extension.py,
+        // un second profil Chrome…). On s'efface au lieu de reprendre la main.
+        suppressUntil = Date.now() + REPLACED_BACKOFF;
+        scheduleReconnect(ws, "remplacé par un autre client du pont", { generation });
+        return;
+      }
+      scheduleReconnect(ws, null, { generation });
+    };
+    ws.onerror = () => {
+      if (socket !== ws) return;
+      setStatus({ lastError: "serveur injoignable" });
+    };
+  } finally {
+    if (connectAttempt === attempt) connectAttempt = null;
+  }
 }
 
 async function handleRecoveryCapture(msg) {
@@ -542,13 +578,27 @@ async function handleConversationArchive(msg) {
   }
 }
 
-function scheduleReconnect(error) {
-  socket = null;
+function scheduleReconnect(ownerSocket, error, options = {}) {
+  if (ownerSocket && socket !== ownerSocket) return false;
+  if (options.attempt && connectAttempt !== options.attempt) return false;
+  if (
+    options.generation !== undefined &&
+    connectionGeneration !== options.generation
+  ) {
+    return false;
+  }
+  if (ownerSocket) socket = null;
   setStatus({ connected: false, lastError: error || status.lastError });
   clearTimeout(reconnectTimer);
   const delay = Math.max(reconnectDelay, suppressUntil - Date.now());
-  reconnectTimer = setTimeout(connect, delay);
+  const generation = options.generation ?? connectionGeneration;
+  reconnectTimer = setTimeout(() => {
+    if (generation !== connectionGeneration || socket !== null) return;
+    reconnectTimer = null;
+    void connect();
+  }, delay);
   reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX);
+  return true;
 }
 
 const MAX_EN_ATTENTE = 500;
@@ -567,7 +617,7 @@ function send(payload) {
     return;
   }
   if (enAttente.length < MAX_EN_ATTENTE) enAttente.push(payload);
-  connect();
+  if (!socket || socket.readyState === WebSocket.CLOSED) void connect();
 }
 
 function flush() {
