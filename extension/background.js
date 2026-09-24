@@ -686,24 +686,58 @@ async function findChatTab() {
 }
 
 async function findDiagnosticChatTab() {
+  const exact = async (tabId, source, bridgeOwned) => {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      return { tab, source, bridge_owned: bridgeOwned };
+    } catch {
+      return null;
+    }
+  };
+  for (const tabId of [...new Set([...inflight.values()].reverse())]) {
+    const found = await exact(tabId, "inflight", true);
+    if (found) return found;
+  }
+  await Promise.all([browserTargetRegistryReady, conversationRegistryReady]);
+  const bound = async (entries, source) => {
+    for (const entry of entries) {
+      if (entry?.bridge_owned_window !== true || !Number.isInteger(entry.tab_id)) continue;
+      const found = await exact(entry.tab_id, source, true);
+      if (found) return found;
+    }
+    return null;
+  };
+  const browserTarget = await bound([...browserTargetRegistry.values()].reverse(), "browser_target");
+  if (browserTarget) return browserTarget;
+  const conversation = await bound(
+    [...conversationRegistry.values()].filter((entry) => entry?.state === "live").reverse(),
+    "bridge_conversation",
+  );
+  if (conversation) return conversation;
   const tabs = await chrome.tabs.query({
     url: ["https://chatgpt.com/*", "https://chat.openai.com/*"],
   });
   if (tabs.length === 0) return null;
-  const byId = new Map(tabs.map((tab) => [tab.id, tab]));
-  const inflightIds = [...new Set([...inflight.values()].reverse())];
-  for (const tabId of inflightIds) {
-    const tab = byId.get(tabId);
-    if (tab) return tab;
+  const temporaryChat = tabs.find((tab) => {
+    try {
+      const url = new URL(tab.url);
+      return url.pathname === "/" && url.searchParams.get("temporary-chat") === "true";
+    } catch {
+      return false;
+    }
+  });
+  if (temporaryChat) {
+    return { tab: temporaryChat, source: "temporary_chat", bridge_owned: false };
   }
   const active = tabs.find((tab) => tab.active);
-  if (active) return active;
-  return tabs.reduce((newest, tab) => {
+  if (active) return { tab: active, source: "generic_chatgpt_tab", bridge_owned: false };
+  const recent = tabs.reduce((newest, tab) => {
     if (typeof tab.lastAccessed === "number" && typeof newest.lastAccessed === "number") {
       return tab.lastAccessed > newest.lastAccessed ? tab : newest;
     }
     return tabs.indexOf(tab) > tabs.indexOf(newest) ? tab : newest;
   });
+  return { tab: recent, source: "generic_chatgpt_tab", bridge_owned: false };
 }
 
 /**
@@ -736,8 +770,8 @@ function diagnosticCount(value) {
   return Number.isInteger(value) ? Math.max(0, Math.min(value, 999)) : 0;
 }
 
-function safeDomHealth(raw, tabId) {
-  const statuses = new Set(["ok", "degraded", "missing", "ambiguous", "invalid"]);
+function safeDomHealth(raw, tabId, diagnosticTarget) {
+  const statuses = new Set(["ok", "degraded", "missing", "ambiguous", "invalid", "not_rendered_idle"]);
   const composerStrategies = new Set(["named_selector", "structural_fallback"]);
   const sendStrategies = composerStrategies;
   const composerSelectors = new Set([
@@ -774,6 +808,12 @@ function safeDomHealth(raw, tabId) {
         ? raw.content_script_version.slice(0, 20)
         : null,
     tab_id: Number.isInteger(tabId) ? tabId : null,
+    diagnostic_target: {
+      source: ["inflight", "browser_target", "bridge_conversation", "temporary_chat", "generic_chatgpt_tab"].includes(diagnosticTarget?.source)
+        ? diagnosticTarget.source
+        : "generic_chatgpt_tab",
+      bridge_owned: diagnosticTarget?.bridge_owned === true,
+    },
     extension_state: "active",
     websocket_state: status.connected ? "connected" : "disconnected",
     connection: connectionDiagnostic(),
@@ -810,14 +850,16 @@ function safeDomHealth(raw, tabId) {
       type: sendType,
       disabled: send.disabled === true,
       aria_disabled: send.aria_disabled === true,
-      same_form_as_composer: send.same_form_as_composer === true,
+      same_form_as_composer: typeof send.same_form_as_composer === "boolean"
+        ? send.same_form_as_composer
+        : null,
     },
   };
 }
 
 async function handleUiDiagnostic() {
-  const tab = await findDiagnosticChatTab();
-  if (!tab) {
+  const target = await findDiagnosticChatTab();
+  if (!target) {
     return {
       ok: false,
       error: "no_chatgpt_tab",
@@ -826,14 +868,19 @@ async function handleUiDiagnostic() {
       connection: connectionDiagnostic(),
     };
   }
+  const { tab } = target;
   try {
     const health = await chrome.tabs.sendMessage(tab.id, { type: "dom_health" });
-    return safeDomHealth(health, tab.id);
+    return safeDomHealth(health, tab.id, target);
   } catch {
     return {
       ok: false,
       error: "content_script_unavailable",
       tab_id: Number.isInteger(tab.id) ? tab.id : null,
+      diagnostic_target: {
+        source: target.source,
+        bridge_owned: target.bridge_owned === true,
+      },
       extension_state: "active",
       websocket_state: status.connected ? "connected" : "disconnected",
       connection: connectionDiagnostic(),

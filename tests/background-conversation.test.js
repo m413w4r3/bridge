@@ -1654,6 +1654,8 @@ async function main() {
     assert.equal(contentMessage.tabId, inflightTab.id);
     assert.equal(contentMessage.message.type, "dom_health");
     assert.equal(diagnostics.tab_id, inflightTab.id);
+    assert.equal(diagnostics.diagnostic_target.source, "inflight");
+    assert.equal(diagnostics.diagnostic_target.bridge_owned, true);
     assert.equal(diagnostics.composer.status, "degraded");
     assert.equal(diagnostics.send.status, "degraded");
     assert.equal(diagnostics.websocket_state, "disconnected");
@@ -1673,6 +1675,44 @@ async function main() {
     ]) {
       assert.equal(json.toLowerCase().includes(forbidden.toLowerCase()), false, forbidden);
     }
+  }
+
+  // A live exact browser_target outranks every URL/active-tab candidate.
+  {
+    const mock = makeChromeMock();
+    const { run } = loadBackground(mock.chrome);
+    const active = await mock.chrome.tabs.create({ url: "https://chatgpt.com/c/user", active: true });
+    const targetTab = await mock.chrome.tabs.create({ url: "https://chatgpt.com/?temporary-chat=true", active: false });
+    const otherTemporary = await mock.chrome.tabs.create({ url: "https://chatgpt.com/?temporary-chat=true", active: false });
+    await run("browserTargetRegistryReady");
+    await run(`browserTargetRegistry.set("run-exact", { target_id: "run-exact", tab_id: ${targetTab.id}, bridge_owned_window: true, state: "recoverable" })`);
+    let diagnosedTab = null;
+    mock.chrome.tabs.sendMessage = async (tabId) => {
+      diagnosedTab = tabId;
+      return { ok: true, surface: {}, composer: { status: "ok" }, send: { status: "not_rendered_idle" } };
+    };
+    const result = await run("handleUiDiagnostic()");
+    assert.equal(diagnosedTab, targetTab.id);
+    assert.equal(result.diagnostic_target.source, "browser_target");
+    assert.equal(result.diagnostic_target.bridge_owned, true);
+    assert.notEqual(diagnosedTab, active.id);
+    assert.notEqual(diagnosedTab, otherTemporary.id);
+  }
+
+  // Without a bridge binding or Temporary Chat, fallback is explicit.
+  {
+    const mock = makeChromeMock();
+    const { run } = loadBackground(mock.chrome);
+    const generic = await mock.chrome.tabs.create({ url: "https://chatgpt.com/c/generic", active: true });
+    mock.chrome.tabs.sendMessage = async (tabId) => {
+      assert.equal(tabId, generic.id);
+      return { ok: true, surface: { temporary_status: "invalid" }, composer: { status: "ok" }, send: { status: "not_rendered_idle" } };
+    };
+    const result = await run("handleUiDiagnostic()");
+    assert.equal(result.diagnostic_target.source, "generic_chatgpt_tab");
+    assert.equal(result.diagnostic_target.bridge_owned, false);
+    assert.equal(result.surface.temporary_status, "invalid");
+    assert.equal(result.ok, true);
   }
 
   // 28. Contrat « pas de vol de focus » sur la source elle-même.

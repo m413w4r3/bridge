@@ -428,6 +428,19 @@ function domHealthSnapshot() {
         visible_candidates: 0,
         same_form_as_composer: false,
       };
+  const composerElement = composer.element;
+  const composerText = composerElement
+    ? ("value" in composerElement ? composerElement.value : composerElement.textContent)
+    : "";
+  const pageSendButtons = composerElement
+    ? new Set([
+        ...SELECTORS.send.flatMap((selector) => visibleMatches(document, selector, (el) => el.tagName === "BUTTON")),
+        ...visibleMatches(document, "button[type='submit']", (el) => el.tagName === "BUTTON"),
+      ])
+    : new Set();
+  const idleSendNotRendered =
+    composer.status === "ok" && !String(composerText || "").trim() &&
+    !send.element && send.status === "missing" && pageSendButtons.size === 0;
   const visibilityState = ["visible", "hidden", "prerender", "unloaded"].includes(
     document.visibilityState,
   )
@@ -461,7 +474,9 @@ function domHealthSnapshot() {
       form_found: Boolean(composer.element?.closest("form")),
     },
     send: {
-      status: send.status,
+      // dom_health est un diagnostic read-only : un composer vide n'affiche
+      // pas toujours Send. Le runtime, lui, garde son attente post-injection.
+      status: idleSendNotRendered ? "not_rendered_idle" : send.status,
       strategy: send.strategy,
       selector: send.selector,
       visible_candidates: send.visible_candidates,
@@ -472,7 +487,7 @@ function domHealthSnapshot() {
           : null,
       disabled: Boolean(send.element?.disabled),
       aria_disabled: send.element?.getAttribute("aria-disabled") === "true",
-      same_form_as_composer: send.same_form_as_composer,
+      same_form_as_composer: idleSendNotRendered ? null : send.same_form_as_composer,
     },
   };
 }
@@ -506,6 +521,26 @@ function uiContractError(kind, resolution, message) {
     content_script_version: VERSION,
   };
   error.diagnostics.dom_health = domHealthSnapshot();
+  return error;
+}
+
+function addPostInjectionUiDiagnostics(error) {
+  const health = domHealthSnapshot();
+  const composer = health.composer || {};
+  const send = health.send || {};
+  // À l'instant runtime, l'injection a eu lieu : idle n'est plus une
+  // explication recevable pour l'absence de Send.
+  if (health.send?.status === "not_rendered_idle") health.send.status = "missing";
+  error.diagnostics = {
+    ...(error.diagnostics || {}),
+    composer_status: composer.status || "missing",
+    send_status: send.status === "not_rendered_idle" ? "missing" : send.status || "missing",
+    prompt_injected: true,
+    send_candidates: Number.isInteger(send.visible_candidates) ? send.visible_candidates : 0,
+    form_found: composer.form_found === true,
+    content_script_version: VERSION,
+    dom_health: health,
+  };
   return error;
 }
 
@@ -2699,6 +2734,7 @@ async function handlePrompt({
     submissionState: "pre_submission",
   };
   const runDiagnostics = captureRunStartDiagnostics();
+  let promptInjected = false;
   currentJob = job;
   if (!(await claimPrompt(id))) {
     if (currentJob === job) currentJob = null;
@@ -2798,6 +2834,7 @@ async function handlePrompt({
     let injectionMethod = null;
     if (composerPrompt) {
       injectionMethod = await typePrompt(composer, composerPrompt);
+      promptInjected = true;
     }
     // Paste and attachment handling can cause a React render. Use the current
     // composer for readiness, the baseline snapshot, and the one allowed Send.
@@ -3002,6 +3039,7 @@ async function handlePrompt({
       });
     }
   } catch (err) {
+    if (promptInjected) addPostInjectionUiDiagnostics(err);
     if (!job.aborted) {
       reply({
         type: "error",

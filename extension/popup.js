@@ -5,6 +5,7 @@ const url = document.getElementById("url");
 const token = document.getElementById("token");
 const ui = document.getElementById("ui");
 const diagnosticFields = {
+  target: document.getElementById("target-status"),
   temporary: document.getElementById("temporary-status"),
   composer: document.getElementById("composer-status"),
   send: document.getElementById("send-status"),
@@ -38,7 +39,7 @@ const SEND_SELECTORS = new Set([
   "button[aria-label*='Send']",
   "button[type='submit']",
 ]);
-const STATUSES = new Set(["ok", "degraded", "missing", "ambiguous", "invalid"]);
+const STATUSES = new Set(["ok", "degraded", "missing", "ambiguous", "invalid", "not_rendered_idle"]);
 const CONNECTION_STATES = new Set(["stable", "connecting", "stale", "conflict", "disconnected"]);
 
 function boundedCount(value) {
@@ -78,6 +79,12 @@ function safeDiagnostic(raw) {
     ok: raw?.ok === true,
     content_script_version: version,
     tab_id: Number.isInteger(raw?.tab_id) ? raw.tab_id : null,
+    diagnostic_target: {
+      source: ["inflight", "browser_target", "bridge_conversation", "temporary_chat", "generic_chatgpt_tab"].includes(raw?.diagnostic_target?.source)
+        ? raw.diagnostic_target.source
+        : "generic_chatgpt_tab",
+      bridge_owned: raw?.diagnostic_target?.bridge_owned === true,
+    },
     extension_state: raw?.extension_state === "active" ? "active" : "unknown",
     websocket_state: raw?.websocket_state === "connected" ? "connected" : "disconnected",
     connection: safeConnection(raw?.connection),
@@ -130,7 +137,9 @@ function safeDiagnostic(raw) {
       type: ["button", "submit", "reset", "other"].includes(send.type) ? send.type : null,
       disabled: send.disabled === true,
       aria_disabled: send.aria_disabled === true,
-      same_form_as_composer: send.same_form_as_composer === true,
+      same_form_as_composer: typeof send.same_form_as_composer === "boolean"
+        ? send.same_form_as_composer
+        : null,
     },
   };
 }
@@ -139,6 +148,7 @@ function setStatus(element, value, fallback = "BROKEN") {
   const display = {
     ok: ["OK", "contract-good"],
     degraded: ["DEGRADED", "contract-warn"],
+    not_rendered_idle: ["Idle / not rendered", "contract-neutral"],
     missing: [fallback, "contract-bad"],
     ambiguous: ["AMBIGUOUS", "contract-bad"],
     invalid: ["INVALID", "contract-bad"],
@@ -177,8 +187,22 @@ function renderDiagnostic(raw) {
     connection.conflict_reason ? `conflit ${connection.conflict_reason}` : null,
   ].filter(Boolean).join(" · ");
 
+  const targetLabels = {
+    inflight: "Bridge inflight",
+    browser_target: "Bridge browser target",
+    bridge_conversation: "Bridge conversation",
+    temporary_chat: "Temporary Chat",
+    generic_chatgpt_tab: "Generic ChatGPT tab",
+  };
+  diagnosticFields.target.textContent = targetLabels[diagnostic.diagnostic_target.source];
+
   if (!diagnostic.ok) {
-    setStatus(diagnosticFields.temporary, "invalid");
+    if (diagnostic.diagnostic_target.source === "generic_chatgpt_tab") {
+      diagnosticFields.temporary.textContent = "N/A";
+      diagnosticFields.temporary.className = "contract-neutral";
+    } else {
+      setStatus(diagnosticFields.temporary, "invalid");
+    }
     setStatus(diagnosticFields.composer, "missing");
     setStatus(diagnosticFields.send, "missing");
     diagnosticFields.version.textContent = "—";
@@ -196,7 +220,12 @@ function renderDiagnostic(raw) {
   }
 
   const { surface, composer, send } = diagnostic;
-  setStatus(diagnosticFields.temporary, surface.temporary_status, "INVALID");
+  if (diagnostic.diagnostic_target.source === "generic_chatgpt_tab") {
+    diagnosticFields.temporary.textContent = "N/A";
+    diagnosticFields.temporary.className = "contract-neutral";
+  } else {
+    setStatus(diagnosticFields.temporary, surface.temporary_status, "INVALID");
+  }
   setStatus(diagnosticFields.composer, composer.status);
   setStatus(diagnosticFields.send, send.status);
   diagnosticFields.version.textContent = diagnostic.content_script_version
@@ -209,8 +238,9 @@ function renderDiagnostic(raw) {
     `${composer.visible_candidates} visible · ${composer.known_selector_candidates} known · ${composer.structural_candidates} structural · form ${composer.form_found ? "yes" : "no"}`;
   diagnosticFields.sendSelector.textContent = send.selector || "Aucun sélecteur trouvé";
   diagnosticFields.sendStrategy.textContent = describeStrategy(send.strategy);
-  diagnosticFields.sendCandidates.textContent =
-    `${send.visible_candidates} visible · type ${send.type || "unknown"} · disabled ${send.disabled ? "yes" : "no"} · aria-disabled ${send.aria_disabled ? "yes" : "no"} · same form ${send.same_form_as_composer ? "yes" : "no"}`;
+  diagnosticFields.sendCandidates.textContent = send.status === "not_rendered_idle"
+    ? `${send.visible_candidates} visible · bouton non rendu tant que le composer est vide`
+    : `${send.visible_candidates} visible · type ${send.type || "unknown"} · disabled ${send.disabled ? "yes" : "no"} · aria-disabled ${send.aria_disabled ? "yes" : "no"} · same form ${send.same_form_as_composer == null ? "unknown" : send.same_form_as_composer ? "yes" : "no"}`;
   diagnosticFields.message.textContent = "Diagnostic terminé. Aucun contenu de conversation n’a été lu.";
 }
 

@@ -148,11 +148,12 @@ function loadPopup() {
 }
 
 const SECRET = "TOP_SECRET_USER_PROMPT_42";
-function rawReport({ composer = {}, send = {}, connection = {} } = {}) {
+function rawReport({ composer = {}, send = {}, connection = {}, surface = {}, diagnostic_target = {} } = {}) {
   return {
     ok: true,
     content_script_version: "36",
     tab_id: 7,
+    diagnostic_target: { source: "generic_chatgpt_tab", bridge_owned: false, ...diagnostic_target },
     extension_state: "active",
     websocket_state: "connected",
     // Champs hors contrat : ne doivent jamais apparaître dans le rapport.
@@ -177,6 +178,7 @@ function rawReport({ composer = {}, send = {}, connection = {} } = {}) {
       visibility_state: "hidden",
       has_focus: false,
       title: SECRET,
+      ...surface,
     },
     composer: {
       status: "ok",
@@ -230,12 +232,34 @@ function rawReport({ composer = {}, send = {}, connection = {} } = {}) {
     [{ status: "ok" }, "OK"],
     [{ status: "degraded", strategy: "structural_fallback", selector: "button[type='submit']" }, "DEGRADED"],
     [{ status: "missing", strategy: "structural_fallback", selector: "button[type='submit']", visible_candidates: 0 }, "BROKEN"],
+    [{ status: "not_rendered_idle", visible_candidates: 0, same_form_as_composer: null }, "Idle / not rendered"],
   ];
   for (const [send, label] of sendCases) {
     const report = popup.render(rawReport({ send }));
     assert.equal(popup.text("send-status"), label, `send ${send.status}`);
     assert.equal(JSON.stringify(report).includes(SECRET), false, `send ${send.status}: aucun contenu`);
   }
+  const genericIdle = popup.render(rawReport({
+    surface: { temporary_status: "invalid" },
+    composer: { status: "ok" },
+    send: { status: "not_rendered_idle", visible_candidates: 0, same_form_as_composer: null },
+  }));
+  assert.equal(genericIdle.ok, true);
+  assert.equal(genericIdle.diagnostic_target.source, "generic_chatgpt_tab");
+  assert.equal(popup.text("target-status"), "Generic ChatGPT tab");
+  assert.equal(popup.text("temporary-status"), "N/A");
+  assert.equal(popup.text("composer-status"), "OK");
+  assert.equal(popup.text("send-status"), "Idle / not rendered");
+
+  const inflightTarget = popup.render(rawReport({
+    diagnostic_target: { source: "inflight", bridge_owned: true },
+    surface: { temporary_status: "ok" },
+    composer: { status: "ok" },
+    send: { status: "ok" },
+  }));
+  assert.equal(inflightTarget.diagnostic_target.source, "inflight");
+  assert.equal(popup.text("target-status"), "Bridge inflight");
+  assert.equal(popup.text("temporary-status"), "OK");
 
   const connectionCases = [
     [{ state: "stable" }, "STABLE", null],
@@ -270,6 +294,7 @@ function rawReport({ composer = {}, send = {}, connection = {} } = {}) {
   assert.deepEqual(Object.keys(failed).sort(), [
     "connection",
     "content_script_version",
+    "diagnostic_target",
     "error",
     "extension_state",
     "ok",

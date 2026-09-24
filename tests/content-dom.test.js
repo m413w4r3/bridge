@@ -678,7 +678,23 @@ function useVirtualClock(window) {
     const noSend = `<form>${CURRENT_CHATGPT_COMPOSER_2026_09_24.match(/<div[\s\S]*?<\/div>/)[0]}</form>`;
     const missingSend = await loadExtension(noSend).dispatch({ type: "dom_health" });
     assert.equal(missingSend.composer.status, "ok");
-    assert.equal(missingSend.send.status, "missing");
+    assert.equal(missingSend.send.status, "not_rendered_idle");
+    assert.equal(missingSend.send.visible_candidates, 0);
+    assert.equal(missingSend.send.same_form_as_composer, null);
+  }
+
+  // An idle generic conversation and an idle Temporary Chat both keep a
+  // valid composer without reporting the absent Send button as a failure.
+  {
+    const markup = `<form><div id="prompt-textarea" contenteditable="true"></div></form>`;
+    const generic = await loadExtension(markup, "https://chatgpt.com/c/123").dispatch({ type: "dom_health" });
+    assert.equal(generic.ok, true);
+    assert.equal(generic.surface.temporary_status, "invalid");
+    assert.equal(generic.composer.status, "ok");
+    assert.equal(generic.send.status, "not_rendered_idle");
+    const temporary = await loadExtension(markup, "https://chatgpt.com/?temporary-chat=true").dispatch({ type: "dom_health" });
+    assert.equal(temporary.composer.status, "ok");
+    assert.equal(temporary.send.status, "not_rendered_idle");
   }
 
   // Diagnostic JSON excludes composer contents, credential names, and authorization fields.
@@ -874,17 +890,25 @@ function useVirtualClock(window) {
   // Missing Send during a run returns the same safe DOM snapshot in BridgeError diagnostics.
   {
     const { window, run } = loadExtension(
-      `<form><div id="prompt-textarea" contenteditable="true"></div></form>`,
+      `<form><textarea data-id="prompt"></textarea></form>`,
       "https://chatgpt.com/?temporary-chat=true",
     );
     useVirtualClock(window);
     const sent = [];
     window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
-    await run(`handlePrompt({ id: "req-no-send", prompt: "", conversation: { id: "conv-no-send", mode: "fresh" } })`);
+    await run(`handlePrompt({ id: "req-no-send", prompt: "hello", conversation: { id: "conv-no-send", mode: "fresh" } })`);
     const error = sent.find((message) => message.type === "error");
+    assert.equal(error?.code, "bridge_ui_timeout");
     assert.equal(error?.diagnostics?.ui_contract_error, "send_missing");
     assert.equal(error?.diagnostics?.dom_health?.composer?.status, "ok");
     assert.equal(error?.diagnostics?.dom_health?.send?.status, "missing");
+    assert.equal(error?.diagnostics?.prompt_injected, true);
+    assert.equal(error?.diagnostics?.composer_status, "ok");
+    assert.equal(error?.diagnostics?.send_status, "missing");
+    assert.equal(error?.diagnostics?.send_candidates, 0);
+    assert.equal(error?.diagnostics?.form_found, true);
+    assert.equal(error?.diagnostics?.content_script_version, "36");
+    assert.equal(JSON.stringify(error).includes("hello"), false);
   }
 
   // 1. URL Temporary + composer, sans toggle : le markup de l'UI n'est pas
