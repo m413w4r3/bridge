@@ -113,6 +113,8 @@ response text can never change what conversation is opened or closed.
   starts with `MarkdownRoot-` (`markdown_root_delta`). The candidate is the
   structural surplus measured against `captureResponseBaseline()` taken just
   before the single Send, inside the composer-linked conversation surface;
+  a root React re-created *inside* the baseline envelope is still the old
+  turn — even with fresh class tokens — never the new answer.
   "the last MarkdownRoot in the page" is never an answer, `inline-markdown`
   leaves are only evidence of conversational content. Two simultaneous new
   roots, or inline leaves with no resolvable root, fail closed as

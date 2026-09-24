@@ -5,7 +5,7 @@
 #
 # - lit la clé depuis BRIDGE_API_KEY, ne l'imprime jamais et ne la passe
 #   jamais en argument de commande (elle n'apparaît pas dans `ps`) ;
-# - envoie « Reply exactly BRIDGE_OK » sur POST /v1/bridge/runs ;
+# - envoie « Reply with exactly: BRIDGE_OK » sur POST /v1/bridge/runs ;
 # - affiche le statut HTTP, la durée, puis soit la correspondance de la
 #   réponse, soit le code d'erreur et son diagnostic DOM borné.
 #
@@ -24,7 +24,7 @@ body_file="$(mktemp)"
 trap 'rm -f "$body_file"' EXIT
 
 idempotency_key="smoke-$(date +%s)-$$-$RANDOM"
-payload='{"input":"Reply exactly BRIDGE_OK","requested_model":"bridge-smoke"}'
+payload='{"input":"Reply with exactly: BRIDGE_OK","requested_model":"bridge-smoke"}'
 
 # L'en-tête Authorization est lu sur stdin (`-H @-`) : printf est un builtin,
 # la clé ne passe donc par aucun argv visible.

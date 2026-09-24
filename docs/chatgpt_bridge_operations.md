@@ -434,11 +434,23 @@ Pour vérifier la chaîne complète après correction :
 BRIDGE_API_KEY=... tools/smoke_chatgpt_bridge.sh   # [base_url], défaut http://127.0.0.1:8001
 ```
 
-Le script envoie « Reply exactly BRIDGE_OK », affiche le statut HTTP, la
+Le script envoie « Reply with exactly: BRIDGE_OK », affiche le statut HTTP, la
 durée, puis soit `reply_match`, soit le code d’erreur et le `dom_health`
 borné. Il ne passe jamais la clé en argument de commande et ne l’affiche
 pas. Chaque exécution soumet un nouveau prompt (nouvelle clé
 d’idempotence).
+
+Si le smoke reste bloqué (statut HTTP obtenu, aucune réponse, ou
+`bridge_ui_timeout`) : ouvrir le popup de l’extension, cliquer
+**Copy diagnostic**, puis lire le JSON **dans cet ordre** —
+**Connection** (extension/WebSocket vivants, cible exacte et son
+propriétaire), **Input** (Temporary Chat confirmé, composer, Send),
+**Response locator** (surface, baseline/roots, verdict du candidat et raison
+bornée), **Finalization** (ACTIVE / QUIESCENT / FINAL, signal bloquant,
+stabilité observée / seuil appliqué), **Serialization** (root trouvé,
+sérialiseur, dernier résultat). Une cause en amont rend les suivantes
+illisibles : ne jamais interpréter une ligne Finalization quand la ligne
+Input est déjà BROKEN.
 
 ## Contrat de réponse (ResponseRoot)
 
@@ -466,6 +478,17 @@ bornée (`resolveConversationSurface()`) : header, nav, aside, menus, popovers
 et modales ne peuvent pas devenir une conversation — le diagnostic réel a déjà
 montré un `app-shell-header-context-menu-surface` qui ne doit jamais être pris
 pour une réponse.
+
+Ce qu’est un root « nouveau » est strict, parce que React peut remonter tout
+le tour (nœud neuf, **tokens de classe neufs**) sans qu’aucune réponse n’ait
+été écrite : est frais un ResponseRoot dont le nœud est absent du baseline
+**et** dont le rang dépasse l’enveloppe des roots du baseline
+(`isFreshResponseRoot()`). Un ancien tour re-rendu, même avec une signature
+différente, reste l’ancien tour : il n’est jamais candidat, ni identité de
+repli pour le locator (`locateResponseCandidate()`), et son contenu n’est
+jamais relivré comme la réponse du run. En cas de doute, le run reste en
+attente — le `bridge_total_timeout` du serveur borne la durée — plutôt que de
+livrer un ancien texte.
 
 L’identité du candidat est locale au run (WeakMap + ordinal + signature) :
 React peut remplacer le nœud, le locator rattache le nouveau nœud au même

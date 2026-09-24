@@ -766,6 +766,132 @@ function observeModernComposer(window, onRender) {
     }
   }
 
+  // --- 16. Re-rendu React d'un ancien tour : jamais la nouvelle réponse ---- //
+  {
+    const { window, run } = loadExtension(MODERN_PAGE);
+    const transcript = window.document.querySelector("#transcript");
+    transcript.innerHTML = answerRoot(inlineText("ancienne réponse"), "Old1");
+    window.__baseline = run("captureResponseBaseline()");
+    assert.equal(window.__baseline.markdownRootCount, 1);
+
+    // React remonte le tour : nœud neuf, signature de classes neuve, contenu
+    // inchangé. Aucune réponse n'a été écrite : l'ancienne ne doit pas devenir
+    // la nouvelle. Le rang est dans l'enveloppe du baseline, donc rien n'est
+    // frais — le run reste en attente, il ne livre jamais ce texte.
+    transcript.innerHTML = answerRoot(inlineText("ancienne réponse"), "Rerendered2");
+    const rerendered = run("resolveResponseCandidate(globalThis.__baseline)");
+    assert.equal(rerendered.status, "pending", "un re-rendu React n'est pas une réponse");
+    assert.equal(rerendered.element, null, "aucun nœud choisi");
+    assert.equal(rerendered.current_root_count, 1);
+
+    // Le tour suivant, lui, apparaît au-delà de l'enveloppe : il reste trouvé,
+    // même en présence de l'ancien tour re-rendu.
+    transcript.insertAdjacentHTML(
+      "beforeend",
+      answerRoot(inlineText("BRIDGE_OK"), "New3"),
+    );
+    const fresh = run(`(() => {
+      const candidate = resolveResponseCandidate(globalThis.__baseline);
+      return {
+        status: candidate.status,
+        text: candidate.element
+          ? readAnswer(resolveResponseContentRoot(candidate, true), false).text
+          : null,
+      };
+    })()`);
+    assert.equal(fresh.status, "found");
+    assert.equal(fresh.text, "BRIDGE_OK", "le nouveau tour uniquement");
+    assert.equal(fresh.text.includes("ancienne"), false);
+
+    // Le repli du locator applique le même contrat : si la réponse du run
+    // disparaît et que seul l'ancien tour est recréé, il n'y a aucune identité
+    // de repli — surtout pas l'ancien contenu.
+    transcript.innerHTML =
+      answerRoot(inlineText("ancienne réponse"), "Old1") +
+      answerRoot(inlineText("BRIDGE_OK"), "New1");
+    run(`(() => {
+      const candidate = resolveResponseCandidate(globalThis.__baseline);
+      globalThis.__locator = createResponseLocator(candidate, globalThis.__baseline);
+    })()`);
+    transcript.innerHTML = answerRoot(inlineText("ancienne réponse"), "Rerendered2");
+    assert.equal(
+      run("locateResponseCandidate(globalThis.__locator, globalThis.__baseline) === null"),
+      true,
+      "un ancien tour re-rendu n'est jamais une identité de repli",
+    );
+  }
+
+  // --- 17. Re-montage React pendant le run : aucun ancien texte livré ------ //
+  {
+    const OLD_TEXT = "ancienne réponse à ne jamais relivrer";
+    const { window, run, dispatch } = loadExtension(MODERN_PAGE);
+    const clockOf = useVirtualClock(window);
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    window.console.log = () => {};
+    window.console.warn = () => {};
+    const transcript = window.document.querySelector("#transcript");
+    transcript.innerHTML = answerRoot(inlineText(OLD_TEXT), "Old1");
+
+    // Le re-montage est déclenché par un COMPTEUR de tours de minuterie : le
+    // run est encore en cours, quelle que soit la fenêtre de stabilisation.
+    const tick = window.setTimeout;
+    let ticksBeforeRemount = null;
+    let remountedAt = null;
+    let quietResolve = null;
+    const quiet = new Promise((resolve) => { quietResolve = resolve; });
+    let ticksAfterRemount = 0;
+    window.setTimeout = (fn, ms) => {
+      if (ticksBeforeRemount !== null) {
+        ticksBeforeRemount -= 1;
+        if (ticksBeforeRemount <= 0) {
+          ticksBeforeRemount = null;
+          remountedAt = clockOf();
+          // React remonte la liste entière : la réponse du run disparaît,
+          // l'ancien tour revient avec une signature neuve.
+          transcript.innerHTML =
+            `<div class="MarkdownRoot-Rerendered2">${inlineText(OLD_TEXT, "Old2")}</div>`;
+        }
+      } else if (remountedAt !== null && quietResolve) {
+        ticksAfterRemount += 1;
+        // 500 tours de POLL_MS : bien au-delà de toutes les fenêtres de
+        // conclusion, et toujours aucune réponse fabriquée.
+        if (ticksAfterRemount >= 500) { quietResolve(); quietResolve = null; }
+      }
+      return tick(fn, ms);
+    };
+    const observed = observeModernComposer(window, (target) => {
+      target.innerHTML =
+        `<div class="MarkdownRoot-R1">${inlineText("BRIDGE_", "R1")}<div class="result-streaming"></div></div>`;
+      ticksBeforeRemount = 8;
+    });
+
+    const runPromise = run(
+      `handlePrompt({ id: "req-remount", prompt: "bonjour", conversation: { id: "conv-remount", mode: "fresh" } })`,
+    );
+    await quiet;
+    assert.equal(observed.submitEvents, 1, "aucun replay automatique");
+    assert.notEqual(remountedAt, null, "le re-montage a bien eu lieu pendant le run");
+    assert.ok(
+      clockOf() >= remountedAt + 500 * run("POLL_MS"),
+      "le run observe sans conclure après le re-montage",
+    );
+    assert.equal(
+      sent.some((message) => ["done", "incomplete"].includes(message.type)),
+      false,
+      "aucune réponse fabriquée depuis le contenu de l'ancien tour",
+    );
+    assert.equal(JSON.stringify(sent).includes(OLD_TEXT), false);
+
+    await dispatch({ type: "abort", id: "req-remount" });
+    await runPromise;
+    assert.equal(
+      sent.some((message) => ["done", "incomplete"].includes(message.type)),
+      false,
+      "un abandon ne fabrique pas de réponse",
+    );
+  }
+
   console.log("response root locator contract: ok");
 })().catch((err) => {
   console.error(err);

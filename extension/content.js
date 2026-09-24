@@ -2256,6 +2256,24 @@ function emptyResponseBaseline() {
   };
 }
 
+/**
+ * Un ResponseRoot observé est-il *structurellement* nouveau par rapport au
+ * baseline ? Deux conditions, jamais une de moins :
+ *
+ * - son nœud n'était pas déjà présent au baseline (identité locale WeakMap) ;
+ * - son rang est au-delà de l'enveloppe des roots du baseline.
+ *
+ * La seconde est ce qui protège l'ancien tour d'un re-rendu React : le nœud
+ * recréé au même rang reste l'ancienne conversation, même quand sa signature
+ * de classes a changé — il ne doit jamais devenir la réponse du run. Fail
+ * closed : un DOM tronqué (tours démontés) retombe en attente typée et bornée,
+ * jamais sur un ancien texte.
+ */
+function isFreshResponseRoot(el, ordinal, baselineCount, baselineKeys) {
+  if (baselineKeys.has(responseRootKey(el))) return false;
+  return ordinal >= (Number.isFinite(baselineCount) ? baselineCount : 0);
+}
+
 /** Candidat décrit par les mêmes champs, quelle que soit la stratégie. */
 function describeResponseCandidate(status, strategy, element, collected, baseline) {
   const roots = collected || { markdown: [], inline_leaf_count: 0 };
@@ -2283,6 +2301,10 @@ function describeResponseCandidate(status, strategy, element, collected, baselin
  * - `pending`   : rien de nouveau (ou un nœud monté mais encore vide).
  * - `ambiguous` : plusieurs nouveaux ResponseRoots plausibles — on ne devine
  *                 pas, l'appelant décide (fail closed).
+ *
+ * « Nouveau » est strict : identité locale absente du baseline ET rang au-delà
+ * de son enveloppe (cf. `isFreshResponseRoot`). Un ancien tour recréé par
+ * React, même avec une signature de classes neuve, reste l'ancien tour.
  */
 function resolveResponseCandidate(baseline, root = document) {
   const safeBaseline = baseline || emptyResponseBaseline();
@@ -2307,24 +2329,26 @@ function resolveResponseCandidate(baseline, root = document) {
   } else {
     // Sélection par delta : une occurrence n'est retenue que si sa signature
     // dépasse le compte du baseline (les occurrences antérieures consomment
-    // l'autorisation) ET si son nœud n'était pas déjà présent avant le Send.
+    // l'autorisation) ET si elle est réellement fraîche — nœud absent du
+    // baseline et rang au-delà de son enveloppe (cf. `isFreshResponseRoot`).
     const allowance = new Map();
     for (const signature of safeBaseline.rootSignatures || []) {
       allowance.set(signature, (allowance.get(signature) || 0) + 1);
     }
-    const surplusRoots = [];
-    for (const el of collected.markdown) {
+    const baselineCount = safeBaseline.markdownRootCount || 0;
+    const freshSurplus = [];
+    collected.markdown.forEach((el, ordinal) => {
       const signature = markdownRootSignature(el);
       const left = allowance.get(signature) || 0;
       if (left > 0) {
+        // Occurrence « autorisée » : elle existait au baseline, ou un re-rendu
+        // React l'a recréée à l'identique (même signature).
         allowance.set(signature, left - 1);
-        continue;
+        return;
       }
-      surplusRoots.push(el);
-    }
-    const freshSurplus = surplusRoots.filter(
-      (el) => !markdownKeys.has(responseRootKey(el)),
-    );
+      if (!isFreshResponseRoot(el, ordinal, baselineCount, markdownKeys)) return;
+      freshSurplus.push(el);
+    });
     if (freshSurplus.length) {
       strategy = "markdown_root_delta";
       raw = freshSurplus;
@@ -2421,8 +2445,11 @@ function locateResponseCandidate(locator, baseline, root = document) {
     );
   }
   const baselineKeys = new Set(baseline?.markdownRootKeys || []);
-  const fresh = collected.markdown.filter(
-    (el) => !baselineKeys.has(responseRootKey(el)),
+  const baselineCount = baseline?.markdownRootCount || 0;
+  // Même contrat de fraîcheur que la résolution initiale : un ancien root
+  // recréé par React n'est pas une identité de repli pour le candidat.
+  const fresh = collected.markdown.filter((el, ordinal) =>
+    isFreshResponseRoot(el, ordinal, baselineCount, baselineKeys),
   );
   if (fresh.length === 1) {
     return describeResponseCandidate(
