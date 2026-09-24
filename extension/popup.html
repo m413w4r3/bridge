@@ -5,13 +5,14 @@
     <style>
       body {
         font: 13px/1.5 system-ui, sans-serif;
-        width: 260px;
+        width: 320px;
         margin: 0;
         padding: 14px;
         background: #1c1c1e;
         color: #f2f2f7;
       }
       h1 { font-size: 13px; margin: 0 0 10px; font-weight: 600; }
+      h2 { font-size: 13px; margin: 14px 0 8px; font-weight: 600; }
       .row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
       .dot { width: 9px; height: 9px; border-radius: 50%; background: #ff453a; flex: none; }
       .dot.on { background: #32d74b; }
@@ -23,7 +24,15 @@
         margin-top: 8px; width: 100%; padding: 7px; border: 0; border-radius: 6px;
         background: #0a84ff; color: #fff; font: inherit; font-weight: 500; cursor: pointer;
       }
+      button.secondary { background: #3a3a3c; }
       .muted { color: #8e8e93; font-size: 12px; }
+      .contract { border-top: 1px solid #3a3a3c; margin-top: 12px; padding-top: 2px; }
+      .contract-row { display: flex; justify-content: space-between; gap: 10px; }
+      .contract-good { color: #32d74b; }
+      .contract-warn { color: #ffd60a; }
+      .contract-bad { color: #ff453a; }
+      .contract-code { display: block; overflow-wrap: anywhere; color: #d1d1d6; }
+      pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 180px; overflow: auto; }
     </style>
   </head>
   <body>
@@ -31,6 +40,27 @@
     <div class="row"><span class="dot" id="dot"></span><span id="state">…</span></div>
     <div class="muted" id="detail"></div>
     <div class="muted" id="ui"></div>
+    <section class="contract" aria-labelledby="contract-title">
+      <h2 id="contract-title">UI contract</h2>
+      <div class="contract-row"><span>Temporary Chat</span><strong id="temporary-status">—</strong></div>
+      <div class="contract-row"><span>Composer</span><strong id="composer-status">—</strong></div>
+      <div class="contract-row"><span>Send</span><strong id="send-status">—</strong></div>
+      <div class="contract-row"><span>Content script</span><strong id="content-version">—</strong></div>
+      <div class="contract-row"><span>Extension / WebSocket</span><strong id="extension-state">—</strong></div>
+      <div class="muted" id="diagnostic-tab"></div>
+      <p class="muted">Composer</p>
+      <code class="contract-code" id="composer-selector">—</code>
+      <div class="muted" id="composer-strategy"></div>
+      <div class="muted" id="composer-candidates"></div>
+      <p class="muted">Send</p>
+      <code class="contract-code" id="send-selector">—</code>
+      <div class="muted" id="send-strategy"></div>
+      <div class="muted" id="send-candidates"></div>
+      <button id="diagnose">Diagnostiquer l’UI ChatGPT</button>
+      <button id="copy-diagnostic" class="secondary" disabled>Copier le diagnostic</button>
+      <div class="muted" id="diagnostic-message" role="status"></div>
+      <pre class="muted" id="diagnostic-json" hidden></pre>
+    </section>
     <label class="muted" for="url">Serveur WebSocket</label>
     <input id="url" spellcheck="false" />
     <label class="muted" for="token">Jeton d’appairage</label>

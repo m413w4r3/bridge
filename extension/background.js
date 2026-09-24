@@ -587,6 +587,133 @@ async function findChatTab() {
   return tabs.find((t) => t.active) || tabs[tabs.length - 1];
 }
 
+async function findDiagnosticChatTab() {
+  const tabs = await chrome.tabs.query({
+    url: ["https://chatgpt.com/*", "https://chat.openai.com/*"],
+  });
+  if (tabs.length === 0) return null;
+  const byId = new Map(tabs.map((tab) => [tab.id, tab]));
+  const inflightIds = [...new Set([...inflight.values()].reverse())];
+  for (const tabId of inflightIds) {
+    const tab = byId.get(tabId);
+    if (tab) return tab;
+  }
+  const active = tabs.find((tab) => tab.active);
+  if (active) return active;
+  return tabs.reduce((newest, tab) => {
+    if (typeof tab.lastAccessed === "number" && typeof newest.lastAccessed === "number") {
+      return tab.lastAccessed > newest.lastAccessed ? tab : newest;
+    }
+    return tabs.indexOf(tab) > tabs.indexOf(newest) ? tab : newest;
+  });
+}
+
+function diagnosticCount(value) {
+  return Number.isInteger(value) ? Math.max(0, Math.min(value, 999)) : 0;
+}
+
+function safeDomHealth(raw, tabId) {
+  const statuses = new Set(["ok", "degraded", "missing", "ambiguous", "invalid"]);
+  const composerStrategies = new Set(["named_selector", "structural_fallback"]);
+  const sendStrategies = composerStrategies;
+  const composerSelectors = new Set([
+    "[data-composer-markdown][contenteditable='true'][role='textbox']",
+    "#prompt-textarea",
+    "[data-testid='prompt-textarea']",
+    "div[contenteditable='true'][id^='prompt']",
+    "textarea[data-id]",
+    "[contenteditable='true'][role='textbox']",
+  ]);
+  const sendSelectors = new Set([
+    "button[data-testid='send-button']",
+    "#composer-submit-button",
+    "button[aria-label*='Envoyer']",
+    "button[aria-label*='Send']",
+    "button[type='submit']",
+  ]);
+  const surface = raw?.surface || {};
+  const composer = raw?.composer || {};
+  const send = raw?.send || {};
+  const normalizeStatus = (value, fallback = "missing") =>
+    statuses.has(value) ? value : fallback;
+  const strategy = (value, allowed) => (allowed.has(value) ? value : null);
+  const fixedSelector = (value, allowed) => (allowed.has(value) ? value : null);
+  const tag = ["DIV", "TEXTAREA", "INPUT"].includes(composer.tag) ? composer.tag : null;
+  const sendType = ["button", "submit", "reset", "other"].includes(send.type)
+    ? send.type
+    : null;
+
+  return {
+    ok: raw?.ok === true,
+    content_script_version:
+      typeof raw?.content_script_version === "string"
+        ? raw.content_script_version.slice(0, 20)
+        : null,
+    tab_id: Number.isInteger(tabId) ? tabId : null,
+    extension_state: "active",
+    websocket_state: status.connected ? "connected" : "disconnected",
+    surface: {
+      origin_ok: surface.origin_ok === true,
+      pathname: typeof surface.pathname === "string" ? surface.pathname.slice(0, 128) : "",
+      temporary_query: surface.temporary_query === true,
+      temporary_status: normalizeStatus(surface.temporary_status, "invalid"),
+      visibility_state: ["visible", "hidden", "prerender", "unloaded"].includes(
+        surface.visibility_state,
+      )
+        ? surface.visibility_state
+        : "unknown",
+      has_focus: surface.has_focus === true,
+    },
+    composer: {
+      status: normalizeStatus(composer.status),
+      strategy: strategy(composer.strategy, composerStrategies),
+      selector: fixedSelector(composer.selector, composerSelectors),
+      visible_candidates: diagnosticCount(composer.visible_candidates),
+      known_selector_candidates: diagnosticCount(composer.known_selector_candidates),
+      structural_candidates: diagnosticCount(composer.structural_candidates),
+      tag,
+      role: composer.role === "textbox" ? "textbox" : null,
+      contenteditable: composer.contenteditable === true,
+      data_composer_markdown: composer.data_composer_markdown === true,
+      form_found: composer.form_found === true,
+    },
+    send: {
+      status: normalizeStatus(send.status),
+      strategy: strategy(send.strategy, sendStrategies),
+      selector: fixedSelector(send.selector, sendSelectors),
+      visible_candidates: diagnosticCount(send.visible_candidates),
+      type: sendType,
+      disabled: send.disabled === true,
+      aria_disabled: send.aria_disabled === true,
+      same_form_as_composer: send.same_form_as_composer === true,
+    },
+  };
+}
+
+async function handleUiDiagnostic() {
+  const tab = await findDiagnosticChatTab();
+  if (!tab) {
+    return {
+      ok: false,
+      error: "no_chatgpt_tab",
+      extension_state: "active",
+      websocket_state: status.connected ? "connected" : "disconnected",
+    };
+  }
+  try {
+    const health = await chrome.tabs.sendMessage(tab.id, { type: "dom_health" });
+    return safeDomHealth(health, tab.id);
+  } catch {
+    return {
+      ok: false,
+      error: "content_script_unavailable",
+      tab_id: Number.isInteger(tab.id) ? tab.id : null,
+      extension_state: "active",
+      websocket_state: status.connected ? "connected" : "disconnected",
+    };
+  }
+}
+
 /** Un onglet appartient-il à une origine ChatGPT autorisée ? Jamais une identité. */
 function isAllowedChatOrigin(value) {
   try {
@@ -1390,6 +1517,18 @@ async function handleUiRequest(msg) {
 
 // Remontée des paquets du content script vers le serveur.
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg?.type === "diagnose_ui") {
+    void handleUiDiagnostic().then(
+      sendResponse,
+      () => sendResponse({
+        ok: false,
+        error: "diagnostic_failed",
+        extension_state: "active",
+        websocket_state: status.connected ? "connected" : "disconnected",
+      }),
+    );
+    return true;
+  }
   if (msg?.type === "status") {
     sendResponse(status);
     return true;

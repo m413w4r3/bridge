@@ -1225,7 +1225,98 @@ async function main() {
     assert.equal(gone.exists, false);
   }
 
-  // 27. Contrat « pas de vol de focus » sur la source elle-même.
+  // 27. UI diagnostics prefer an inflight ChatGPT tab and expose only the allow-listed snapshot.
+  {
+    const mock = makeChromeMock();
+    mock.localStore.wsToken = "STORED_WS_TOKEN_SECRET";
+    const { run } = loadBackground(mock.chrome);
+    const activeTab = await mock.chrome.tabs.create({
+      url: "https://chatgpt.com/c/active",
+      active: true,
+    });
+    const inflightTab = await mock.chrome.tabs.create({
+      url: "https://chatgpt.com/?temporary-chat=true",
+      active: false,
+    });
+    await run(`inflight.set("run-diagnostic", ${inflightTab.id})`);
+    const beforeActive = mock.tabsById.get(activeTab.id).active;
+    const beforeInflight = mock.tabsById.get(inflightTab.id).active;
+    let contentMessage = null;
+    mock.chrome.tabs.sendMessage = async (tabId, message) => {
+      contentMessage = { tabId, message };
+      return {
+        ok: true,
+        content_script_version: "35",
+        surface: {
+          origin_ok: true,
+          pathname: "/",
+          temporary_query: true,
+          temporary_status: "ok",
+          visibility_state: "hidden",
+          has_focus: false,
+        },
+        composer: {
+          status: "degraded",
+          strategy: "structural_fallback",
+          selector: "[contenteditable='true'][role='textbox']",
+          visible_candidates: 1,
+          known_selector_candidates: 0,
+          structural_candidates: 1,
+          tag: "DIV",
+          role: "textbox",
+          contenteditable: true,
+          data_composer_markdown: false,
+          form_found: true,
+        },
+        send: {
+          status: "degraded",
+          strategy: "structural_fallback",
+          selector: "button[type='submit']",
+          visible_candidates: 1,
+          type: "submit",
+          disabled: false,
+          aria_disabled: false,
+          same_form_as_composer: true,
+        },
+        prompt: "TOP_SECRET_PROMPT_123",
+        response: "PRIVATE_RESPONSE",
+        wsToken: "FORBIDDEN_TOKEN",
+        Authorization: "Bearer SECRET",
+      };
+    };
+
+    const diagnosticPromise = new Promise((resolve) => {
+      const handled = mock.messageListeners.some((listener) =>
+        listener({ type: "diagnose_ui" }, {}, resolve),
+      );
+      assert.equal(handled, true);
+    });
+    const diagnostics = await diagnosticPromise;
+    assert.equal(contentMessage.tabId, inflightTab.id);
+    assert.equal(contentMessage.message.type, "dom_health");
+    assert.equal(diagnostics.tab_id, inflightTab.id);
+    assert.equal(diagnostics.composer.status, "degraded");
+    assert.equal(diagnostics.send.status, "degraded");
+    assert.equal(diagnostics.websocket_state, "disconnected");
+    assert.equal(mock.tabsById.get(activeTab.id).active, beforeActive);
+    assert.equal(mock.tabsById.get(inflightTab.id).active, beforeInflight);
+    const json = JSON.stringify(diagnostics);
+    for (const forbidden of [
+      "STORED_WS_TOKEN_SECRET",
+      "TOP_SECRET_PROMPT_123",
+      "PRIVATE_RESPONSE",
+      "FORBIDDEN_TOKEN",
+      "Bearer SECRET",
+      "wsToken",
+      "Authorization",
+      "prompt",
+      "response",
+    ]) {
+      assert.equal(json.toLowerCase().includes(forbidden.toLowerCase()), false, forbidden);
+    }
+  }
+
+  // 28. Contrat « pas de vol de focus » sur la source elle-même.
   {
     assert.doesNotMatch(BACKGROUND_SOURCE, /focused:\s*true/);
     assert.doesNotMatch(BACKGROUND_SOURCE, /chrome\.windows\.update/);

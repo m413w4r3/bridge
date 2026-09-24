@@ -42,11 +42,12 @@ function loadExtension(body, url = "https://chatgpt.com/") {
   window.CSS = window.CSS || {
     escape: (value) => String(value).replace(/["\\]/g, "\\$&"),
   };
+  const messageListeners = [];
   window.chrome = {
     storage: { local: { get: async () => ({}), set: async () => {} } },
     runtime: {
       sendMessage: async () => {},
-      onMessage: { addListener: () => {} },
+      onMessage: { addListener: (listener) => messageListeners.push(listener) },
     },
   };
 
@@ -108,6 +109,9 @@ function loadExtension(body, url = "https://chatgpt.com/") {
   return {
     window,
     run: (expression) => vm.runInContext(expression, context),
+    dispatch: (message) => new Promise((resolve) => {
+      for (const listener of messageListeners) listener(message, {}, resolve);
+    }),
     // Les objets nés dans le contexte vm ont un autre prototype : on les
     // recopie pour que deepEqual compare des valeurs, pas des realms.
     state: (expression) => ({ ...vm.runInContext(expression, context) }),
@@ -589,8 +593,8 @@ function useVirtualClock(window) {
     assert.ok(sent.some((message) => message.type === "done"));
     assert.equal(contractLog?.composer_strategy, "named_selector");
     assert.equal(contractLog?.composer_selector, "[data-composer-markdown][contenteditable='true'][role='textbox']");
-    assert.equal(contractLog?.send_selector, "button[type='submit']");
-    assert.equal(contractLog?.content_script_version, "34");
+    assert.equal(contractLog?.send_selector, "button[aria-label*='Send']");
+    assert.equal(contractLog?.content_script_version, "35");
     assert.equal(JSON.stringify(contractLog).includes("bonjour moderne"), false);
     assert.equal(submit, form.querySelector("button[type='submit']"));
   }
@@ -604,6 +608,112 @@ function useVirtualClock(window) {
     const { run } = loadExtension(unlabelled);
     assert.equal(run("resolveComposer().element.getAttribute('data-composer-markdown')"), "");
     assert.equal(run("resolveSendButton(resolveComposer().element).element.type"), "submit");
+  }
+
+  // DOM health is read-only and reports known selectors/fallbacks without page text.
+  {
+    const { window, dispatch } = loadExtension(
+      modernComposer,
+      "https://chatgpt.com/?temporary-chat=true",
+    );
+    const current = await dispatch({ type: "dom_health" });
+    assert.equal(current.ok, true);
+    assert.equal(current.content_script_version, "35");
+    assert.equal(current.surface.temporary_status, "ok");
+    assert.equal(current.composer.status, "ok");
+    assert.equal(current.send.status, "ok");
+
+    const old = await loadExtension(
+      `<form><textarea data-id="prompt"></textarea><button data-testid="send-button">Send</button></form>`,
+      "https://chatgpt.com/?temporary-chat=true",
+    ).dispatch({ type: "dom_health" });
+    assert.equal(old.composer.status, "ok", "un DOM historique garde un sélecteur connu");
+  }
+
+  // A unique structural composer and its unique form submit are DEGRADED, usable fallbacks.
+  {
+    const fallback = `<form>
+      <div contenteditable="true" role="textbox" aria-multiline="true" class="ProseMirror"></div>
+      <button type="submit">Send</button>
+    </form>`;
+    const { window, dispatch, run } = loadExtension(fallback, "https://chatgpt.com/?temporary-chat=true");
+    const health = await dispatch({ type: "dom_health" });
+    assert.equal(health.composer.status, "degraded");
+    assert.equal(health.composer.known_selector_candidates, 0);
+    assert.equal(health.composer.structural_candidates, 1);
+    assert.equal(health.send.status, "degraded");
+    assert.equal(health.send.same_form_as_composer, true);
+    assert.equal(run("resolveComposer().element !== null"), true);
+    assert.equal(run("resolveSendButton(resolveComposer().element).element !== null"), true);
+
+    useVirtualClock(window);
+    const sent = [];
+    const warnings = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    window.console.warn = (event, details) => warnings.push({ event, details: { ...details } });
+    const form = window.document.querySelector("form");
+    const composer = form.querySelector("[contenteditable='true']");
+    composer.addEventListener("paste", (event) => {
+      event.preventDefault();
+      composer.textContent = event.clipboardData.getData("text/plain");
+    });
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      composer.textContent = "";
+      window.document.body.insertAdjacentHTML("beforeend", `<article data-testid="conversation-turn-1">
+        <div data-message-author-role="assistant" data-message-id="fallback-turn">
+          <div class="markdown"><p>ok</p></div>
+        </div>${copyButton}</article>`);
+    });
+    await run(`handlePrompt({ id: "req-fallback", prompt: "hello fallback", conversation: { id: "conv-fallback", mode: "fresh" } })`);
+    assert.ok(sent.some((message) => message.type === "done"), "le fallback doit laisser le run réussir");
+    assert.equal(warnings.length, 2);
+    assert.deepEqual(warnings.map((warning) => warning.event), [
+      "bridge_dom_contract_degraded",
+      "bridge_dom_contract_degraded",
+    ]);
+    for (const warning of warnings) {
+      assert.deepEqual(Object.keys(warning.details).sort(), [
+        "candidate_count",
+        "component",
+        "content_script_version",
+        "selector",
+        "strategy",
+      ]);
+      assert.equal(warning.details.strategy, "structural_fallback");
+      assert.equal(JSON.stringify(warning).includes("hello fallback"), false);
+    }
+  }
+
+  // Multiple structural textboxes are explicitly ambiguous; missing Send is separate.
+  {
+    const ambiguous = `<div contenteditable="true" role="textbox" aria-multiline="true" class="ProseMirror"></div>
+      <div contenteditable="true" role="textbox" aria-multiline="true" class="ProseMirror"></div>`;
+    const ambiguousHealth = await loadExtension(ambiguous).dispatch({ type: "dom_health" });
+    assert.equal(ambiguousHealth.composer.status, "ambiguous");
+    assert.equal(ambiguousHealth.composer.visible_candidates, 2);
+
+    const noSend = `<form>${modernComposer.match(/<div[\s\S]*?<\/div>/)[0]}</form>`;
+    const missingSend = await loadExtension(noSend).dispatch({ type: "dom_health" });
+    assert.equal(missingSend.composer.status, "ok");
+    assert.equal(missingSend.send.status, "missing");
+  }
+
+  // Diagnostic JSON excludes composer contents, credential names, and authorization fields.
+  {
+    const { window, dispatch } = loadExtension(
+      modernComposer,
+      "https://chatgpt.com/?temporary-chat=true",
+    );
+    window.document.querySelector("[data-composer-markdown]").textContent = "TOP_SECRET_PROMPT_123";
+    window.chrome.storage.local.get = async () => ({ wsToken: "STORED_WS_TOKEN_SECRET" });
+    const diagnostics = await dispatch({ type: "dom_health" });
+    const json = JSON.stringify(diagnostics);
+    assert.equal(json.includes("TOP_SECRET_PROMPT_123"), false);
+    assert.equal(json.includes("STORED_WS_TOKEN_SECRET"), false);
+    for (const forbidden of ["wsToken", "Authorization", "prompt", "response"]) {
+      assert.equal(json.toLowerCase().includes(forbidden.toLowerCase()), false, forbidden);
+    }
   }
 
   // D. Plusieurs textboxes visibles sans signature unique sont ambigus :
@@ -659,7 +769,25 @@ function useVirtualClock(window) {
     assert.equal(error?.phase, "pre_submission");
     assert.equal(error?.submission_state, "pre_submission");
     assert.equal(error?.diagnostics?.ui_contract_error, "composer_missing");
+    assert.equal(error?.diagnostics?.dom_health?.composer?.status, "missing");
+    assert.equal(error?.diagnostics?.dom_health?.content_script_version, "35");
     assert.equal(sent.some((message) => message.type === "done"), false);
+  }
+
+  // Missing Send during a run returns the same safe DOM snapshot in BridgeError diagnostics.
+  {
+    const { window, run } = loadExtension(
+      `<form><div id="prompt-textarea" contenteditable="true"></div></form>`,
+      "https://chatgpt.com/?temporary-chat=true",
+    );
+    useVirtualClock(window);
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    await run(`handlePrompt({ id: "req-no-send", prompt: "", conversation: { id: "conv-no-send", mode: "fresh" } })`);
+    const error = sent.find((message) => message.type === "error");
+    assert.equal(error?.diagnostics?.ui_contract_error, "send_missing");
+    assert.equal(error?.diagnostics?.dom_health?.composer?.status, "ok");
+    assert.equal(error?.diagnostics?.dom_health?.send?.status, "missing");
   }
 
   // 1. URL Temporary + composer, sans toggle : le markup de l'UI n'est pas
@@ -1552,7 +1680,7 @@ const PLACEHOLDER_ID =
       "l'identité doit venir du nœud courant, pas du placeholder détaché",
     );
     assert.equal(done.metadata?.initial_turn_id, "stable-assistant-42");
-    assert.equal(done.metadata?.content_script_version, "34");
+    assert.equal(done.metadata?.content_script_version, "35");
   }
 
   // Même remplacement, mais l'UI reste bloquée « en streaming » : le candidat
@@ -2284,7 +2412,7 @@ async function runPromptInjection({ id, prompt, files = null }) {
     })()`);
     assert.equal(diagnostics.composer_was_non_empty, true);
     assert.equal(diagnostics.composer_still_has_text, true);
-    assert.equal(diagnostics.content_script_version, "34");
+    assert.equal(diagnostics.content_script_version, "35");
 
     // Le snapshot ne transporte plus le texte du composer, seulement un booléen.
     const snapshot = run(`captureSubmissionSnapshot(${SEL})`);

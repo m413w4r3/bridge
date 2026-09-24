@@ -1,106 +1,119 @@
 /**
- * Enregistreur de l'UI ChatGPT — capture le cycle complet d'une réponse.
+ * Safe structural recorder for deeper ChatGPT UI changes.
  *
- * MODE D'EMPLOI
- *   1. Ouvre la console (F12) sur chatgpt.com et colle tout ce fichier.
- *   2. Envoie un prompt à la main, de préférence un qui déclenche une phase de
- *      réflexion (« Thinking »), par exemple : « réfléchis bien : 17 * 23 ? ».
- *   3. Laisse la réponse se terminer, puis attends la ligne « ENREGISTREMENT
- *      TERMINÉ » (90 s max, ou tape __diagStop() pour couper avant).
- *   4. Copie tout le bloc final et transmets-le.
- *
- * Il ne journalise que les CHANGEMENTS d'état : la sortie reste courte.
+ * Paste this file into the DevTools console on chatgpt.com. It logs only
+ * selectors, element counts, and boolean state; it never reads page text.
  */
 (() => {
   const DUREE_MS = 90000;
   const PAS_MS = 400;
   const t0 = Date.now();
   const journal = [];
-
-  const attrs = (el) =>
-    `${el.tagName.toLowerCase()}[testid=${el.getAttribute("data-testid") || "-"}][label=${
-      el.getAttribute("aria-label") || "-"
-    }]${el.disabled ? "[disabled]" : ""}`;
-
   const SELECTEURS_COMPOSER = [
     "[data-composer-markdown][contenteditable='true'][role='textbox']",
     "#prompt-textarea",
     "[data-testid='prompt-textarea']",
     "div[contenteditable='true'][id^='prompt']",
     "textarea[data-id]",
-    "[contenteditable='true'][role='textbox']",
+  ];
+  const SELECTEUR_COMPOSER_STRUCTUREL = "[contenteditable='true'][role='textbox']";
+  const SELECTEURS_SEND = [
+    "button[data-testid='send-button']",
+    "#composer-submit-button",
+    "button[aria-label*='Envoyer']",
+    "button[aria-label*='Send']",
+  ];
+  const SELECTEURS_STREAMING = [
+    ".streaming-animation",
+    ".result-streaming",
+    "[data-is-streaming='true']",
   ];
 
-  function composerActuel() {
+  function visibles(selector) {
+    return [...document.querySelectorAll(selector)].filter((el) => {
+      if (!el.isConnected) return false;
+      const style = globalThis.getComputedStyle?.(el);
+      if (style?.display === "none" || style?.visibility === "hidden") return false;
+      return typeof el.getClientRects !== "function" || el.getClientRects().length > 0;
+    });
+  }
+
+  function inspecterComposer() {
     for (const selector of SELECTEURS_COMPOSER) {
-      const candidats = [...document.querySelectorAll(selector)].filter((el) => {
-        if (!el.isConnected) return false;
-        const style = globalThis.getComputedStyle?.(el);
-        if (style?.display === "none" || style?.visibility === "hidden") return false;
-        return typeof el.getClientRects !== "function" || el.getClientRects().length > 0;
-      });
-      if (candidats.length > 1) return null;
-      if (candidats.length === 1) return candidats[0];
+      const found = visibles(selector);
+      if (found.length > 1) return { element: null, status: "ambiguous", strategy: "named_selector", selector, count: found.length };
+      if (found.length === 1) return { element: found[0], status: "ok", strategy: "named_selector", selector, count: 1 };
     }
-    return null;
+    const found = visibles(SELECTEUR_COMPOSER_STRUCTUREL);
+    if (found.length > 1) return { element: null, status: "ambiguous", strategy: "structural_fallback", selector: SELECTEUR_COMPOSER_STRUCTUREL, count: found.length };
+    const element = found[0] || null;
+    const structurallySafe = element &&
+      (element.closest("form") || element.hasAttribute("data-composer-markdown")) &&
+      (element.hasAttribute("data-composer-markdown") ||
+        element.getAttribute("aria-multiline") === "true" ||
+        element.classList?.contains("ProseMirror") ||
+        Boolean(element.querySelector("p[data-placeholder]")));
+    return {
+      element: structurallySafe ? element : null,
+      status: structurallySafe ? "degraded" : "missing",
+      strategy: "structural_fallback",
+      selector: SELECTEUR_COMPOSER_STRUCTUREL,
+      count: structurallySafe ? 1 : 0,
+    };
   }
 
-  /** Boutons du composer : c'est parmi eux que vivent « envoyer » et « stop ». */
-  function boutonsComposer() {
-    const champ = composerActuel();
-    if (!champ) return "composer absent ou ambigu";
-    const zone = champ.closest("form") || champ.parentElement?.parentElement?.parentElement;
-    if (!zone) return "zone composer introuvable";
-    return [...zone.querySelectorAll("button")].map(attrs).join("  ") || "aucun bouton";
-  }
-
-  /** Indices de réflexion / streaming, quel que soit le nommage employé. */
-  function indices() {
-    const out = [];
-    for (const el of document.querySelectorAll("[data-testid]")) {
-      const id = el.getAttribute("data-testid");
-      if (/think|reason|thought|stream/i.test(id)) out.push(`testid=${id}`);
+  function inspecterSend(composer) {
+    const form = composer?.closest("form");
+    const root = form || document;
+    for (const selector of SELECTEURS_SEND) {
+      const found = visibles(selector).filter((el) => el.tagName === "BUTTON" && root.contains(el));
+      if (found.length > 1) return { status: "ambiguous", strategy: "named_selector", selector, count: found.length };
+      if (found.length === 1) return { status: "ok", strategy: "named_selector", selector, count: 1 };
     }
-    for (const el of document.querySelectorAll("[class*='stream'], [class*='thinking']")) {
-      const cls = [...el.classList].filter((c) => /stream|thinking/i.test(c)).join(".");
-      if (cls) out.push(`class=${cls}`);
-    }
-    return [...new Set(out)].join("  ") || "aucun";
+    const found = form
+      ? visibles("button[type='submit']").filter((el) => form.contains(el))
+      : [];
+    if (found.length > 1) return { status: "ambiguous", strategy: "structural_fallback", selector: "button[type='submit']", count: found.length };
+    if (found.length === 1) return { status: "degraded", strategy: "structural_fallback", selector: "button[type='submit']", count: 1 };
+    return { status: "missing", strategy: "structural_fallback", selector: "button[type='submit']", count: 0 };
   }
 
   function etat() {
-    const tours = document.querySelectorAll("[data-message-author-role='assistant']");
-    const tour = tours[tours.length - 1];
-    if (!tour) return { sig: "aucune réponse", detail: null };
-
-    const conteneur =
-      tour.closest("[data-testid^='conversation-turn']") || tour.closest("article") || tour.parentElement;
-    const blocs = [...tour.querySelectorAll(".markdown")];
-    const copie = conteneur ? conteneur.querySelector("[data-testid='copy-turn-action-button']") : null;
-
+    const assistants = document.querySelectorAll("[data-message-author-role='assistant']");
+    const dernier = assistants[assistants.length - 1] || null;
+    const tour = dernier?.closest("[data-testid^='conversation-turn']") || dernier?.closest("article") || dernier;
+    const composer = inspecterComposer();
+    const send = inspecterSend(composer.element);
+    const streaming = SELECTEURS_STREAMING.map((selector) => ({
+      selector,
+      count: visibles(selector).length,
+    }));
+    const buttons = composer.element
+      ? [...(composer.element.closest("form") || document).querySelectorAll("button")].map((button) => ({
+          type: ["button", "submit", "reset"].includes(button.type) ? button.type : "other",
+          disabled: Boolean(button.disabled),
+          aria_disabled: button.getAttribute("aria-disabled") === "true",
+        }))
+      : [];
     const detail = {
-      blocs: blocs.length,
-      // Pour chaque bloc : son ancêtre porteur d'un data-testid = le conteneur
-      // qui permettra de distinguer réflexion et réponse.
-      ancetres: blocs
-        .map((b, i) => {
-          const a = b.closest("[data-testid]");
-          return `#${i}<${a ? a.getAttribute("data-testid") : "-"}>${JSON.stringify(
-            b.innerText.slice(0, 40),
-          )}`;
-        })
-        .join("  "),
-      copie: copie ? "OUI" : "non",
-      conteneur: conteneur ? conteneur.getAttribute("data-testid") || conteneur.tagName : "-",
-      boutons: boutonsComposer(),
-      indices: indices(),
-      len: tour.innerText.length,
+      assistant_turn_count: assistants.length,
+      markdown_block_count: dernier?.querySelectorAll(".markdown").length || 0,
+      copy_action_present: Boolean(tour?.querySelector("[data-testid='copy-turn-action-button']")),
+      turn_container_tag: tour?.tagName || null,
+      composer: { status: composer.status, strategy: composer.strategy, selector: composer.selector, visible_candidates: composer.count },
+      send: { status: send.status, strategy: send.strategy, selector: send.selector, visible_candidates: send.count },
+      streaming,
+      buttons,
     };
-    // La longueur du texte est volontairement hors signature : sinon chaque
-    // caractère produirait une ligne de journal.
-    const sig = `${detail.blocs}|${detail.copie}|${detail.boutons}|${detail.indices}|${detail.ancetres}`;
-    return { sig, detail };
+    return { sig: JSON.stringify(detail), detail };
   }
+
+  const composerContract = inspecterComposer();
+  const sendContract = inspecterSend(composerContract.element);
+  console.log("DOM CONTRACT");
+  console.log("composer status:", composerContract.status);
+  console.log("send status:", sendContract.status);
+  console.log("matched strategy:", composerContract.strategy, "/", sendContract.strategy);
 
   let precedent = null;
   const timer = setInterval(() => {
@@ -108,8 +121,8 @@
     if (sig !== precedent) {
       precedent = sig;
       const s = ((Date.now() - t0) / 1000).toFixed(1).padStart(5);
-      journal.push({ t: s, ...(detail || {}) });
-      console.log(`[${s}s] ${detail ? JSON.stringify(detail, null, 1) : sig}`);
+      journal.push({ t: s, ...detail });
+      console.log(`[${s}s] ${JSON.stringify(detail, null, 1)}`);
     }
     if (Date.now() - t0 > DUREE_MS) fin();
   }, PAS_MS);
@@ -121,6 +134,6 @@
   }
   window.__diagStop = fin;
 
-  console.log("🔴 Enregistrement en cours. Envoie ton prompt maintenant.");
+  console.log("🔴 Enregistrement en cours. Envoie un prompt maintenant.");
   console.log("   (__diagStop() pour arrêter avant la fin des 90 s)");
 })();

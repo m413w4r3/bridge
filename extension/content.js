@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "34";
+const VERSION = "35";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -28,7 +28,6 @@ const SELECTORS = {
   send: [
     "button[data-testid='send-button']",
     "#composer-submit-button",
-    "button[type='submit']",
     "button[aria-label*='Envoyer']",
     "button[aria-label*='Send']",
   ],
@@ -281,6 +280,214 @@ function uiResolution(strategy, selector, candidateCount, element) {
   };
 }
 
+function visibleMatches(root, selector, predicate = () => true) {
+  return [...root.querySelectorAll(selector)].filter(
+    (el) => isVisibleElement(el) && predicate(el),
+  );
+}
+
+/** Inspect composer structure without reading any editable or rendered text. */
+function inspectComposer(root = document) {
+  const namedSelectors = SELECTORS.composer.filter(
+    (selector) => selector !== STRUCTURAL_COMPOSER_SELECTOR,
+  );
+  const knownElements = new Set();
+  for (const selector of namedSelectors) {
+    const candidates = visibleMatches(root, selector, isComposerElement);
+    for (const candidate of candidates) knownElements.add(candidate);
+    if (candidates.length > 1) {
+      return {
+        element: null,
+        status: "ambiguous",
+        strategy: "named_selector",
+        selector,
+        visible_candidates: candidates.length,
+        known_selector_candidates: knownElements.size,
+        structural_candidates: visibleMatches(root, STRUCTURAL_COMPOSER_SELECTOR).length,
+      };
+    }
+    if (candidates.length === 1) {
+      return {
+        element: candidates[0],
+        status: "ok",
+        strategy: "named_selector",
+        selector,
+        visible_candidates: candidates.length,
+        known_selector_candidates: knownElements.size,
+        structural_candidates: visibleMatches(root, STRUCTURAL_COMPOSER_SELECTOR).length,
+      };
+    }
+  }
+
+  const candidates = visibleMatches(root, STRUCTURAL_COMPOSER_SELECTOR);
+  const structural = {
+    element: null,
+    status: candidates.length > 1 ? "ambiguous" : "missing",
+    strategy: "structural_fallback",
+    selector: STRUCTURAL_COMPOSER_SELECTOR,
+    visible_candidates: candidates.length,
+    known_selector_candidates: knownElements.size,
+    structural_candidates: candidates.length,
+  };
+  if (candidates.length !== 1) return structural;
+
+  const candidate = candidates[0];
+  if (
+    (candidate.closest("form") || candidate.hasAttribute("data-composer-markdown")) &&
+    looksLikeStructuralComposer(candidate)
+  ) {
+    return { ...structural, element: candidate, status: "degraded" };
+  }
+  return { ...structural, visible_candidates: 0 };
+}
+
+/** Inspect Send in the exact composer form when one exists. */
+function inspectSendButton(composer, root = document) {
+  const form = composer?.closest("form") || null;
+  const searchRoot = form || root;
+  for (const selector of SELECTORS.send) {
+    const candidates = visibleMatches(
+      searchRoot,
+      selector,
+      (el) => el.tagName === "BUTTON",
+    );
+    if (candidates.length > 1) {
+      return {
+        element: null,
+        status: "ambiguous",
+        strategy: "named_selector",
+        selector,
+        visible_candidates: candidates.length,
+        same_form_as_composer: false,
+      };
+    }
+    if (candidates.length === 1) {
+      return {
+        element: candidates[0],
+        status: "ok",
+        strategy: "named_selector",
+        selector,
+        visible_candidates: 1,
+        same_form_as_composer: Boolean(form && candidates[0].closest("form") === form),
+      };
+    }
+  }
+
+  const candidates = form
+    ? visibleMatches(form, "button[type='submit']", (el) => el.tagName === "BUTTON")
+    : [];
+  if (candidates.length > 1) {
+    return {
+      element: null,
+      status: "ambiguous",
+      strategy: "structural_fallback",
+      selector: "button[type='submit']",
+      visible_candidates: candidates.length,
+      same_form_as_composer: false,
+    };
+  }
+  if (candidates.length === 1) {
+    return {
+      element: candidates[0],
+      status: "degraded",
+      strategy: "structural_fallback",
+      selector: "button[type='submit']",
+      visible_candidates: 1,
+      same_form_as_composer: candidates[0].closest("form") === form,
+    };
+  }
+  return {
+    element: null,
+    status: "missing",
+    strategy: "structural_fallback",
+    selector: "button[type='submit']",
+    visible_candidates: 0,
+    same_form_as_composer: false,
+  };
+}
+
+/** Bounded UI snapshot. This function deliberately never reads page text. */
+function domHealthSnapshot() {
+  let url = null;
+  try {
+    url = new URL(window.location.href);
+  } catch {
+    // A failed URL parse is represented by the fixed safe defaults below.
+  }
+  const originOk = Boolean(url && TEMPORARY_CHAT_ORIGINS.has(url.origin));
+  const pathname = typeof url?.pathname === "string" ? url.pathname.slice(0, 128) : "";
+  const temporaryQuery = url?.searchParams.get("temporary-chat") === "true";
+  const composer = inspectComposer();
+  const send = composer.element
+    ? inspectSendButton(composer.element)
+    : {
+        element: null,
+        status: "missing",
+        strategy: "structural_fallback",
+        selector: "button[type='submit']",
+        visible_candidates: 0,
+        same_form_as_composer: false,
+      };
+  const visibilityState = ["visible", "hidden", "prerender", "unloaded"].includes(
+    document.visibilityState,
+  )
+    ? document.visibilityState
+    : "unknown";
+
+  return {
+    ok: true,
+    content_script_version: VERSION,
+    surface: {
+      origin_ok: originOk,
+      pathname,
+      temporary_query: temporaryQuery,
+      temporary_status: originOk && pathname === "/" && temporaryQuery ? "ok" : "invalid",
+      visibility_state: visibilityState,
+      has_focus: Boolean(document.hasFocus?.()),
+    },
+    composer: {
+      status: composer.status,
+      strategy: composer.strategy,
+      selector: composer.selector,
+      visible_candidates: composer.visible_candidates,
+      known_selector_candidates: composer.known_selector_candidates,
+      structural_candidates: composer.structural_candidates,
+      tag: composer.element?.tagName || null,
+      role: composer.element?.getAttribute("role") === "textbox" ? "textbox" : null,
+      contenteditable: composer.element?.getAttribute("contenteditable") === "true",
+      data_composer_markdown: Boolean(
+        composer.element?.hasAttribute("data-composer-markdown"),
+      ),
+      form_found: Boolean(composer.element?.closest("form")),
+    },
+    send: {
+      status: send.status,
+      strategy: send.strategy,
+      selector: send.selector,
+      visible_candidates: send.visible_candidates,
+      type: send.element && ["button", "submit", "reset"].includes(send.element.type)
+        ? send.element.type
+        : send.element
+          ? "other"
+          : null,
+      disabled: Boolean(send.element?.disabled),
+      aria_disabled: send.element?.getAttribute("aria-disabled") === "true",
+      same_form_as_composer: send.same_form_as_composer,
+    },
+  };
+}
+
+function warnIfDegraded(component, resolution) {
+  if (resolution?.strategy !== "structural_fallback" || !resolution.element) return;
+  console.warn("bridge_dom_contract_degraded", {
+    component,
+    strategy: resolution.strategy,
+    selector: resolution.selector,
+    candidate_count: resolution.candidate_count,
+    content_script_version: VERSION,
+  });
+}
+
 function uiContractError(kind, resolution, message) {
   const error = new BridgeError("bridge_ui_timeout", message);
   error.diagnostics = {
@@ -298,57 +505,26 @@ function uiContractError(kind, resolution, message) {
         }),
     content_script_version: VERSION,
   };
+  error.diagnostics.dom_health = domHealthSnapshot();
   return error;
 }
 
 /** Resolve a unique, visible composer or report the UI contract ambiguity. */
 function resolveComposer(root = document) {
-  const namedSelectors = SELECTORS.composer.filter(
-    (selector) => selector !== STRUCTURAL_COMPOSER_SELECTOR,
-  );
-  for (const selector of namedSelectors) {
-    const candidates = [...root.querySelectorAll(selector)].filter(
-      (el) => isVisibleElement(el) && isComposerElement(el),
-    );
-    if (candidates.length > 1) {
-      const resolution = uiResolution("named_selector", selector, candidates.length);
-      throw uiContractError(
-        "ambiguous_composer",
-        resolution,
-        "plusieurs composers correspondent au même sélecteur",
-      );
-    }
-    if (candidates.length === 1) {
-      return uiResolution("named_selector", selector, candidates.length, candidates[0]);
-    }
-  }
-
-  const candidates = [...root.querySelectorAll(STRUCTURAL_COMPOSER_SELECTOR)].filter(
-    isVisibleElement,
-  );
+  const inspected = inspectComposer(root);
   const resolution = uiResolution(
-    "structural_fallback",
-    STRUCTURAL_COMPOSER_SELECTOR,
-    candidates.length,
+    inspected.strategy,
+    inspected.selector,
+    inspected.visible_candidates,
+    inspected.element,
   );
-  if (candidates.length > 1) {
+  if (inspected.status === "ambiguous") {
     throw uiContractError(
       "ambiguous_composer",
       resolution,
-      "plusieurs zones de texte peuvent être le composer",
-    );
-  }
-  const candidate = candidates[0];
-  if (
-    candidate &&
-    (candidate.closest("form") || candidate.hasAttribute("data-composer-markdown")) &&
-    looksLikeStructuralComposer(candidate)
-  ) {
-    return uiResolution(
-      "structural_fallback",
-      STRUCTURAL_COMPOSER_SELECTOR,
-      candidates.length,
-      candidate,
+      inspected.strategy === "named_selector"
+        ? "plusieurs composers correspondent au même sélecteur"
+        : "plusieurs zones de texte peuvent être le composer",
     );
   }
   return resolution;
@@ -356,52 +532,22 @@ function resolveComposer(root = document) {
 
 /** Resolve Send inside the composer's form whenever the form is available. */
 function resolveSendButton(composer, root = document) {
-  const form = composer?.closest("form");
-  const searchRoot = form || root;
-  for (const selector of SELECTORS.send) {
-    const candidates = [...searchRoot.querySelectorAll(selector)].filter(
-      (el) => isVisibleElement(el) && el.tagName === "BUTTON",
+  const inspected = inspectSendButton(composer, root);
+  if (inspected.status === "ambiguous") {
+    throw uiContractError(
+      "ambiguous_send_button",
+      uiResolution(inspected.strategy, inspected.selector, inspected.visible_candidates),
+      inspected.strategy === "named_selector"
+        ? "plusieurs boutons Send correspondent au même sélecteur"
+        : "plusieurs boutons submit sont présents dans le formulaire du composer",
     );
-    if (candidates.length > 1) {
-      const resolution = uiResolution("named_selector", selector, candidates.length);
-      throw uiContractError(
-        "ambiguous_send_button",
-        resolution,
-        "plusieurs boutons Send correspondent au même sélecteur",
-      );
-    }
-    if (candidates.length === 1) {
-      return uiResolution("named_selector", selector, candidates.length, candidates[0]);
-    }
   }
-
-  if (form) {
-    const candidates = [...form.querySelectorAll("button[type='submit']")].filter(
-      isVisibleElement,
-    );
-    if (candidates.length > 1) {
-      const resolution = uiResolution(
-        "structural_fallback",
-        "button[type='submit']",
-        candidates.length,
-      );
-      throw uiContractError(
-        "ambiguous_send_button",
-        resolution,
-        "plusieurs boutons submit sont présents dans le formulaire du composer",
-      );
-    }
-    if (candidates.length === 1) {
-      return uiResolution(
-        "structural_fallback",
-        "button[type='submit']",
-        candidates.length,
-        candidates[0],
-      );
-    }
-  }
-
-  return uiResolution("structural_fallback", "button[type='submit']", 0);
+  return uiResolution(
+    inspected.strategy,
+    inspected.selector,
+    inspected.visible_candidates,
+    inspected.element,
+  );
 }
 
 async function waitForComposer(timeout, label) {
@@ -2683,21 +2829,47 @@ async function handlePrompt({
     // Ce délai long n'ajoute aucune latence : `waitFor` rend la main dès que
     // Send devient utilisable.
     let sendResolution = null;
-    const resolvedSend = await waitFor(
-      () => {
-        composerResolution = resolveComposer();
-        if (!composerResolution.element) return null;
-        composer = composerResolution.element;
-        sendResolution = resolveSendButton(composer);
-        return isSendButtonReady(sendResolution.element) ? sendResolution : null;
-      },
-      waitsForUpload ? UPLOAD_TIMEOUT_MS : 8000,
-      waitsForUpload
-        ? "contenu collé ou pièce jointe non prêt pour l'envoi"
-        : "bouton d'envoi jamais actif",
-    );
+    let resolvedSend;
+    try {
+      resolvedSend = await waitFor(
+        () => {
+          composerResolution = resolveComposer();
+          if (!composerResolution.element) return null;
+          composer = composerResolution.element;
+          sendResolution = resolveSendButton(composer);
+          return isSendButtonReady(sendResolution.element) ? sendResolution : null;
+        },
+        waitsForUpload ? UPLOAD_TIMEOUT_MS : 8000,
+        waitsForUpload
+          ? "contenu collé ou pièce jointe non prêt pour l'envoi"
+          : "bouton d'envoi jamais actif",
+      );
+    } catch (error) {
+      if (error instanceof BridgeError) throw error;
+      if (!composerResolution.element) {
+        throw uiContractError(
+          "composer_missing",
+          composerResolution,
+          "composer introuvable pendant la préparation de l'envoi",
+        );
+      }
+      if (!sendResolution?.element) {
+        throw uiContractError(
+          "send_missing",
+          sendResolution || resolveSendButton(composer),
+          "bouton d'envoi introuvable",
+        );
+      }
+      throw uiContractError(
+        "send_not_ready",
+        sendResolution,
+        "bouton d'envoi jamais actif",
+      );
+    }
     sendResolution = resolvedSend;
     const sendBtn = sendResolution.element;
+    warnIfDegraded("composer", composerResolution);
+    warnIfDegraded("send", sendResolution);
     console.log("bridge_dom_contract", {
       composer_strategy: composerResolution.strategy,
       composer_selector: composerResolution.selector,
@@ -2959,6 +3131,10 @@ async function captureLaterResponse(msg) {
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg?.type === "dom_health") {
+    sendResponse(domHealthSnapshot());
+    return true;
+  }
   if (msg?.type === "ui_state" || msg?.type === "ui_control") {
     // Requête/réponse : le service worker attend la valeur, d'où le `return true`
     // sans acquittement immédiat (un seul `sendResponse` est autorisé).
