@@ -371,7 +371,9 @@ def test_stall_guards_require_several_real_observations() -> None:
 
     assert "const MIN_STALL_OBSERVATIONS = 3;" in content
     assert content.count("stableObservations >= MIN_STALL_OBSERVATIONS") == 2
-    assert "observationsSinceActivity >= MIN_STALL_OBSERVATIONS" in content
+    # Avant le premier ResponseRoot, 300 s sans mutation peuvent être une
+    # réflexion normale ; seule la borne totale serveur clôt cette attente.
+    assert "FIRST_ASSISTANT_ACTIVITY_STALL_MS" not in content
     # La sémantique v29 de `.streaming-animation` reste intacte.
     assert 'longRunningStreaming: [".streaming-animation"]' in content
-    assert "!longRunningStreamingSignalActive(signalSources)" in content
+    assert "activeSignalStallApplies(finalization.signal, signalSources)" in content

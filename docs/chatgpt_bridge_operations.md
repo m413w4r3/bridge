@@ -77,30 +77,29 @@ Reprendre aussi les deux secrets dans le `.env` de ce dépôt (`BRIDGE_API_KEY`,
 Timeouts de connexion et nombre de tentatives côté client relèvent de la
 configuration de chaque application cliente.
 
-### Quatre bornes indépendantes
+### Bornes indépendantes
 
 Elles ne se remplacent pas et ne doivent jamais être confondues :
 
-    watchdog avant le premier tour
-        ≠ tour surveillé avec `.streaming-animation` active
+    tour surveillé avec `.streaming-animation` active
         ≠ idle timeout serveur
         ≠ total timeout serveur
 
 1. **Idle timeout réseau/extension** — `BRIDGE_IDLE_TIMEOUT` (300 s). Silence
    total de l’extension côté serveur : plus aucun paquet, heartbeat compris. Un
    heartbeat le réarme, parce qu’il prouve que l’extension et l’onglet vivent.
-2. **Watchdog d’activité avant le premier tour assistant** — dans le content
-   script, `FIRST_ASSISTANT_ACTIVITY_STALL_MS` (300 s). Il mesure l’activité
-   *observable du DOM* : apparition, disparition, changement de signature ou
-   d’état d’un signal Stop/reasoning/streaming. Un signal apparu puis
-   strictement figé n’est **pas** de l’activité et n’en repousse pas l’échéance.
-   Un heartbeat ne peut donc jamais masquer indéfiniment une UI bloquée : le
-   heartbeat réarme la borne 1, jamais celle-ci. Cette borne reste volontairement
-   locale : « aucun tour assistant n’apparaît jamais » doit échouer en
-   `bridge_ui_timeout` sans attendre `BRIDGE_TOTAL_TIMEOUT`.
+2. **Attente du premier tour assistant** — aucun délai local lié à la stabilité
+   du DOM. Une réflexion réelle peut durer plus de 300 s sans mutation ni
+   signal reconnu, surtout après un changement de sélecteur. Le content script
+   continue ses heartbeats sans contenu ; la borne totale du serveur clôt une
+   attente qui ne produit jamais de réponse. Les ambiguïtés du contrat de
+   réponse gardent leurs propres délais de détection.
 3. **Garde-fous du tour assistant surveillé** — `FINALIZATION_STALL_MS` (45 s)
    quand l’UI ne se dit plus active, et `WATCHED_TURN_ACTIVE_SIGNAL_STALL_MS`
-   (300 s) quand elle se dit encore active alors que le texte ne bouge plus.
+   (300 s) pour les seuls signaux de streaming bornés
+   (`.result-streaming`, `[data-is-streaming='true']`). Un Stop visible ou un
+   raisonnement actif peut rester stable plusieurs minutes : il conserve le
+   run vivant jusqu’à la borne totale du serveur.
 
    **Exception `.streaming-animation`.** Quand ce détecteur-là est visible dans
    le périmètre du tour surveillé, la génération est active : le texte peut
@@ -113,9 +112,9 @@ Elles ne se remplacent pas et ne doivent jamais être confondues :
    resoumet rien. La borne dure redevient la borne 4.
 
    `.result-streaming` et `[data-is-streaming='true']` gardent leur sémantique
-   bornée : aucune preuve de production ne les montre longuement actifs sans
-   mutation. `assistant_actions` reste le signal final le plus fort et finalise
-   immédiatement, même si un signal d’activité est encore présent.
+   bornée lorsqu’ils sont le signal actif prioritaire. `assistant_actions`
+   reste le signal final le plus fort et finalise immédiatement, même si un
+   signal d’activité est encore présent.
 
    **Une réponse sans boutons d’actions reste finalisable.** La stabilité du
    texte ne conclut jamais pendant un signal actif, mais elle conclut *après*
@@ -129,8 +128,8 @@ Elles ne se remplacent pas et ne doivent jamais être confondues :
    worker) doit se donner une borne supérieure, pour parser et persister après.
 
 Aucune de ces bornes ne resoumet le prompt : elles terminent le run
-(`bridge_timeout` ou `bridge_ui_timeout`) et laissent la réconciliation
-explicite décider.
+(`bridge_idle_timeout`, `bridge_total_timeout` ou réponse incomplète à la
+finalisation) et laissent la réconciliation explicite décider.
 
 ### Autonomie en arrière-plan
 
@@ -212,7 +211,7 @@ Trois protections indépendantes, aucune ne pouvant conclure seule :
    problème d’observation.
 
 `MIN_STALL_OBSERVATIONS` (3) complète ces bornes : un verdict de « figé »
-(`finalization_stalled`, `active_signal_stalled`, watchdog du premier tour)
+(`finalization_stalled`, `active_signal_stalled`)
 exige désormais une durée longue **et** plusieurs observations réelles. Un seul
 réveil tardif n’est pas la preuve que la boucle n’a jamais conclu.
 
@@ -479,6 +478,16 @@ et modales ne peuvent pas devenir une conversation — le diagnostic réel a dé
 montré un `app-shell-header-context-menu-surface` qui ne doit jamais être pris
 pour une réponse.
 
+**Le message utilisateur moderne peut aussi être un `MarkdownRoot-`.** Après
+Send, son rendu peut être le premier root nouveau, sans attribut de rôle. Le
+locator compare alors ce root au texte fiable réellement mis dans le composer
+avant l'envoi et l'exclut, avec ses feuilles inline, du delta de réponse. La
+comparaison reste locale au run et n'apparaît dans aucun log ni heartbeat. Un
+assistant qui répéterait ce texte de façon indiscernable reste exclu : le
+bridge attend une réponse distincte ou atteint la borne totale, plutôt que de
+livrer le prompt comme une réponse. Les roots assistant suivants conservent
+leur identité par ordinal et signature après ce filtrage.
+
 Ce qu’est un root « nouveau » est strict, parce que React peut remonter tout
 le tour (nœud neuf, **tokens de classe neufs**) sans qu’aucune réponse n’ait
 été écrite : est frais un ResponseRoot dont le nœud est absent du baseline
@@ -604,7 +613,7 @@ Un signal ACTIVE qui reste allumé anormalement longtemps n’est jamais convert
 en FINAL par la durée seule : `WATCHED_TURN_ACTIVE_SIGNAL_STALL_MS` produit
 `incomplete/active_signal_stalled` (candidat joint, `blocking_signal` nommé),
 `FINALIZATION_STALL_MS` produit `incomplete/finalization_stalled`. L’exception
-`.streaming-animation` reste inchangée (cf. « Quatre bornes indépendantes »).
+`.streaming-animation` reste inchangée (cf. « Bornes indépendantes »).
 
 ### Sortie finale et identité de continuation
 
@@ -693,7 +702,7 @@ cycle de vie de la fenêtre, **jamais** l’absence de dépendance au premier pl
 1. `make up`, puis vérifier le pont : `make status`.
 2. Recharger l’extension dans Chrome et vérifier la version du content script :
    dans la console de l’onglet ChatGPT, la ligne
-   `🔌 ChatGPT Mini-Bridge : content script prêt — version 39`. Une version plus
+   `🔌 ChatGPT Mini-Bridge : content script prêt — version 40`. Une version plus
    ancienne signifie que Chrome sert encore le code précédent.
 3. Lancer une génération qui occupe ChatGPT **au moins 6 à 10 minutes**
    (recherche approfondie), sans effet de bord de production.

@@ -305,6 +305,49 @@ function observeModernComposer(window, onRender) {
     assert.equal(output.text.includes("ancienne"), false);
   }
 
+  // --- 5bis. Le prompt moderne est lui aussi un MarkdownRoot sans rôle ----- //
+  {
+    const prompt = "Consigne de planification confidentielle ".repeat(24);
+    const { window, run } = loadExtension(MODERN_PAGE);
+    const transcript = window.document.querySelector("#transcript");
+    window.__baseline = run("captureResponseBaseline()");
+    window.__isPrompt = run(`createSubmittedPromptMatcher(${JSON.stringify(prompt)})`);
+
+    transcript.innerHTML = answerRoot(inlineText(prompt), "User1");
+    assert.equal(
+      run("resolveResponseCandidate(globalThis.__baseline).status"),
+      "found",
+      "l'ancien locator confondait le prompt avec l'assistant",
+    );
+    let candidate = run(
+      "resolveResponseCandidate(globalThis.__baseline, document, globalThis.__isPrompt)",
+    );
+    assert.equal(candidate.status, "pending");
+    assert.equal(candidate.inline_leaf_count, 0, "les feuilles du prompt ne signalent pas une dérive");
+
+    transcript.insertAdjacentHTML("beforeend", answerRoot(inlineText("PLAN_FINAL"), "Assistant1"));
+    candidate = run(
+      "resolveResponseCandidate(globalThis.__baseline, document, globalThis.__isPrompt)",
+    );
+    assert.equal(candidate.status, "found");
+    assert.equal(run("readAnswer(resolveResponseContentRoot(resolveResponseCandidate(globalThis.__baseline, document, globalThis.__isPrompt)), false).text"), "PLAN_FINAL");
+    window.__locator = run(
+      "createResponseLocator(resolveResponseCandidate(globalThis.__baseline, document, globalThis.__isPrompt), globalThis.__baseline, document, globalThis.__isPrompt)",
+    );
+    assert.equal(
+      run("readAnswer(locateResponseCandidate(globalThis.__locator, globalThis.__baseline, document, globalThis.__isPrompt).element, false).text"),
+      "PLAN_FINAL",
+    );
+
+    // Un re-rendu React du message utilisateur ne doit jamais décaler le
+    // locator de l'assistant vers l'écho du prompt.
+    transcript.firstElementChild.outerHTML = answerRoot(inlineText(prompt), "User2");
+    assert.equal(
+      run("readAnswer(locateResponseCandidate(globalThis.__locator, globalThis.__baseline, document, globalThis.__isPrompt).element, false).text"),
+      "PLAN_FINAL",
+    );
+  }
+
   // --- 6. Ambiguïté : deux nouveaux roots -> fail closed ------------------- //
   {
     const { window, run } = loadExtension(`<main><div id="transcript"></div></main>`);
@@ -407,7 +450,7 @@ function observeModernComposer(window, onRender) {
     );
     const health = await dispatch({ type: "dom_health" });
     assert.equal(health.ok, true);
-    assert.equal(health.content_script_version, "39");
+    assert.equal(health.content_script_version, "40");
     assert.deepEqual(Object.keys(health.response_locator).sort(), [
       "ambiguity_count",
       "baseline_root_count",
@@ -449,7 +492,7 @@ function observeModernComposer(window, onRender) {
     );
     const structure = await dispatch({ type: "response_structure" });
     assert.equal(structure.ok, true);
-    assert.equal(structure.content_script_version, "39");
+    assert.equal(structure.content_script_version, "40");
     assert.equal(structure.conversation_surface.found, true);
     assert.equal(structure.conversation_surface.strategy, "composer_main");
     assert.equal(structure.strategy, "markdown_root_delta");
@@ -519,7 +562,7 @@ function observeModernComposer(window, onRender) {
     assert.equal(answers[0].text, "BRIDGE_OK");
     assert.equal(answers[0].submission_state, "post_submission");
     assert.equal(answers[0].metadata.output_chars, "BRIDGE_OK".length);
-    assert.equal(answers[0].metadata.content_script_version, "39");
+    assert.equal(answers[0].metadata.content_script_version, "40");
     // Ce test demande une conversation Bridge réutilisable : la finale reste
     // visible, mais elle ne peut pas devenir `done` sans identité externe.
     assert.equal(answers[0].type, "incomplete");
@@ -546,8 +589,44 @@ function observeModernComposer(window, onRender) {
     assert.equal(locatorLogs[0].current_root_count, 1);
     assert.equal(locatorLogs[0].inline_leaf_count, 1);
     assert.equal(locatorLogs[0].ambiguity_count, 0);
-    assert.equal(locatorLogs[0].version, "39");
+    assert.equal(locatorLogs[0].version, "40");
     assert.equal(JSON.stringify(locatorLogs).includes("BRIDGE_OK"), false);
+  }
+
+  // --- 11bis. Le MarkdownRoot utilisateur précède la réponse assistant ---- //
+  {
+    const prompt = "PLAN_PROMPT_PRIVE ".repeat(40);
+    const { window, run } = loadExtension(MODERN_PAGE);
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    window.console.log = () => {};
+    const transcript = window.document.querySelector("#transcript");
+    const form = window.document.querySelector("#composer-form");
+    let clock = 0;
+    let rendered = false;
+    window.Date.now = () => clock;
+    window.setTimeout = (fn, ms) => {
+      clock += ms || 0;
+      if (!rendered && clock >= 30_500) {
+        rendered = true;
+        form.querySelector("[data-testid='stop-button']")?.remove();
+        transcript.insertAdjacentHTML("beforeend", answerRoot(inlineText("PLAN_FINAL"), "Assistant1"));
+      }
+      queueMicrotask(fn);
+      return 0;
+    };
+    const observed = observeModernComposer(window, (surface) => {
+      surface.innerHTML = answerRoot(inlineText(prompt), "User1");
+      form.insertAdjacentHTML("beforeend", `<button data-testid="stop-button">Stop</button>`);
+    });
+
+    await run(`handlePrompt({ id: "req-user-root-first", prompt: ${JSON.stringify(prompt)}, conversation: { id: "conv-user-root-first", mode: "fresh" } })`);
+
+    assert.equal(observed.submitEvents, 1);
+    assert.ok(clock >= 30_500);
+    assert.equal(sent.filter((message) => message.type === "error").length, 0);
+    assert.equal(sent.find((message) => message.type === "done")?.text, "PLAN_FINAL");
+    assert.equal(sent.some((message) => JSON.stringify(message).includes(prompt)), false);
   }
 
   // --- 12. Remplacement React pendant le run : une seule réponse ---------- //
@@ -640,7 +719,7 @@ function observeModernComposer(window, onRender) {
     assert.equal(details.current_root_count, 2);
     assert.equal(details.conversation_surface_found, true);
     assert.equal(details.submission_state, "post_submission");
-    assert.equal(details.content_script_version, "39");
+    assert.equal(details.content_script_version, "40");
     assert.deepEqual([...details.response_root_strategies], ["markdown_root_delta"]);
     assert.ok(
       clockOf() >= run("RESPONSE_AMBIGUITY_HOLD_MS"),
@@ -693,7 +772,7 @@ function observeModernComposer(window, onRender) {
     assert.equal(details.conversation_surface_found, true);
     assert.deepEqual([...details.response_root_strategies], []);
     assert.equal(details.submission_state, "post_submission");
-    assert.equal(details.content_script_version, "39");
+    assert.equal(details.content_script_version, "40");
     assert.ok(
       clockOf() >= run("RESPONSE_CONTRACT_DRIFT_MS"),
       "la dérive se conclut dans une fenêtre bornée",

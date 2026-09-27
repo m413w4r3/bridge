@@ -389,8 +389,9 @@ async function main() {
 
     assert.equal(run("socket"), null);
     assert.equal(run("status.connected"), false);
-    assert.equal(run("suppressUntil - Date.now()"), 60000);
-    assert.equal(timer.delay, 60000);
+    const remaining = run("suppressUntil - Date.now()");
+    assert.ok(remaining > 59900 && remaining <= 60000);
+    assert.ok(timer.delay > 59900 && timer.delay <= 60000);
     run("send({ type: 'queued-during-suppression' })");
     assert.deepEqual(
       JSON.parse(JSON.stringify(run("enAttente"))),
@@ -408,8 +409,10 @@ async function main() {
     openFakeSocket(socket, WebSocket);
     socket.readyState = WebSocket.CLOSED;
     socket.onclose({ code: 4409, reason: "owner_active" });
-    assert.equal(run("suppressUntil - Date.now()"), 60000);
-    assert.equal([...timers.pending.values()][0].delay, 60000);
+    const remaining = run("suppressUntil - Date.now()");
+    assert.ok(remaining > 59900 && remaining <= 60000);
+    const delay = [...timers.pending.values()][0].delay;
+    assert.ok(delay > 59900 && delay <= 60000);
   }
 
   // WebSocket race matrix, from the worker's point of view. Every state is
@@ -504,7 +507,10 @@ async function main() {
         assert.equal(connection(run).conflict_reason, "owner_active");
         assert.equal(timers.pending.size, 1, "exactly one pending retry");
         const [[timerId, timer]] = [...timers.pending.entries()];
-        assert.equal(timer.delay, 60000, "retry honours the owner_active backoff");
+        assert.ok(
+          timer.delay > 59900 && timer.delay <= 60000,
+          "retry honours the owner_active backoff",
+        );
         run("suppressUntil = 0"); // the 60 s have elapsed
         timers.fire(timerId);
         await new Promise((resolve) => setImmediate(resolve));

@@ -481,6 +481,41 @@ function recoverFencedCode(markdown) {
   process.exit(1);
 });
 
+// Régression réelle du 26/09 : 76 689 caractères visibles, Stop encore
+// présent, 300 131 ms de texte stable, puis ChatGPT a continué à répondre.
+(async () => {
+  const { window, run } = loadExtension(page({ composerStop: true }));
+  let clock = 1_000_000;
+  let completedAfter = null;
+  let observations = 0;
+  window.Date.now = () => clock;
+  window.setTimeout = (fn, ms) => {
+    clock += ms || 0;
+    observations += 1;
+    if (observations > 20_000) throw new Error("attente non bornée dans le test");
+    if (completedAfter === null && clock >= 1_360_000) {
+      completedAfter = clock;
+      window.document.querySelector("[data-testid='stop-button']").remove();
+      window.document.querySelector("[data-testid='conversation-turn-3']")
+        .insertAdjacentHTML("beforeend", copyButton);
+    }
+    queueMicrotask(fn);
+    return 0;
+  };
+  window.testJob = { id: "long-stop", aborted: false };
+  const result = await run(`streamAnswer(testJob, { kind: "semantic_assistant", strategy: "semantic_assistant", turn_locator: "conversation-turn-3", baseline_count: 1 }, null)`);
+  assert.ok(completedAfter >= 1_360_000);
+  assert.equal(result.incomplete, undefined);
+  assert.equal(result.text, "réponse finale");
+  assert.equal(result.completion_signal, "assistant_actions");
+  assert.equal(run(`activeSignalStallApplies("stop_button", [])`), false);
+  assert.equal(run(`activeSignalStallApplies("reasoning", [])`), false);
+  assert.equal(run(`activeSignalStallApplies("streaming", [])`), true);
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+
 // --------------------------------------------------------------------------- //
 // Temporary Chat : confirmation positive avant Send, jamais best-effort ; et
 // identité du tour précédent pour CONTINUE, jamais par index/comptage.
@@ -584,7 +619,7 @@ function useVirtualClock(window) {
     assert.equal(contractLog?.composer_strategy, "named_selector");
     assert.equal(contractLog?.composer_selector, "[data-composer-markdown][contenteditable='true'][role='textbox']");
     assert.equal(contractLog?.send_selector, "button[aria-label*='Send']");
-    assert.equal(contractLog?.content_script_version, "39");
+    assert.equal(contractLog?.content_script_version, "40");
     assert.equal(JSON.stringify(contractLog).includes("bonjour moderne"), false);
     assert.equal(submit, form.querySelector("button[type='submit']"));
   }
@@ -608,7 +643,7 @@ function useVirtualClock(window) {
     );
     const current = await dispatch({ type: "dom_health" });
     assert.equal(current.ok, true);
-    assert.equal(current.content_script_version, "39");
+    assert.equal(current.content_script_version, "40");
     assert.equal(current.surface.temporary_status, "ok");
     assert.equal(current.composer.status, "ok");
     assert.equal(current.send.status, "ok");
@@ -904,7 +939,7 @@ function useVirtualClock(window) {
     assert.equal(error?.submission_state, "pre_submission");
     assert.equal(error?.diagnostics?.ui_contract_error, "composer_missing");
     assert.equal(error?.diagnostics?.dom_health?.composer?.status, "missing");
-    assert.equal(error?.diagnostics?.dom_health?.content_script_version, "39");
+    assert.equal(error?.diagnostics?.dom_health?.content_script_version, "40");
     assert.equal(sent.some((message) => message.type === "done"), false);
   }
 
@@ -928,7 +963,7 @@ function useVirtualClock(window) {
     assert.equal(error?.diagnostics?.send_status, "missing");
     assert.equal(error?.diagnostics?.send_candidates, 0);
     assert.equal(error?.diagnostics?.form_found, true);
-    assert.equal(error?.diagnostics?.content_script_version, "39");
+    assert.equal(error?.diagnostics?.content_script_version, "40");
     assert.equal(JSON.stringify(error).includes("hello"), false);
   }
 
@@ -1229,40 +1264,8 @@ function useVirtualClock(window) {
     assert.equal(sent.find((message) => message.type === "error")?.submission_state, "pre_submission");
   }
 
-  // 10d. Une soumission confirmée puis une panne de génération est post_submission.
-  {
-    const body = `<form id="composer-form"><textarea data-id="prompt"></textarea>
-      <button aria-disabled="false" id="composer-submit-button" aria-label="Send prompt" data-testid="send-button">Send</button></form>`;
-    const { window, run } = loadExtension(body, "https://chatgpt.com/?temporary-chat=true");
-    useVirtualClock(window);
-    const sent = [];
-    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
-    let submitEvents = 0;
-    window.document.querySelector("#composer-form").addEventListener("submit", (event) => {
-      submitEvents += 1;
-      event.preventDefault();
-      window.document.querySelector("textarea[data-id='prompt']").value = "";
-    });
-    await run(`handlePrompt({ id: "req-post", prompt: "bonjour", conversation: { id: "conv-A", mode: "fresh" } })`);
-    assert.equal(submitEvents, 1);
-    const error = sent.find((message) => message.type === "error");
-    assert.equal(error?.code, "bridge_ui_timeout");
-    assert.equal(error?.phase, "generation");
-    assert.equal(error?.submission_state, "post_submission");
-    assert.equal(error?.diagnostics?.composer_has_text, false);
-    assert.equal(error?.diagnostics?.streaming_generation_signal_visible, false);
-    assert.equal(error?.diagnostics?.assistant_turns_before, 0);
-    assert.equal(error?.diagnostics?.assistant_turns_after, 0);
-    assert.equal(
-      JSON.stringify(error).includes("bonjour"),
-      false,
-      "les diagnostics de stall ne doivent pas contenir le prompt",
-    );
-  }
-
-  // 10e. Le premier tour peut apparaître après plus de 30 s : une activité de
-  // génération post-soumission garde l'attente en vie, les heartbeats restent
-  // sans contenu, puis le même envoi aboutit sans second trigger.
+  // 10e. Le premier tour peut apparaître après plus de 30 s : les heartbeats
+  // restent sans contenu, puis le même envoi aboutit sans second trigger.
   {
     const body = `<form id="composer-form"><textarea data-id="prompt"></textarea>
       <button aria-disabled="false" data-testid="send-button">Send</button></form>`;
@@ -1327,46 +1330,8 @@ function useVirtualClock(window) {
     );
   }
 
-  // 10f. Les signaux Stop/reasoning/streaming déjà présents avant l'envoi ne
-  // prolongent pas artificiellement l'attente d'un nouveau tour assistant.
-  {
-    const body = `<article data-testid="conversation-turn-stale">
-        <div data-message-author-role="assistant" data-message-id="msg-stale">
-          <div class="markdown"><p>ancienne réponse</p></div>
-          <div class="result-streaming"></div>
-        </div>
-      </article>
-      <details data-testid="reasoning" open><summary>Reasoning</summary></details>
-      <form id="composer-form"><textarea data-id="prompt"></textarea>
-        <button data-testid="stop-button" aria-label="Stop streaming">Stop</button>
-        <button aria-disabled="false" data-testid="send-button">Send</button></form>`;
-    const { window, run } = loadExtension(body, "https://chatgpt.com/?temporary-chat=true");
-    useVirtualClock(window);
-    const sent = [];
-    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
-    let submitEvents = 0;
-    window.document.querySelector("#composer-form").addEventListener("submit", (event) => {
-      submitEvents += 1;
-      event.preventDefault();
-      window.document.querySelector("textarea[data-id='prompt']").value = "";
-    });
-
-    await run(`handlePrompt({ id: "req-stale-signals", prompt: "recherche", conversation: { id: "conv-stale", mode: "fresh" } })`);
-
-    const error = sent.find((message) => message.type === "error");
-    assert.equal(submitEvents, 1, "un signal DOM périmé ne doit jamais provoquer un second envoi");
-    assert.equal(error?.code, "bridge_ui_timeout");
-    assert.equal(error?.phase, "generation");
-    assert.equal(error?.submission_state, "post_submission");
-    assert.equal(error?.diagnostics?.assistant_turns_before, 1);
-    assert.equal(error?.diagnostics?.assistant_turns_after, 1);
-    assert.equal(error?.diagnostics?.stop_visible, true);
-    assert.equal(error?.diagnostics?.reasoning_visible, true);
-    assert.equal(error?.diagnostics?.streaming_generation_signal_visible, true);
-  }
-
   // 10g. `generationSignalTransition` distingue les six cas observables. Une
-  // persistance stricte n'est jamais de l'activité.
+  // persistance stricte n'est jamais une nouvelle preuve de soumission.
   {
     const { window, run } = loadExtension(
       `<div id="host"><div class="result-streaming" id="s1"></div></div>`,
@@ -1411,71 +1376,73 @@ function useVirtualClock(window) {
     assert.equal(run(`generationSignalTransition(__g, __h)`), null);
   }
 
-  // 10h. Un signal de génération qui apparaît APRÈS Send puis reste
-  // parfaitement figé ne doit pas rafraîchir l'activité à chaque poll :
-  // l'attente doit finir en bridge_ui_timeout borné.
-  {
-    const body = `<form id="composer-form"><textarea data-id="prompt"></textarea>
+  // 10h. Une réflexion silencieuse de plus de 300 s, avec ou sans signal
+  // reconnu, doit attendre le premier vrai tour. Ce scénario échouait avec
+  // FIRST_ASSISTANT_ACTIVITY_STALL_MS : bridge_ui_timeout à 300 s.
+  for (const signal of ["none", "frozen", "stale"]) {
+    const stale = signal === "stale"
+      ? `<article data-testid="conversation-turn-stale">
+           <div data-message-author-role="assistant" data-message-id="msg-stale">
+             <div class="markdown"><p>ancienne réponse</p></div>
+             <div class="result-streaming"></div>
+           </div>
+         </article>`
+      : "";
+    const body = `${stale}<form id="composer-form"><textarea data-id="prompt"></textarea>
       <button aria-disabled="false" data-testid="send-button">Send</button></form>`;
     const { window, run } = loadExtension(body, "https://chatgpt.com/?temporary-chat=true");
     const sent = [];
     window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
     let clock = 0;
     let polls = 0;
+    let assistantAdded = false;
     window.Date.now = () => clock;
     window.setTimeout = (fn, ms) => {
       clock += ms || 0;
       polls += 1;
-      if (polls > 20_000) {
-        throw new Error(
-          "le watchdog n'a jamais conclu : un signal figé maintient l'attente en vie",
+      if (polls > 20_000) throw new Error("attente sans réponse non bornée dans le test");
+      if (!assistantAdded && clock >= 360_000) {
+        assistantAdded = true;
+        window.document.body.insertAdjacentHTML(
+          "beforeend",
+          `<article data-testid="conversation-turn-final">
+            <div data-message-author-role="assistant" data-message-id="msg-final">
+              <div class="markdown"><p>réponse après réflexion</p></div>
+            </div>${copyButton}
+          </article>`,
         );
       }
       queueMicrotask(fn);
       return 0;
     };
     let submitEvents = 0;
-    let sendClicks = 0;
-    window.document.querySelector("button[data-testid='send-button']").addEventListener("click", () => { sendClicks += 1; });
     window.document.querySelector("#composer-form").addEventListener("submit", (event) => {
       submitEvents += 1;
       event.preventDefault();
       window.document.querySelector("textarea[data-id='prompt']").value = "";
-      // Apparaît une fois, puis plus jamais aucune mutation.
-      window.document.body.insertAdjacentHTML(
-        "beforeend",
-        `<div class="result-streaming" data-frozen="true"></div>`,
-      );
+      if (signal === "frozen") {
+        window.document.body.insertAdjacentHTML(
+          "beforeend",
+          `<div class="result-streaming" data-frozen="true"></div>`,
+        );
+      }
     });
 
-    await run(`handlePrompt({ id: "req-frozen-signal", prompt: "recherche figée", conversation: { id: "conv-frozen", mode: "fresh" } })`);
+    await run(`handlePrompt({ id: "req-silent-${signal}", prompt: "recherche longue", conversation: { id: "conv-silent-${signal}", mode: "fresh" } })`);
 
-    const error = sent.find((message) => message.type === "error");
-    assert.equal(error?.code, "bridge_ui_timeout");
-    assert.equal(error?.phase, "generation");
-    assert.equal(error?.submission_state, "post_submission");
-    assert.equal(error?.diagnostics?.streaming_generation_signal_visible, true);
-    assert.equal(error?.diagnostics?.assistant_turns_after, 0);
-    assert.equal(submitEvents, 1, "aucune resoumission après un stall figé");
-    assert.equal(sendClicks, 0);
-    assert.ok(
-      clock >= 300_000,
-      `le stall ne doit pas être prématuré (clock=${clock})`,
-    );
-    assert.ok(
-      clock < 400_000,
-      `le stall doit rester borné par FIRST_ASSISTANT_ACTIVITY_STALL_MS (clock=${clock})`,
-    );
-    assert.equal(
-      JSON.stringify(sent).includes("recherche figée"),
-      false,
-      "ni heartbeat ni diagnostics ne doivent contenir le prompt",
-    );
+    assert.ok(clock >= 360_000, `${signal}: réponse attendue après 300 s`);
+    assert.equal(submitEvents, 1, `${signal}: un seul envoi`);
+    assert.equal(sent.filter((message) => message.type === "error").length, 0);
+    assert.equal(sent.find((message) => message.type === "done")?.text, "réponse après réflexion");
+    const heartbeats = sent.filter((message) => message.type === "heartbeat");
+    assert.ok(heartbeats.length >= 5, `${signal}: heartbeats pendant la réflexion`);
+    assert.ok(heartbeats.every((message) => message.progress?.output_chars === 0));
+    assert.equal(JSON.stringify(heartbeats).includes("recherche longue"), false);
+    assert.equal(JSON.stringify(heartbeats).includes("réponse après réflexion"), false);
   }
 
-  // 10i. Une vraie activité prolongée (signature qui change réellement) garde
-  // le watchdog vivant bien au-delà de FIRST_ASSISTANT_ACTIVITY_STALL_MS, puis le tour
-  // assistant arrive et la finalisation se poursuit normalement.
+  // 10i. Une vraie activité prolongée précède le tour assistant, puis la
+  // finalisation se poursuit normalement.
   {
     const body = `<form id="composer-form"><textarea data-id="prompt"></textarea>
       <button aria-disabled="false" data-testid="send-button">Send</button></form>`;
@@ -1822,7 +1789,7 @@ const PLACEHOLDER_ID =
       "l'identité doit venir du nœud courant, pas du placeholder détaché",
     );
     assert.equal(done.metadata?.initial_turn_id, "stable-assistant-42");
-    assert.equal(done.metadata?.content_script_version, "39");
+    assert.equal(done.metadata?.content_script_version, "40");
   }
 
   // Même remplacement, mais l'UI reste bloquée « en streaming » : le candidat
@@ -2554,7 +2521,7 @@ async function runPromptInjection({ id, prompt, files = null }) {
     })()`);
     assert.equal(diagnostics.composer_was_non_empty, true);
     assert.equal(diagnostics.composer_still_has_text, true);
-    assert.equal(diagnostics.content_script_version, "39");
+    assert.equal(diagnostics.content_script_version, "40");
 
     // Le snapshot ne transporte plus le texte du composer, seulement un booléen.
     const snapshot = run(`captureSubmissionSnapshot(${SEL})`);

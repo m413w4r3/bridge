@@ -179,9 +179,14 @@ assert.equal(finalReport.includes("A\n\n## SUBJECT S2\nB"), false);
 // nombre choisi par le popup.
 const threshold = (fields) => finalizationThresholdMs({ thresholds, ...fields });
 assert.equal(
-  threshold({ state: "active", outputChars: 120 }),
+  threshold({ state: "active", outputChars: 120, activeStallEnabled: true }),
   300_000,
-  "ACTIVE sort au bout de `active_signal_stall_ms`",
+  "un streaming borné sort au bout de `active_signal_stall_ms`",
+);
+assert.equal(
+  threshold({ state: "active", outputChars: 120, activeStallEnabled: false }),
+  null,
+  "Stop et reasoning n'ont pas de borne locale de stabilité",
 );
 assert.equal(
   outcome({ state: "active", stableForMs: 300_000, stableObservations: 5 }),

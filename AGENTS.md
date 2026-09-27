@@ -92,7 +92,7 @@ response text can never change what conversation is opened or closed.
   during deep research. The content script keeps observing and beating; only
   `bridge_total_timeout` bounds the duration. `.result-streaming` and
   `[data-is-streaming='true']` keep their bounded `active_signal_stalled`
-  guard. See "Quatre bornes indépendantes" in
+  guard. See "Bornes indépendantes" in
   `docs/chatgpt_bridge_operations.md`.
 - **finalization is an explicit state machine** (ACTIVE / QUIESCENT / FINAL):
   the historical Copy/action bar is a high-confidence terminal signal but is no
@@ -113,7 +113,11 @@ response text can never change what conversation is opened or closed.
   starts with `MarkdownRoot-` (`markdown_root_delta`). The candidate is the
   structural surplus measured against `captureResponseBaseline()` taken just
   before the single Send, inside the composer-linked conversation surface;
-  a root React re-created *inside* the baseline envelope is still the old
+  the current UI can render the submitted user prompt as a role-less
+  `MarkdownRoot-`, so its content is compared locally with the trusted text
+  actually submitted in the composer and excluded from the candidate delta;
+  neither the prompt nor the comparison result is logged or sent in a heartbeat.
+  A root React re-created *inside* the baseline envelope is still the old
   turn — even with fresh class tokens — never the new answer.
   "the last MarkdownRoot in the page" is never an answer, `inline-markdown`
   leaves are only evidence of conversational content. Two simultaneous new

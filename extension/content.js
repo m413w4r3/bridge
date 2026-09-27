@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "39";
+const VERSION = "40";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -221,24 +221,11 @@ const MIN_STALL_OBSERVATIONS = 3;
 // de SETTLE_UNKNOWN_MS sans plusieurs observations réelles ne conclut rien.
 const MIN_QUIESCENT_OBSERVATIONS = 3;
 
-// Deux garde-fous distincts, longtemps confondus sous un même nom.
-//
-// 1) AVANT le premier tour assistant : rien n'est encore observable côté
-//    réponse, seule l'activité des signaux de génération dit que quelque chose
-//    se passe. Une UI totalement figée après Send doit échouer de façon bornée,
-//    sans attendre la borne totale du serveur.
-const FIRST_ASSISTANT_ACTIVITY_STALL_MS = 300000;
-
-// 2) APRÈS le premier tour assistant : l'UI se prétend encore active
-//    (`finished=false`, donc le garde-fou de finalisation ci-dessus est
-//    désarmé) alors que la réponse n'a plus bougé d'un caractère. On ne conclut
-//    pas « terminé » — un Stop réellement visible peut signifier que ChatGPT
-//    travaille — mais on rend la main en `incomplete` plutôt que de rester
-//    « running » indéfiniment.
-//    Exception : cf. `longRunningStreamingSignalActive()` — quand
-//    `.streaming-animation` est visible dans le tour surveillé, la stabilité du
-//    texte n'est PAS une preuve d'échec et ce garde-fou est désarmé ; la borne
-//    dure redevient alors le `bridge_total_timeout` du serveur.
+// Après le premier tour assistant, seuls `.result-streaming` et
+// `[data-is-streaming='true']` gardent un garde-fou local de stabilité.
+// Stop et reasoning peuvent rester visibles pendant une réflexion longue ;
+// `.streaming-animation` a la même sémantique prouvée en production. Pour ces
+// signaux, la borne dure est le `bridge_total_timeout` du serveur.
 const WATCHED_TURN_ACTIVE_SIGNAL_STALL_MS = 300000;
 
 // Le contrat de réponse (ResponseRoot) a ses propres bornes, distinctes de
@@ -248,7 +235,7 @@ const WATCHED_TURN_ACTIVE_SIGNAL_STALL_MS = 300000;
 //     visibles alors qu'AUCUN ResponseRoot n'est résolvable. C'est la
 //     signature exacte d'un nouveau changement d'UI : au-delà de cette
 //     fenêtre bornée, on échoue en `bridge_response_contract_drift` — la borne
-//     d'activité de 300 s, elle, ne dit rien de la structure.
+//     d'activité locale, elle, ne dit rien de la structure.
 //   - `RESPONSE_AMBIGUITY_HOLD_MS` : deux ResponseRoots nouveaux simultanés.
 //     React peut monter deux nœuds le temps d'une frame ; l'ambiguïté doit
 //     persister avant de conclure. Aucun choix arbitraire n'est jamais fait.
@@ -605,6 +592,10 @@ function runDiagnosticSnapshot() {
     ? globalThis.ChatGPTBridgeFinalOutput.finalizationThresholdMs({
         state,
         outputChars: boundedRunMetric(finalization.output_chars),
+        activeStallEnabled: activeSignalStallApplies(
+          finalization.signal,
+          progress?.streaming_signal_sources,
+        ),
         thresholds: FINALIZATION_THRESHOLDS,
       })
     : null;
@@ -1260,6 +1251,12 @@ function longRunningStreamingSignalActive(signalSources) {
   );
 }
 
+/** Un signal actif dont la seule stabilité du texte peut justifier un stall. */
+function activeSignalStallApplies(signal, signalSources) {
+  return signal === "streaming" &&
+    !longRunningStreamingSignalActive(signalSources);
+}
+
 function currentSubmissionGenerationSignals() {
   const stopSignals = activeSubmissionSignals(SELECTORS.stop);
   const reasoningSignals = activeSubmissionSignals(
@@ -1314,8 +1311,8 @@ function captureSubmissionSnapshot(composer, sendBtn) {
  * Compares two generation-signal states and names the transition between them.
  *
  * Returns `null` when the signals are strictly unchanged — same elements, same
- * signatures. Persistence is not activity: a Stop/reasoning/streaming node that
- * appeared once and then froze must stop refreshing any liveness deadline.
+ * signatures. Persistence is not a new submission proof: a Stop/reasoning/
+ * streaming node that appeared before Send cannot confirm the new Send.
  */
 function generationSignalTransition(previous, current) {
   for (const element of current.elements) {
@@ -1414,43 +1411,6 @@ async function waitForSubmissionConfirmation(composer, sendBtn, snapshot, method
 }
 
 /**
- * Diagnostic d'attente du premier ResponseRoot, sans contenu : comptages,
- * booléens et dernière décision du locator.
- */
-function responseWaitDiagnostics(
-  composer,
-  sendBtn,
-  snapshot,
-  responseBaseline,
-  startedAt,
-  candidate,
-) {
-  const after = captureSubmissionSnapshot(composer, sendBtn);
-  const collected = resolveResponseRoots();
-  return {
-    content_script_version: VERSION,
-    elapsed_ms: Math.max(0, Date.now() - startedAt),
-    assistant_turns_before: snapshot.assistantTurns,
-    assistant_turns_after: after.assistantTurns,
-    user_turns_before: snapshot.userTurns,
-    user_turns_after: after.userTurns,
-    composer_has_text: after.composerHasText,
-    send_enabled: after.sendState.ready,
-    send_disabled: !after.sendState.ready,
-    stop_visible: after.generation.stop,
-    reasoning_visible: after.generation.reasoning,
-    streaming_generation_signal_visible: after.generation.present,
-    streaming_signal_sources: streamingSignalSources(document),
-    response_locator: responseLocatorDiagnostic(candidate),
-    conversation_surface_found: Boolean(collected.surface_element),
-    conversation_surface_strategy: collected.surface_strategy || null,
-    baseline_root_count: responseBaseline?.markdownRootCount || 0,
-    current_root_count: collected.markdown.length,
-    inline_leaf_count: collected.inline_leaf_count,
-  };
-}
-
-/**
  * Détails sûrs d'une dérive de contrat de réponse : comptages et booléens
  * uniquement — jamais un caractère de contenu, jamais un identifiant externe.
  */
@@ -1501,16 +1461,9 @@ function responseContractDriftError(reason, candidate) {
  * passer plusieurs minutes en recherche web ou en réflexion avant de rendre
  * quoi que ce soit de lisible.
  *
- * L'activité est une *transition* depuis le dernier état de signaux observé,
- * jamais une comparaison répétée avec le snapshot d'avant-Send. Cette
- * distinction compte pour deux défaillances symétriques :
- *   - un signal déjà visible avant le Send n'est jamais compté (il n'a pas de
- *     transition) ;
- *   - un signal apparu après le Send puis figé est compté exactement une fois,
- *     donc une UI bloquée atteint bien FIRST_ASSISTANT_ACTIVITY_STALL_MS au
- *     lieu d'être maintenue en vie par sa propre persistance.
- * Un vrai mouvement (apparition, disparition, changement d'état, nouveau
- * nœud) repousse la borne aussi longtemps que l'UI bouge réellement.
+ * Avant le premier ResponseRoot, l'absence de mutation ou de signal reconnu
+ * ne prouve pas que ChatGPT a cessé de réfléchir. Le serveur borne l'attente
+ * totale et les heartbeats distinguent une extension vivante d'une panne.
  *
  * Le candidat vient du DELTA structurel : la stratégie historique d'abord,
  * puis le delta des MarkdownRoots contre le baseline d'avant-Send. Deux
@@ -1520,20 +1473,12 @@ function responseContractDriftError(reason, candidate) {
  */
 async function waitForResponseCandidate(
   job,
-  composer,
-  sendBtn,
-  submissionSnapshot,
   responseBaseline,
   run,
+  isSubmittedPromptRoot = null,
 ) {
-  const startedAt = Date.now();
-  let lastActivityAt = startedAt;
-  let lastHeartbeatAt = startedAt;
-  let lastObservationAt = startedAt;
-  let observationsSinceActivity = 0;
-  // Baseline = l'état observé à la soumission : un signal déjà présent est donc
-  // déjà « vu » et ne peut pas être compté comme une apparition.
-  let observedSignals = submissionSnapshot.generation;
+  let lastHeartbeatAt = Date.now();
+  let lastObservationAt = lastHeartbeatAt;
   // Fenêtres bornées propres au contrat de réponse (cf. constantes).
   let ambiguousSince = null;
   let unresolvedLeavesSince = null;
@@ -1575,7 +1520,7 @@ async function waitForResponseCandidate(
       }
       lastObservationAt = now;
 
-      candidate = resolveResponseCandidate(responseBaseline);
+      candidate = resolveResponseCandidate(responseBaseline, document, isSubmittedPromptRoot);
       recordResponseLocator(candidate);
       if (candidate.status === "found") return candidate;
 
@@ -1606,42 +1551,6 @@ async function waitForResponseCandidate(
         unresolvedLeavesSince = null;
       }
 
-      const currentSignals = currentSubmissionGenerationSignals();
-      if (generationSignalTransition(observedSignals, currentSignals)) {
-        lastActivityAt = now;
-        observationsSinceActivity = 0;
-      } else {
-        observationsSinceActivity += 1;
-      }
-      observedSignals = currentSignals;
-      // Même règle que dans `streamAnswer` : une unique itération throttlée ne
-      // prouve pas qu'une UI est figée (cf. MIN_STALL_OBSERVATIONS).
-      if (
-        now - lastActivityAt >= FIRST_ASSISTANT_ACTIVITY_STALL_MS &&
-        observationsSinceActivity >= MIN_STALL_OBSERVATIONS
-      ) {
-        const error = new BridgeError(
-          "bridge_ui_timeout",
-          "aucune réponse rendue après la soumission du prompt",
-        );
-        error.diagnostics = {
-          ...responseWaitDiagnostics(
-            composer,
-            sendBtn,
-            submissionSnapshot,
-            responseBaseline,
-            startedAt,
-            candidate,
-          ),
-          page_state: pageStateDiagnostics(now, {
-            watcher,
-            lastObservationAt,
-            lastHeartbeatAt,
-            run,
-          }),
-        };
-        throw error;
-      }
     }
     return null;
   } finally {
@@ -2168,6 +2077,30 @@ function hasSerializableContent(el) {
 }
 
 /**
+ * L'UI moderne peut rendre le message utilisateur dans un MarkdownRoot sans
+ * attribut de rôle. Son texte vient du prompt fiable déjà soumis : on l'écarte
+ * du locator sans jamais le journaliser. Un écho assistant indiscernable est
+ * écarté lui aussi (fail closed), plutôt que de relivrer le prompt comme réponse.
+ */
+function createSubmittedPromptMatcher(prompt) {
+  const expected = typeof prompt === "string" ? prompt.trim() : "";
+  const cache = new WeakMap();
+  return (element) => {
+    if (!expected || !element) return false;
+    const sourceText = element.textContent || "";
+    const cached = cache.get(element);
+    if (cached?.sourceText === sourceText) return cached.matches;
+    const rendered = (readAnswer(element, false)?.text || "").trim();
+    const prefixLength = Math.min(expected.length, 256);
+    const matches = rendered.length >= expected.length * 0.7 &&
+      rendered.length <= expected.length * 1.3 &&
+      rendered.startsWith(expected.slice(0, prefixLength));
+    cache.set(element, { sourceText, matches });
+    return matches;
+  };
+}
+
+/**
  * Un MarkdownRoot est-il un ResponseRoot plausible ?
  * Candidat moderne = descendant de la surface, hors composer, hors chrome, hors
  * réflexion, hors message utilisateur, visible, et non ambigu par lui-même.
@@ -2192,25 +2125,31 @@ function isResponseRootCandidate(el, surfaceElement, root = document) {
  * Tous les ResponseRoots visibles, par stratégie. Observation pure : aucun
  * choix, aucune écriture, aucun texte lu ni journalisé.
  */
-function resolveResponseRoots(root = document) {
+function resolveResponseRoots(root = document, isSubmittedPromptRoot = null) {
   const surface = resolveConversationSurface(root);
   const surfaceElement = surface.element;
   const semantic = [];
   const markdown = [];
+  const submittedPromptRoots = [];
   let inlineLeafCount = 0;
   if (surfaceElement) {
     for (const element of surfaceElement.querySelectorAll(
       SELECTORS.markdownRootCandidate,
     )) {
       if (isResponseRootCandidate(element, surfaceElement, root)) {
-        markdown.push(element);
+        if (isSubmittedPromptRoot?.(element)) submittedPromptRoots.push(element);
+        else markdown.push(element);
       }
     }
     let leaves = 0;
     for (const leaf of surfaceElement.querySelectorAll(
       SELECTORS.inlineMarkdown.join(", "),
     )) {
-      if (isVisibleElement(leaf) && !isInsideComposer(leaf, root)) leaves += 1;
+      if (
+        isVisibleElement(leaf) &&
+        !isInsideComposer(leaf, root) &&
+        !submittedPromptRoots.some((element) => element.contains(leaf))
+      ) leaves += 1;
     }
     inlineLeafCount = Math.min(leaves, MAX_INLINE_LEAF_COUNT);
   }
@@ -2306,9 +2245,9 @@ function describeResponseCandidate(status, strategy, element, collected, baselin
  * de son enveloppe (cf. `isFreshResponseRoot`). Un ancien tour recréé par
  * React, même avec une signature de classes neuve, reste l'ancien tour.
  */
-function resolveResponseCandidate(baseline, root = document) {
+function resolveResponseCandidate(baseline, root = document, isSubmittedPromptRoot = null) {
   const safeBaseline = baseline || emptyResponseBaseline();
-  const collected = resolveResponseRoots(root);
+  const collected = resolveResponseRoots(root, isSubmittedPromptRoot);
   const markdownKeys = new Set(safeBaseline.markdownRootKeys || []);
   // Stratégie historique : un tour assistant de plus, dans l'ordre du
   // document. Le sélecteur est intrinsèquement sémantique (il ne peut désigner
@@ -2391,7 +2330,7 @@ function resolveResponseContentRoot(candidate, fallbackOk = true) {
  * Locator local d'un ResponseRoot : valable pendant le run, jamais persisté,
  * jamais comparé à un identifiant externe (conversation, tour, message).
  */
-function createResponseLocator(candidate, baseline, root = document) {
+function createResponseLocator(candidate, baseline, root = document, isSubmittedPromptRoot = null) {
   if (!candidate?.element) return null;
   if (candidate.strategy === "semantic_assistant") {
     const surface = resolveConversationSurface(root).element;
@@ -2406,7 +2345,7 @@ function createResponseLocator(candidate, baseline, root = document) {
       ordinal: turns.indexOf(candidate.element),
     };
   }
-  const collected = resolveResponseRoots(root);
+  const collected = resolveResponseRoots(root, isSubmittedPromptRoot);
   return {
     kind: "markdown_root",
     strategy: "markdown_root_delta",
@@ -2420,7 +2359,7 @@ function createResponseLocator(candidate, baseline, root = document) {
  * (le locator doit rattacher le nouveau nœud au même candidat logique), mais
  * deux candidats restent indistinguables — on ne devine alors pas.
  */
-function locateResponseCandidate(locator, baseline, root = document) {
+function locateResponseCandidate(locator, baseline, root = document, isSubmittedPromptRoot = null) {
   if (!locator) return null;
   if (locator.kind === "semantic_assistant") {
     const turn = findTurn(locator.turn_locator, locator.baseline_count);
@@ -2429,11 +2368,11 @@ function locateResponseCandidate(locator, baseline, root = document) {
       "found",
       "semantic_assistant",
       turn,
-      resolveResponseRoots(root),
+      resolveResponseRoots(root, isSubmittedPromptRoot),
       baseline,
     );
   }
-  const collected = resolveResponseRoots(root);
+  const collected = resolveResponseRoots(root, isSubmittedPromptRoot);
   const ordinalRoot = collected.markdown[locator.ordinal] || null;
   if (ordinalRoot && markdownRootSignature(ordinalRoot) === locator.signature) {
     return describeResponseCandidate(
@@ -3261,7 +3200,7 @@ function incompleteAnswer({
  *                 confirmée. FINAL est terminal : un unique `done`/`incomplete`
  *                 est émis par l'appelant, jamais un second.
  */
-async function streamAnswer(job, locator, responseBaseline, run) {
+async function streamAnswer(job, locator, responseBaseline, run, isSubmittedPromptRoot = null) {
   const output = globalThis.ChatGPTBridgeFinalOutput.createAccumulator();
   let vu = ""; // relevé précédent, pour mesurer la stabilité
   let stableSince = null;
@@ -3390,7 +3329,9 @@ async function streamAnswer(job, locator, responseBaseline, run) {
       // Re-résolution du candidat à chaque itération, jamais de référence
       // gardée : React remplace le nœud entre la réflexion et la réponse, et
       // un nœud détaché resterait figé sur « Thinking ».
-      const candidate = locateResponseCandidate(locator, responseBaseline);
+      const candidate = locateResponseCandidate(
+        locator, responseBaseline, document, isSubmittedPromptRoot,
+      );
       if (!candidate) {
         // Aucune identité résoluble (nœud pas encore monté, ou deux roots
         // indistinguables) : on ne finalise JAMAIS sur un état antérieur. La
@@ -3611,7 +3552,7 @@ async function streamAnswer(job, locator, responseBaseline, run) {
         full.length > 0 &&
         stableForMs >= WATCHED_TURN_ACTIVE_SIGNAL_STALL_MS &&
         stableObservations >= MIN_STALL_OBSERVATIONS &&
-        !longRunningStreamingSignalActive(signalSources)
+        activeSignalStallApplies(finalization.signal, signalSources)
       ) {
         return incompleteAnswer({
           reason: "active_signal_stalled",
@@ -3655,6 +3596,8 @@ async function streamAnswer(job, locator, responseBaseline, run) {
       const verificationCandidate = locateResponseCandidate(
         verificationLocator,
         responseBaseline,
+        document,
+        isSubmittedPromptRoot,
       );
       const verificationScope = verificationCandidate
         ? responseSignalScope(verificationCandidate)
@@ -3777,13 +3720,15 @@ async function streamAnswer(job, locator, responseBaseline, run) {
  * l'identité capturée par `streamAnswer`, et à défaut on re-résout ce même
  * tour par son locator, sans jamais réutiliser une référence DOM conservée.
  */
-function resolveExternalTurnId(serialized, locator, responseBaseline) {
+function resolveExternalTurnId(serialized, locator, responseBaseline, isSubmittedPromptRoot = null) {
   if (serialized.external_turn_id) return serialized.external_turn_id;
   const refined =
     locator?.kind === "semantic_assistant" && serialized.turn_locator
       ? { ...locator, turn_locator: serialized.turn_locator }
       : locator;
-  const candidate = locateResponseCandidate(refined, responseBaseline);
+  const candidate = locateResponseCandidate(
+    refined, responseBaseline, document, isSubmittedPromptRoot,
+  );
   return candidate ? turnExternalId(candidate.element) : null;
 }
 
@@ -4216,6 +4161,7 @@ async function handlePrompt({
     // La baseline de réponse décrit la structure déjà rendue (comptages,
     // signatures) : aucun texte, et c'est le SEUL état de référence du delta.
     const responseBaseline = captureResponseBaseline();
+    const isSubmittedPromptRoot = createSubmittedPromptMatcher(composerPrompt);
     const submissionBaseline = captureSubmissionSnapshot(composer, sendBtn);
     job.submissionState = "submission_attempted";
     job.phase = "submission_confirmation";
@@ -4256,19 +4202,20 @@ async function handlePrompt({
     // Le candidat vient du delta structurel contre le baseline d'avant-Send.
     const candidate = await waitForResponseCandidate(
       job,
-      composer,
-      sendBtn,
-      submissionBaseline,
       responseBaseline,
       runDiagnostics,
+      isSubmittedPromptRoot,
     );
     if (!candidate) return;
-    const responseLocator = createResponseLocator(candidate, responseBaseline);
+    const responseLocator = createResponseLocator(
+      candidate, responseBaseline, document, isSubmittedPromptRoot,
+    );
     const serialized = await streamAnswer(
       job,
       responseLocator,
       responseBaseline,
       runDiagnostics,
+      isSubmittedPromptRoot,
     );
 
     if (!job.aborted) {
@@ -4278,6 +4225,7 @@ async function handlePrompt({
         serialized,
         responseLocator,
         responseBaseline,
+        isSubmittedPromptRoot,
       );
       console.log("bridge_run_phase", { phase: "generation" });
       // La finalité de la sortie et l'identité réutilisable sont deux contrats
