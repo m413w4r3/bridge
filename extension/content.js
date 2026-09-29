@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "40";
+const VERSION = "41";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -37,6 +37,44 @@ const SELECTORS = {
     "button[aria-label*='rrêter']",
   ],
   fileInput: ["input[type='file']"],
+  // Payload contract: an explicit file state OR the observed completed file
+  // preview. Unrecognised cards remain UNKNOWN. Enabled Send is never evidence.
+  // Current card/preview classes come from the user's 2026-09-28 DOM recorder;
+  // data-state/data-upload-status retain support for explicit state variants.
+  composerSurface: ["form", "[data-testid='composer']"],
+  attachment: [
+    // Observed in the user's 2026-09-28 structural recorder. The generated
+    // ComposerLayoutAttachments-* token is intentionally not hard-coded.
+    "[data-composer-attachments] [class~='group/composer-attachment']",
+    "[data-testid='file-upload']",
+    "[data-testid='attachment']",
+    "[data-testid='composer-attachment']",
+  ],
+  attachmentPending: [
+    "[aria-busy='true']", "[role='progressbar']", "progress",
+    "[data-state='uploading']", "[data-state='processing']", "[data-state='pending']",
+    "[data-upload-status='uploading']", "[data-upload-status='processing']",
+    "[data-testid='attachment-progress']",
+    "[data-loading='true']", "[data-state='loading']",
+    "[data-status='uploading']", "[data-status='processing']", "[data-status='pending']",
+  ],
+  attachmentAnimationPending: [".animate-spin", ".animate-pulse"],
+  // Completed preview observed on an auto-converted Pasted text.txt: a file
+  // type badge AND an interactive full-surface preview inside the same card.
+  attachmentPreviewSurface: "span.composer-attachment-surface:not([aria-hidden='true'])",
+  attachmentPreviewButton: "button.composer-attachment-surface.cursor-interaction",
+  attachmentFileBadge: "svg[class^='text-file-'], svg[class*=' text-file-']",
+  attachmentUnavailable: "[inert], [aria-hidden='true']",
+  attachmentReady: [
+    "[data-state='ready']", "[data-state='complete']",
+    "[data-upload-status='complete']", "[data-upload-status='success']",
+  ],
+  attachmentError: [
+    "[data-state='error']", "[data-state='failed']",
+    "[data-upload-status='error']", "[data-upload-status='failed']",
+    "[data-testid='attachment-error']", "[role='alert']",
+    "[data-status='error']", "[data-status='failed']", "[aria-invalid='true']",
+  ],
   assistant: "[data-message-author-role='assistant']",
   user: "[data-message-author-role='user']",
   markdown: ".markdown",
@@ -1123,6 +1161,144 @@ function composerHasText(el) {
 function isSendButtonReady(button) {
   if (!button || button.disabled === true) return false;
   return button.getAttribute("aria-disabled") !== "true";
+}
+
+/**
+ * @typedef {"EMPTY" | "TEXT_READY" | "ATTACHMENT_PENDING" |
+ *   "ATTACHMENT_READY" | "ATTACHMENT_ERROR" | "UNKNOWN"} ComposerPayloadState
+ */
+/**
+ * Positive evidence from the recorded current UI, not just absence of upload
+ * activity: the rendered file badge and usable file-preview control must be
+ * inside the SAME content surface. The remove button is never READY evidence.
+ */
+function attachmentHasCompletedPreview(card) {
+  const surfaces = [...card.querySelectorAll(SELECTORS.attachmentPreviewSurface)]
+    .filter(isVisibleElement);
+  if (surfaces.length !== 1) return false;
+  const surface = surfaces[0];
+  const badge = surface.querySelector(SELECTORS.attachmentFileBadge);
+  if (!isVisibleElement(badge)) return false;
+  const buttons = [...surface.querySelectorAll(SELECTORS.attachmentPreviewButton)]
+    .filter(isVisibleElement);
+  if (buttons.length !== 1) return false;
+  const button = buttons[0];
+  return isSendButtonReady(button) &&
+    !button.closest(SELECTORS.attachmentUnavailable) &&
+    globalThis.getComputedStyle?.(button)?.pointerEvents !== "none";
+}
+
+/** Pure, composer-scoped payload inspection. Never reads file names/content. */
+function inspectComposerPayload(composer, expectedAttachmentCount = 0) {
+  const surface = composer && closestOf(composer, SELECTORS.composerSurface);
+  if (!composer?.isConnected || !surface?.isConnected) {
+    return { state: "UNKNOWN", observed_attachment_count: 0,
+      attachment_pending: false, attachment_error: false, payload_ready: false };
+  }
+  const matches = (node, selectors) => selectors.some(
+    (selector) => node.matches(selector) || Boolean(node.querySelector(selector)),
+  );
+  // Deduplicate nested card selectors: one file must not count twice.
+  const candidates = [...surface.querySelectorAll(SELECTORS.attachment.join(","))]
+    .filter(isVisibleElement);
+  const cards = candidates.filter((node) => !candidates.some(
+    (other) => other !== node && other.contains(node),
+  ));
+  const pending = matches(surface, SELECTORS.attachmentPending) ||
+    cards.some((card) => matches(card, SELECTORS.attachmentAnimationPending));
+  const error = (cards.length > 0 || expectedAttachmentCount > 0) &&
+    matches(surface, SELECTORS.attachmentError);
+  const allReady = cards.length > 0 && cards.every(
+    // A nested tooltip/menu state cannot prove that the file itself is ready.
+    (card) => SELECTORS.attachmentReady.some((selector) => card.matches(selector)) ||
+      attachmentHasCompletedPreview(card),
+  );
+  let state;
+  if (error) state = "ATTACHMENT_ERROR";
+  else if (pending) state = "ATTACHMENT_PENDING";
+  else if (cards.length < expectedAttachmentCount) state = "UNKNOWN";
+  else if (cards.length) state = allReady ? "ATTACHMENT_READY" : "UNKNOWN";
+  else state = composerHasText(composer) ? "TEXT_READY" : "EMPTY";
+  return {
+    state, observed_attachment_count: cards.length,
+    attachment_pending: pending, attachment_error: error,
+    payload_ready: state === "TEXT_READY" || state === "ATTACHMENT_READY",
+  };
+}
+
+/** Re-resolve React nodes on EVERY observation, including immediately pre-Send. */
+function inspectSubmissionPayload(context) {
+  const composerResolution = resolveComposer();
+  const composer = composerResolution.element;
+  const sendResolution = resolveSendButton(composer);
+  const send = sendResolution.element;
+  const observed = inspectComposerPayload(composer, context.expected_attachment_count);
+  // A consumed paste with no text still needs a card. Latch cards seen during
+  // preparation so a transient React removal cannot turn an upload into text.
+  context.expected_attachment_count = Math.max(
+    context.expected_attachment_count,
+    observed.observed_attachment_count,
+    context.explicit_attachment_count +
+      (context.paste_consumed && composer && !composerHasText(composer) ? 1 : 0),
+  );
+  const payload = inspectComposerPayload(composer, context.expected_attachment_count);
+  const surface = composer && closestOf(composer, SELECTORS.composerSurface);
+  const sameSurface = Boolean(composer?.isConnected && send?.isConnected &&
+    surface?.contains(send));
+  const diagnostics = {
+    payload_mode: context.payload_mode, prompt_bytes: context.prompt_bytes,
+    paste_consumed: context.paste_consumed,
+    expected_attachment_count: context.expected_attachment_count,
+    observed_attachment_count: payload.observed_attachment_count,
+    attachment_state: payload.state,
+    attachment_pending: payload.attachment_pending,
+    attachment_error: payload.attachment_error,
+    send_present: Boolean(send?.isConnected),
+    send_disabled: send ? send.disabled === true : null,
+    send_aria_disabled: send ? send.getAttribute("aria-disabled") === "true" : null,
+    payload_ready: payload.payload_ready,
+  };
+  if (payload.attachment_error) {
+    console.log("bridge_composer_payload", diagnostics);
+    const error = new BridgeError("bridge_attachment_upload_error", "échec de préparation de la pièce jointe avant soumission");
+    error.diagnostics = diagnostics;
+    throw error;
+  }
+  return { composerResolution, sendResolution, diagnostics,
+    ready: sameSurface && payload.payload_ready && isSendButtonReady(send) };
+}
+
+async function waitForComposerPayloadReady(context, timeout) {
+  let last;
+  context.diagnostic_count ??= 0;
+  let previous = null;
+  try {
+    return await waitFor(() => {
+      last = inspectSubmissionPayload(context);
+      const signature = JSON.stringify(last.diagnostics);
+      if (signature !== previous && context.diagnostic_count < (last.ready ? 13 : 12)) {
+        console.log("bridge_composer_payload", last.diagnostics);
+        context.diagnostic_count += 1;
+        previous = signature;
+      }
+      return last.ready ? last : null;
+    }, timeout, "payload du composer non prêt");
+  } catch (error) {
+    if (error instanceof BridgeError) throw error;
+    if (last) console.log("bridge_composer_payload", last.diagnostics);
+    if (last && !last.composerResolution.element) {
+      throw uiContractError("composer_missing", last.composerResolution, "composer introuvable pendant la préparation");
+    }
+    if (last && !last.sendResolution.element) {
+      throw uiContractError("send_missing", last.sendResolution, "bouton d’envoi introuvable");
+    }
+    if (last?.diagnostics.payload_ready) {
+      throw uiContractError("send_not_ready", last.sendResolution, "bouton d’envoi jamais actif sur la surface courante");
+    }
+    const failure = new BridgeError("bridge_composer_payload_not_ready", "payload du composer non prêt avant soumission");
+    failure.diagnostics = last?.diagnostics || {};
+    throw failure;
+  }
 }
 
 function submissionForm(composer, sendBtn) {
@@ -4073,17 +4249,6 @@ async function handlePrompt({
       injectionMethod = await typePrompt(composer, composerPrompt);
       promptInjected = true;
     }
-    // Paste and attachment handling can cause a React render. Use the current
-    // composer for readiness, the baseline snapshot, and the one allowed Send.
-    composerResolution = resolveComposer();
-    if (!composerResolution.element) {
-      throw uiContractError(
-        "composer_missing",
-        composerResolution,
-        "composer introuvable après injection",
-      );
-    }
-    composer = composerResolution.element;
     // Volumétrie uniquement : ni le prompt, ni le contenu du fichier, ni le
     // DOM du composer ne doivent apparaître dans un log.
     console.log("bridge_run_phase", {
@@ -4101,49 +4266,23 @@ async function handlePrompt({
     const mayUploadAfterPaste = injectionMethod === "synthetic_paste";
     const waitsForUpload = hasAttachments || mayUploadAfterPaste;
 
-    // Le bouton d'envoi ne devient actif qu'après le rendu de la saisie — et,
-    // si un upload est possible, qu'une fois celui-ci terminé (bien plus long).
-    // Ce délai long n'ajoute aucune latence : `waitFor` rend la main dès que
-    // Send devient utilisable.
-    let sendResolution = null;
-    let resolvedSend;
-    try {
-      resolvedSend = await waitFor(
-        () => {
-          composerResolution = resolveComposer();
-          if (!composerResolution.element) return null;
-          composer = composerResolution.element;
-          sendResolution = resolveSendButton(composer);
-          return isSendButtonReady(sendResolution.element) ? sendResolution : null;
-        },
-        waitsForUpload ? UPLOAD_TIMEOUT_MS : 8000,
-        waitsForUpload
-          ? "contenu collé ou pièce jointe non prêt pour l'envoi"
-          : "bouton d'envoi jamais actif",
-      );
-    } catch (error) {
-      if (error instanceof BridgeError) throw error;
-      if (!composerResolution.element) {
-        throw uiContractError(
-          "composer_missing",
-          composerResolution,
-          "composer introuvable pendant la préparation de l'envoi",
-        );
-      }
-      if (!sendResolution?.element) {
-        throw uiContractError(
-          "send_missing",
-          sendResolution || resolveSendButton(composer),
-          "bouton d'envoi introuvable",
-        );
-      }
-      throw uiContractError(
-        "send_not_ready",
-        sendResolution,
-        "bouton d'envoi jamais actif",
-      );
-    }
-    sendResolution = resolvedSend;
+    const payloadContext = {
+      payload_mode: promptAsFile ? "prompt_file" : hasAttachments ? "text_with_files" : "paste_or_text",
+      prompt_bytes: promptBytes,
+      paste_consumed: mayUploadAfterPaste,
+      explicit_attachment_count: (files?.length || 0) + extraFiles.length,
+      expected_attachment_count: (files?.length || 0) + extraFiles.length,
+    };
+    const payloadDeadline = Date.now() + (waitsForUpload ? UPLOAD_TIMEOUT_MS : 8000);
+    let readyPayload;
+    do {
+      await waitForComposerPayloadReady(payloadContext, Math.max(0, payloadDeadline - Date.now()));
+      // No await between this fresh inspection, the baseline and the trigger.
+      readyPayload = inspectSubmissionPayload(payloadContext);
+    } while (!readyPayload.ready);
+    composerResolution = readyPayload.composerResolution;
+    composer = composerResolution.element;
+    const sendResolution = readyPayload.sendResolution;
     const sendBtn = sendResolution.element;
     warnIfDegraded("composer", composerResolution);
     warnIfDegraded("send", sendResolution);

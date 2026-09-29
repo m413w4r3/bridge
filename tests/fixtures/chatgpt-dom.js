@@ -111,4 +111,31 @@ const DOM_DRIFT_MATRIX = [
   },
 ];
 
-module.exports = { CURRENT_CHATGPT_COMPOSER_2026_09_24, DOM_DRIFT_MATRIX };
+// Current completed document card recorded by the user on 2026-09-28.
+// This contains NO synthetic READY/testid/status attributes. SVG path geometry
+// and filename content are irrelevant to the structural payload contract.
+const CURRENT_CHATGPT_DOCUMENT_ATTACHMENT_2026_09_28 = `
+<span class="group/composer-attachment relative block h-30.5 w-40 shrink-0 select-none">
+  <span class="composer-attachment-surface flex size-full flex-col overflow-hidden rounded-2xl bg-surface-secondary text-default">
+    <span class="pointer-events-none flex h-22.5 shrink-0 items-center justify-center overflow-hidden">
+      <span class="relative flex size-full items-center justify-center">
+        <svg class="text-secondary" aria-hidden="true"><path></path></svg>
+      </span>
+    </span>
+    <span class="pointer-events-none flex h-8 min-w-0 shrink-0 items-center gap-1 bg-surface px-2 text-xs leading-4">
+      <svg class="text-file-document" aria-hidden="true"><path></path></svg>
+      <span class="truncate">PRIVATE_FILENAME.txt</span>
+    </span>
+    <span class="composer-attachment-surface pointer-events-none absolute inset-0 rounded-2xl ring-1 ring-inset ring-border" aria-hidden="true"></span>
+    <button type="button" class="composer-attachment-surface absolute inset-0 cursor-interaction rounded-2xl focus-visible:ring-2"></button>
+  </span>
+  <button type="button" class="absolute flex size-4 cursor-interaction items-center justify-center rounded-full bg-primary-solid text-primary-solid shadow-sm pointer-events-none opacity-0">
+    <svg aria-hidden="true"><path></path></svg>
+  </button>
+</span>`;
+
+module.exports = {
+  CURRENT_CHATGPT_COMPOSER_2026_09_24,
+  CURRENT_CHATGPT_DOCUMENT_ATTACHMENT_2026_09_28,
+  DOM_DRIFT_MATRIX,
+};

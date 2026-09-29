@@ -14,6 +14,7 @@ const vm = require("node:vm");
 const EXTENSION = path.join(__dirname, "..", "extension");
 const {
   CURRENT_CHATGPT_COMPOSER_2026_09_24,
+  CURRENT_CHATGPT_DOCUMENT_ATTACHMENT_2026_09_28,
   DOM_DRIFT_MATRIX,
 } = require("./fixtures/chatgpt-dom.js");
 
@@ -619,7 +620,7 @@ function useVirtualClock(window) {
     assert.equal(contractLog?.composer_strategy, "named_selector");
     assert.equal(contractLog?.composer_selector, "[data-composer-markdown][contenteditable='true'][role='textbox']");
     assert.equal(contractLog?.send_selector, "button[aria-label*='Send']");
-    assert.equal(contractLog?.content_script_version, "40");
+    assert.equal(contractLog?.content_script_version, "41");
     assert.equal(JSON.stringify(contractLog).includes("bonjour moderne"), false);
     assert.equal(submit, form.querySelector("button[type='submit']"));
   }
@@ -643,7 +644,7 @@ function useVirtualClock(window) {
     );
     const current = await dispatch({ type: "dom_health" });
     assert.equal(current.ok, true);
-    assert.equal(current.content_script_version, "40");
+    assert.equal(current.content_script_version, "41");
     assert.equal(current.surface.temporary_status, "ok");
     assert.equal(current.composer.status, "ok");
     assert.equal(current.send.status, "ok");
@@ -939,7 +940,7 @@ function useVirtualClock(window) {
     assert.equal(error?.submission_state, "pre_submission");
     assert.equal(error?.diagnostics?.ui_contract_error, "composer_missing");
     assert.equal(error?.diagnostics?.dom_health?.composer?.status, "missing");
-    assert.equal(error?.diagnostics?.dom_health?.content_script_version, "40");
+    assert.equal(error?.diagnostics?.dom_health?.content_script_version, "41");
     assert.equal(sent.some((message) => message.type === "done"), false);
   }
 
@@ -963,7 +964,7 @@ function useVirtualClock(window) {
     assert.equal(error?.diagnostics?.send_status, "missing");
     assert.equal(error?.diagnostics?.send_candidates, 0);
     assert.equal(error?.diagnostics?.form_found, true);
-    assert.equal(error?.diagnostics?.content_script_version, "40");
+    assert.equal(error?.diagnostics?.content_script_version, "41");
     assert.equal(JSON.stringify(error).includes("hello"), false);
   }
 
@@ -1789,7 +1790,7 @@ const PLACEHOLDER_ID =
       "l'identité doit venir du nœud courant, pas du placeholder détaché",
     );
     assert.equal(done.metadata?.initial_turn_id, "stable-assistant-42");
-    assert.equal(done.metadata?.content_script_version, "40");
+    assert.equal(done.metadata?.content_script_version, "41");
   }
 
   // Même remplacement, mais l'UI reste bloquée « en streaming » : le candidat
@@ -2282,6 +2283,8 @@ function observeComposer(window, mode = "text") {
     // En mode "attachment" aucun texte n'est ajouté : ChatGPT a transformé le
     // collage en pièce jointe. Le composer reste légitimement vide.
     if (mode === "text") composer.textContent = observed.pastedText;
+    else composer.closest("form").insertAdjacentHTML("beforeend",
+      `<div data-testid="composer-attachment" data-state="ready"></div>`);
   });
   return { composer, observed };
 }
@@ -2311,6 +2314,10 @@ async function runPromptInjection({ id, prompt, files = null }) {
   fileInput.addEventListener("change", () => {
     attach.operations += 1;
     attach.files = [...(fileInput.files || [])];
+    for (const file of attach.files) {
+      fileInput.closest("form").insertAdjacentHTML("beforeend",
+        `<div data-testid="composer-attachment" data-state="ready"></div>`);
+    }
   });
 
   window.document
@@ -2521,7 +2528,7 @@ async function runPromptInjection({ id, prompt, files = null }) {
     })()`);
     assert.equal(diagnostics.composer_was_non_empty, true);
     assert.equal(diagnostics.composer_still_has_text, true);
-    assert.equal(diagnostics.content_script_version, "40");
+    assert.equal(diagnostics.content_script_version, "41");
 
     // Le snapshot ne transporte plus le texte du composer, seulement un booléen.
     const snapshot = run(`captureSubmissionSnapshot(${SEL})`);
@@ -2861,3 +2868,247 @@ async function runPromptInjection({ id, prompt, files = null }) {
   console.error(err);
   process.exit(1);
 });
+
+// Payload barrier regression: enabled Send is never upload completion proof.
+(async () => {
+  for (const scenario of [
+    { name: "auto-paste", prompt: "x".repeat(92_899), auto: true },
+    { name: "auto-spinner", prompt: "x".repeat(92_899), auto: true, spinner: true },
+    { name: "auto-preview-disabled", prompt: "x".repeat(92_899), auto: true, disabledPreview: true },
+    { name: "auto-rerender", prompt: "x".repeat(92_899), auto: true, rerender: true },
+    { name: "explicit-large", prompt: "x".repeat(200_001), count: 1 },
+    { name: "api-plus-large", prompt: "x".repeat(200_001), api: true, count: 2 },
+    { name: "api-plus-text", prompt: "bonjour", api: true, count: 1 },
+    { name: "api-only", prompt: "", api: true, count: 1 },
+    { name: "upload-error", prompt: "x".repeat(92_899), auto: true, error: true },
+    { name: "unknown-card", prompt: "x".repeat(92_899), auto: true, unknown: true },
+    { name: "text", prompt: "bonjour" },
+  ]) {
+    const { window, run } = loadExtension(INJECTION_PAGE, "https://chatgpt.com/?temporary-chat=true");
+    const doc = window.document;
+    forbidEditingCommand(window);
+    const sent = [], diagnostics = [], phases = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    window.console.log = (name, value) => {
+      if (name === "bridge_composer_payload") diagnostics.push({ ...value });
+      if (name === "bridge_run_phase") phases.push({ ...value });
+    };
+    window.console.warn = window.console.error = () => {};
+    let submitEvents = 0, clicks = 0, oldClicks = 0, pasted = 0, oldPastes = 0;
+    const oldComposer = doc.querySelector("#prompt-textarea");
+    const oldSend = doc.querySelector("[data-testid='send-button']");
+    oldSend.addEventListener("click", () => { clicks++; oldClicks++; });
+    const cards = [];
+    let readyReached = false;
+    const region = doc.createElement("div");
+    region.setAttribute("data-composer-attachments", "");
+    doc.querySelector("form").prepend(region);
+    const addCard = () => {
+      const template = doc.createElement("template");
+      template.innerHTML = CURRENT_CHATGPT_DOCUMENT_ATTACHMENT_2026_09_28;
+      const card = template.content.firstElementChild;
+      if (scenario.unknown) card.replaceChildren();
+      else if (scenario.disabledPreview) card.querySelector("button.composer-attachment-surface").disabled = true;
+      else card.insertAdjacentHTML("beforeend", scenario.spinner
+        ? `<svg class="animate-spin"></svg>` : `<span role="progressbar"></span>`);
+      region.append(card);
+      cards.push(card);
+    };
+    oldComposer.addEventListener("paste", (event) => {
+      event.preventDefault();
+      pasted++;
+      const text = event.clipboardData.getData("text/plain");
+      if (scenario.auto) addCard();
+      else oldComposer.textContent = text;
+      if (scenario.rerender) {
+        const replacement = oldComposer.cloneNode(false);
+        replacement.addEventListener("paste", () => { oldPastes++; });
+        oldComposer.replaceWith(replacement);
+        const send = oldSend.cloneNode(true);
+        send.addEventListener("click", () => { clicks++; });
+        oldSend.replaceWith(send);
+        // Access to a stale editable must never be required by readiness.
+        Object.defineProperty(oldComposer, "textContent", {
+          get() { throw new Error("stale composer read"); },
+        });
+      }
+    });
+    const input = doc.querySelector("input");
+    Object.defineProperty(input, "files", { writable: true, value: null });
+    let attached = [];
+    input.addEventListener("change", () => {
+      attached = [...input.files];
+      attached.forEach(addCard);
+    });
+    doc.querySelector("form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      submitEvents++;
+      assert.equal(run("currentJob.submissionState"), "submission_attempted");
+      assert.ok(cards.length === 0 || readyReached, "payload must be prepared before submit");
+      assert.equal(event.submitter, doc.querySelector("[data-testid='send-button']"));
+      doc.body.insertAdjacentHTML("beforeend", `
+        <article data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="u1">user</div></article>
+        <article data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="a1"><div class="markdown"><p>réponse finale</p></div></div>${copyButton}</article>`);
+    });
+    let clock = 0, checkedPending = false;
+    window.Date.now = () => clock;
+    window.setTimeout = (fn, ms) => {
+      clock += ms || 0;
+      if (cards.length && !checkedPending && clock >= 500) {
+        checkedPending = true;
+        assert.equal(submitEvents, 0, `${scenario.name}: no early submit`);
+        assert.equal(clicks, 0);
+        assert.equal(run("currentJob.submissionState"), "pre_submission");
+        const send = doc.querySelector("[data-testid='send-button']");
+        assert.equal(send.disabled, false);
+        assert.notEqual(send.getAttribute("aria-disabled"), "true");
+        if (!scenario.unknown) {
+          for (const [index, card] of cards.entries()) {
+            card.querySelector("[role='progressbar'], .animate-spin")?.remove();
+            card.querySelector("button.composer-attachment-surface").disabled = false;
+            if (scenario.error) card.insertAdjacentHTML("beforeend", `<span role="alert"></span>`);
+            if (scenario.rerender) {
+              const replacementCard = card.cloneNode(true);
+              card.replaceWith(replacementCard);
+              cards[index] = replacementCard;
+            }
+          }
+          readyReached = !scenario.error;
+        }
+      }
+      queueMicrotask(fn);
+      return 0;
+    };
+    window.__barrierPrompt = {
+      id: `barrier-${scenario.name}`, prompt: scenario.prompt,
+      files: scenario.api ? [{ name: "private.csv", data: "YQ==", mime: "text/csv" }] : [],
+      conversation: { id: `conv-${scenario.name}`, mode: "fresh" },
+    };
+    await run("handlePrompt(__barrierPrompt)");
+    assert.ok(submitEvents <= 1);
+    assert.equal(clicks, 0, "no fallback Send click");
+    assert.equal(oldClicks, 0);
+    assert.equal(oldPastes, 0);
+    if (scenario.prompt) assert.equal(pasted, 1);
+    if (scenario.count) assert.equal(attached.length, scenario.count);
+    if (scenario.prompt.length > 200_000) {
+      assert.match(attached.at(-1).name, /^bridge-prompt-/);
+      assert.equal(attached.at(-1).size, 200_001);
+      assert.ok(doc.querySelector("#prompt-textarea").textContent.length < 400);
+    }
+    const errors = sent.filter((message) => message.type === "error");
+    if (scenario.error || scenario.unknown) {
+      assert.equal(submitEvents, 0);
+      assert.equal(errors.length, 1);
+      assert.equal(errors[0].submission_state, "pre_submission");
+      assert.equal(errors[0].code, scenario.error ? "bridge_attachment_upload_error" : "bridge_composer_payload_not_ready");
+    } else {
+      assert.deepEqual(errors, []);
+      assert.equal(submitEvents, 1);
+      assert.equal(sent.filter((message) => message.type === "done").length, 1);
+      assert.equal(sent.find((message) => message.type === "done").text, "réponse finale");
+      assert.equal(phases.find((phase) => phase.phase === "submission_confirmed").signal, "user_turn");
+      assert.equal(phases.filter((phase) => phase.phase === "submission_attempted").length, 1);
+    }
+    if (cards.length) assert.ok(checkedPending);
+    assert.ok(diagnostics.length <= 14, "bounded diagnostics");
+    for (const diagnostic of diagnostics) {
+      assert.deepEqual(Object.keys(diagnostic).sort(), [
+        "payload_mode", "prompt_bytes", "paste_consumed", "expected_attachment_count",
+        "observed_attachment_count", "attachment_state", "attachment_pending",
+        "attachment_error", "send_present", "send_disabled", "send_aria_disabled", "payload_ready",
+      ].sort());
+      assert.equal(JSON.stringify(diagnostic).includes("private.csv"), false);
+      assert.equal(JSON.stringify(diagnostic).includes("PRIVATE_FILENAME"), false);
+    }
+  }
+  console.log("composer payload barrier: ok");
+})().catch((error) => { console.error(error); process.exit(1); });
+
+{
+  const { window, run } = loadExtension(INJECTION_PAGE);
+  const form = window.document.querySelector("form");
+  const state = (expected = 0) => run(`inspectComposerPayload(document.querySelector("#prompt-textarea"), ${expected}).state`);
+  assert.equal(state(), "EMPTY");
+  assert.equal(state(1), "UNKNOWN", "missing expected card blocks even enabled Send");
+  window.document.querySelector("#prompt-textarea").textContent = "text";
+  assert.equal(state(), "TEXT_READY");
+  form.insertAdjacentHTML("beforeend", `<div data-testid="composer-attachment"><span data-state="ready"></span></div>`);
+  assert.equal(state(), "UNKNOWN", "nested unrelated ready state is insufficient");
+  const card = form.querySelector("[data-testid='composer-attachment']");
+  card.dataset.state = "ready";
+  assert.equal(state(), "ATTACHMENT_READY");
+  card.setAttribute("data-test-offscreen", "");
+  assert.equal(state(1), "UNKNOWN", "hidden stale card cannot satisfy expected upload");
+  card.removeAttribute("data-test-offscreen");
+  assert.equal(state(2), "UNKNOWN", "all expected files must be present");
+  card.insertAdjacentHTML("beforeend", `<span role="progressbar"></span>`);
+  assert.equal(state(), "ATTACHMENT_PENDING", "pending overrides ready");
+  card.dataset.state = "error";
+  assert.equal(state(), "ATTACHMENT_ERROR", "error overrides pending");
+  card.remove();
+  form.insertAdjacentHTML("beforeend", `<div role="progressbar"></div>`);
+  assert.equal(state(), "ATTACHMENT_PENDING", "preparation outside the card still blocks");
+  console.log("composer payload conservative state contract: ok");
+}
+
+// Actual outer card structure from the user's 2026-09-28 recorder. That
+// recorder stopped before the card's contents: this establishes PRESENCE,
+// never invents a READY signal from the enabled Send or data-visible-attachments.
+{
+  const { window, run } = loadExtension(`<form data-chatgpt-composer>
+    <div class="ComposerLayoutAttachments-bG080e" data-composer-attachments data-visible-attachments="true">
+      <div class="flex flex-wrap items-end gap-3 p-1">
+        <span class="group/composer-attachment relative block h-30.5 w-40 shrink-0 select-none"></span>
+      </div>
+    </div>
+    <div id="prompt-textarea" contenteditable="true"></div>
+    <button type="submit" aria-label="Send"></button>
+  </form>`);
+  const inspect = () => run(`inspectComposerPayload(document.querySelector('#prompt-textarea'), 1)`);
+  assert.equal(inspect().observed_attachment_count, 1, "recognise actual card without invented data-testid");
+  assert.equal(inspect().state, "UNKNOWN", "outer card and enabled Send are not READY evidence");
+  const card = window.document.querySelector("[class~='group/composer-attachment']");
+  card.insertAdjacentHTML('beforeend', '<span role="progressbar"></span>');
+  assert.equal(inspect().state, "ATTACHMENT_PENDING");
+}
+
+// READY proof from the full user-recorded card, with NO data-state/testid.
+{
+  const { window, run } = loadExtension(`<form>
+    <div data-composer-attachments>${CURRENT_CHATGPT_DOCUMENT_ATTACHMENT_2026_09_28}</div>
+    <div id="prompt-textarea" contenteditable="true"></div>
+    <button type="submit" aria-label="Send"></button>
+  </form>`);
+  const card = window.document.querySelector("[class~='group/composer-attachment']");
+  const preview = card.querySelector("button.composer-attachment-surface");
+  const badge = card.querySelector(".text-file-document");
+  const state = () => run(`inspectComposerPayload(document.querySelector('#prompt-textarea'), 1).state`);
+  for (const node of [card, ...card.querySelectorAll('*')]) {
+    Object.defineProperty(node, 'textContent', { get() { throw new Error('filename/content read'); } });
+  }
+  assert.equal(state(), "ATTACHMENT_READY", "user-recorded completed preview proves READY");
+  preview.disabled = true;
+  assert.equal(state(), "UNKNOWN", "Send enabled cannot replace an unusable preview");
+  preview.disabled = false;
+  preview.setAttribute('aria-disabled', 'true');
+  assert.equal(state(), "UNKNOWN");
+  preview.removeAttribute('aria-disabled');
+  preview.style.pointerEvents = 'none';
+  assert.equal(state(), "UNKNOWN");
+  preview.style.pointerEvents = '';
+  preview.setAttribute('inert', '');
+  assert.equal(state(), "UNKNOWN");
+  preview.removeAttribute('inert');
+  badge.setAttribute('data-test-offscreen', '');
+  assert.equal(state(), "UNKNOWN", "a preview button alone is insufficient");
+  badge.removeAttribute('data-test-offscreen');
+  card.insertAdjacentHTML('beforeend', '<svg class="animate-spin"></svg>');
+  assert.equal(state(), "ATTACHMENT_PENDING", "pending overrides a fully rendered enabled preview");
+  card.querySelector('.animate-spin').remove();
+  card.insertAdjacentHTML('beforeend', '<span data-status="error"></span>');
+  assert.equal(state(), "ATTACHMENT_ERROR", "an upload error overrides completed-preview appearance");
+  card.querySelector('[data-status]').remove();
+  assert.equal(state(), "ATTACHMENT_READY");
+  console.log('recorded current attachment readiness contract: ok');
+}

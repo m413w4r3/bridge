@@ -352,6 +352,33 @@ composer → Send → locator de réponse → finalisation → sérialisation, p
 `Copy diagnostic` pour joindre un JSON complet et sûr. Voir
 « UI contract drift » pour la lecture ligne par ligne.
 
+## Préparation du payload avant Send
+
+Un paste consommé (`defaultPrevented`) peut devenir une pièce jointe, même sous
+le seuil bridge de 200 000 octets. Send actif ne prouve pas la fin de l'upload.
+Le content script attend `TEXT_READY` ou `ATTACHMENT_READY`, puis re-résout le
+composer et Send avant la baseline et l'unique soumission.
+
+La carte document observée le 2026-09-28 est un `group/composer-attachment`
+dans `[data-composer-attachments]`, sans `data-testid` ni attribut READY.
+Le contrat reconnaît son badge SVG `text-file-*` et son bouton de
+prévisualisation `composer-attachment-surface.cursor-interaction`, actif et
+dans la même surface de contenu. Les signaux de préparation (progressbar,
+spinner, busy/loading) et d'erreur ont priorité sur cette structure. Une carte
+incomplète ou une variante inconnue reste bloquée. Les autres variantes
+peuvent aussi exposer un état explicite `data-state`/`data-upload-status`.
+
+`bridge_attachment_upload_error` et `bridge_composer_payload_not_ready`
+restent des erreurs **pre_submission**, sans Send ni retry. Le diagnostic
+`bridge_composer_payload` expose uniquement mode, volumétrie, comptages et
+états booléens ; aucun texte ni nom de fichier. Pour identifier une nouvelle
+variante, `tools/diagnose-composer-payload.js` relève la structure bornée de la
+zone des attachments sans lire son contenu.
+
+Après une modification du content script, recharger l'extension et démarrer un
+nouveau run fresh : les onglets déjà ouverts gardent l'ancien script. Le
+correctif de cette barrière est identifié par `content_script_version=41`.
+
 ## UI contract drift
 
 Symptôme typique : les runs échouent en HTTP 502 avec
