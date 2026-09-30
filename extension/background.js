@@ -11,6 +11,8 @@ const RECONNECT_MIN = 1000;
 const RECONNECT_MAX = 30000;
 
 const REPLACED_BACKOFF = 60000; // après un remplacement, on laisse la place
+const workerSessionId = crypto.randomUUID();
+let bridgeInstanceIdPromise = null;
 
 // Toute conversation fraîche ouverte par le bridge est un Temporary Chat :
 // jamais écrite dans l'historique ChatGPT, donc jamais à en supprimer après
@@ -20,10 +22,22 @@ const TEMPORARY_CHAT_URL = "https://chatgpt.com/?temporary-chat=true";
 const ALLOWED_CHAT_ORIGINS = ["https://chatgpt.com", "https://chat.openai.com"];
 
 let socket = null;
+let connectionGeneration = 0;
+let connectAttempt = null;
 let reconnectDelay = RECONNECT_MIN;
 let reconnectTimer = null;
 let suppressUntil = 0;
+/** Raison typée de la suppression courante : "replaced" (4000) ou "owner_active" (4409). */
+let suppressReason = null;
 let status = { connected: false, lastError: null, url: DEFAULT_URL };
+// Diagnostic de connexion sans contenu : identité du socket courant, nombre de
+// reconnexions de ce worker et âge du dernier ping serveur.
+let connectionIdentity = null;
+let openedConnections = 0;
+let lastPingAt = null;
+// Le serveur pinge toutes les 20 s ; au-delà de trois pings manqués, un socket
+// OPEN est considéré stale (même borne que BRIDGE_EXTENSION_PONG_TIMEOUT).
+const PING_STALE_MS = 60000;
 /** id de requête -> id de l'onglet qui la traite */
 const inflight = new Map();
 /** Deuxième barrière persistante : un id reçu n'est jamais retransmis deux fois au DOM. */
@@ -305,82 +319,152 @@ async function authenticatedServerUrl() {
   return parsed.toString();
 }
 
+async function persistentBridgeInstanceId() {
+  if (!bridgeInstanceIdPromise) {
+    bridgeInstanceIdPromise = (async () => {
+      const { bridgeInstanceId: storedId } = await chrome.storage.local.get("bridgeInstanceId");
+      if (typeof storedId === "string" && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(storedId)) {
+        return storedId.toLowerCase();
+      }
+      const instanceId = crypto.randomUUID();
+      await chrome.storage.local.set({ bridgeInstanceId: instanceId });
+      return instanceId;
+    })();
+  }
+  return bridgeInstanceIdPromise;
+}
+
 function setStatus(patch) {
   status = { ...status, ...patch };
   chrome.storage.local.set({ status });
 }
 
+function socketIsOwned(socketToCheck) {
+  return (
+    socketToCheck &&
+    (socketToCheck.readyState === WebSocket.OPEN ||
+      socketToCheck.readyState === WebSocket.CONNECTING ||
+      socketToCheck.readyState === WebSocket.CLOSING)
+  );
+}
+
 async function connect() {
-  if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+  if (socketIsOwned(socket) || connectAttempt) {
     return;
   }
   // Un autre client détient volontairement le pont : ne pas le lui reprendre
   // en boucle (sinon les deux se volent la connexion indéfiniment).
   if (Date.now() < suppressUntil) return;
   clearTimeout(reconnectTimer);
-  const displayUrl = await serverUrl();
-  const url = await authenticatedServerUrl();
-  setStatus({ url: displayUrl });
-
+  reconnectTimer = null;
+  const attempt = {};
+  const startingGeneration = connectionGeneration;
+  connectAttempt = attempt;
   try {
-    socket = new WebSocket(url);
-  } catch (err) {
-    scheduleReconnect(String(err));
-    return;
-  }
+    const displayUrl = await serverUrl();
+    const url = await authenticatedServerUrl();
+    const instanceId = await persistentBridgeInstanceId();
+    if (connectAttempt !== attempt) return;
+    if (socketIsOwned(socket)) return;
+    if (Date.now() < suppressUntil) return;
+    setStatus({ url: displayUrl });
 
-  socket.onopen = () => {
-    reconnectDelay = RECONNECT_MIN;
-    setStatus({ connected: true, lastError: null });
-    send({ type: "hello", client: "extension-chrome" });
-    flush(); // rejoue ce qui a été produit pendant la coupure
-    console.log("🤖 Connecté au Mini-Bridge", displayUrl, enAttente.length ? "(file non vidée)" : "");
-  };
-
-  socket.onmessage = (event) => {
-    let msg;
+    if (socket && socket.readyState === WebSocket.CLOSED) socket = null;
+    let ws;
+    const identity = {
+      instance_id: instanceId,
+      worker_session_id: workerSessionId,
+      connection_id: crypto.randomUUID(),
+      extension_version: chrome.runtime.getManifest().version,
+    };
     try {
-      msg = JSON.parse(event.data);
-    } catch {
+      ws = new WebSocket(url);
+    } catch (err) {
+      scheduleReconnect(null, String(err), { generation: startingGeneration, attempt });
       return;
     }
-    if (msg.type === "ping") {
-      send({ type: "pong" }); // maintient aussi le service worker éveillé
-      pumpObservationTicks();
-      return;
-    }
-    if (msg.type === "prompt") {
-      handlePrompt(msg);
-    } else if (msg.type === "ui_state" || msg.type === "ui_control") {
-      handleUiRequest(msg);
-    } else if (msg.type === "conversation_archive") {
-      handleConversationArchive(msg);
-    } else if (msg.type === "recovery_capture") {
-      handleRecoveryCapture(msg);
-    } else if (msg.type === "browser_target_retain") {
-      handleBrowserTargetRetain(msg);
-    } else if (msg.type === "browser_target_release") {
-      handleBrowserTargetRelease(msg);
-    } else if (msg.type === "abort") {
-      const tabId = inflight.get(msg.id);
-      inflight.delete(msg.id);
-      if (tabId !== undefined) {
-        chrome.tabs.sendMessage(tabId, { type: "abort", id: msg.id }).catch(() => {});
-      }
-    }
-  };
+    const generation = ++connectionGeneration;
+    socket = ws;
+    connectAttempt = null;
 
-  socket.onclose = (event) => {
-    if (event.code === 4000) {
-      // Le serveur nous a remplacés par un autre client (fake_extension.py,
-      // un second profil Chrome…). On s'efface au lieu de reprendre la main.
-      suppressUntil = Date.now() + REPLACED_BACKOFF;
-      scheduleReconnect("remplacé par un autre client du pont");
-      return;
-    }
-    scheduleReconnect(null);
-  };
-  socket.onerror = () => setStatus({ lastError: "serveur injoignable" });
+    ws.onopen = () => {
+      if (socket !== ws) return;
+      reconnectDelay = RECONNECT_MIN;
+      connectionIdentity = identity;
+      openedConnections += 1;
+      lastPingAt = null;
+      suppressReason = null;
+      setStatus({ connected: true, lastError: null });
+      send({ type: "hello", client: "extension-chrome", ...identity });
+      flush(); // rejoue ce qui a été produit pendant la coupure
+      console.log("🤖 Connecté au Mini-Bridge", displayUrl, enAttente.length ? "(file non vidée)" : "");
+    };
+
+    ws.onmessage = (event) => {
+      if (socket !== ws) return;
+      let msg;
+      try {
+        msg = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      if (msg.type === "ping") {
+        lastPingAt = Date.now();
+        send({ type: "pong" }); // maintient aussi le service worker éveillé
+        pumpObservationTicks();
+        return;
+      }
+      if (msg.type === "prompt") {
+        handlePrompt(msg);
+      } else if (msg.type === "ui_state" || msg.type === "ui_control") {
+        handleUiRequest(msg);
+      } else if (msg.type === "conversation_archive") {
+        handleConversationArchive(msg);
+      } else if (msg.type === "recovery_capture") {
+        handleRecoveryCapture(msg);
+      } else if (msg.type === "browser_target_retain") {
+        handleBrowserTargetRetain(msg);
+      } else if (msg.type === "browser_target_release") {
+        handleBrowserTargetRelease(msg);
+      } else if (msg.type === "abort") {
+        const tabId = inflight.get(msg.id);
+        inflight.delete(msg.id);
+        if (tabId !== undefined) {
+          chrome.tabs.sendMessage(tabId, { type: "abort", id: msg.id }).catch(() => {});
+        }
+      }
+    };
+
+    ws.onclose = (event) => {
+      if (socket !== ws) {
+        console.debug("stale_socket_close_ignored", { generation, code: event.code });
+        return;
+      }
+      if (event.code === 4000) {
+        // Le serveur nous a remplacés par un autre client (fake_extension.py,
+        // un second profil Chrome…). On s'efface au lieu de reprendre la main.
+        suppressUntil = Date.now() + REPLACED_BACKOFF;
+        suppressReason = "replaced";
+        scheduleReconnect(ws, "remplacé par un autre client du pont", { generation });
+        return;
+      }
+      if (event.code === 4409 && event.reason === "owner_active") {
+        // Un autre owner détient un lease sain : attendre avant toute nouvelle
+        // tentative évite une oscillation entre plusieurs profils Chrome.
+        suppressUntil = Date.now() + REPLACED_BACKOFF;
+        suppressReason = "owner_active";
+        scheduleReconnect(ws, "owner_active", { generation });
+        return;
+      }
+      scheduleReconnect(ws, null, { generation });
+    };
+    ws.onerror = () => {
+      if (socket !== ws) return;
+      setStatus({ lastError: "serveur injoignable" });
+    };
+  } finally {
+    if (connectAttempt === attempt) connectAttempt = null;
+  }
 }
 
 async function handleRecoveryCapture(msg) {
@@ -542,13 +626,27 @@ async function handleConversationArchive(msg) {
   }
 }
 
-function scheduleReconnect(error) {
-  socket = null;
+function scheduleReconnect(ownerSocket, error, options = {}) {
+  if (ownerSocket && socket !== ownerSocket) return false;
+  if (options.attempt && connectAttempt !== options.attempt) return false;
+  if (
+    options.generation !== undefined &&
+    connectionGeneration !== options.generation
+  ) {
+    return false;
+  }
+  if (ownerSocket) socket = null;
   setStatus({ connected: false, lastError: error || status.lastError });
   clearTimeout(reconnectTimer);
   const delay = Math.max(reconnectDelay, suppressUntil - Date.now());
-  reconnectTimer = setTimeout(connect, delay);
+  const generation = options.generation ?? connectionGeneration;
+  reconnectTimer = setTimeout(() => {
+    if (generation !== connectionGeneration || socket !== null) return;
+    reconnectTimer = null;
+    void connect();
+  }, delay);
   reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX);
+  return true;
 }
 
 const MAX_EN_ATTENTE = 500;
@@ -567,7 +665,7 @@ function send(payload) {
     return;
   }
   if (enAttente.length < MAX_EN_ATTENTE) enAttente.push(payload);
-  connect();
+  if (!socket || socket.readyState === WebSocket.CLOSED) void connect();
 }
 
 function flush() {
@@ -585,6 +683,581 @@ async function findChatTab() {
   });
   if (tabs.length === 0) return null;
   return tabs.find((t) => t.active) || tabs[tabs.length - 1];
+}
+
+/**
+ * Onglet diagnostiqué : la priorité suit la chaîne réelle du run, du plus
+ * exact au plus générique. Un onglet ChatGPT quelconque n'est JAMAIS préféré à
+ * une cible du bridge, et le diagnostic dit toujours de quelle source il parle
+ * (`diagnostic_target.source` + `bridge_owned`).
+ *
+ *   1. inflight      : l'onglet exact du run en cours (Map `inflight`) ;
+ *   2. browser_target: la target exacte réservée pour un run stateless ;
+ *   3. bridge_conversation : le binding retenu (KEEP / recovery) d'une
+ *      conversation live, retrouvé par `tabs.get` exact ;
+ *   4. bridge_owned_tab : un onglet ChatGPT vivant dans une fenêtre possédée
+ *      par le bridge — la propriété est prouvée, l'onglet ne l'est pas ;
+ *   5. generic_chatgpt_tab : dernier recours assumé, `bridge_owned: false`.
+ */
+async function findDiagnosticChatTab() {
+  const exact = async (tabId, source, bridgeOwned) => {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      return { tab, source, bridge_owned: bridgeOwned };
+    } catch {
+      return null;
+    }
+  };
+  for (const tabId of [...new Set([...inflight.values()].reverse())]) {
+    const found = await exact(tabId, "inflight", true);
+    if (found) return found;
+  }
+  await Promise.all([browserTargetRegistryReady, conversationRegistryReady]);
+  const bound = async (entries, source) => {
+    for (const entry of entries) {
+      if (entry?.bridge_owned_window !== true || !Number.isInteger(entry.tab_id)) continue;
+      const found = await exact(entry.tab_id, source, true);
+      if (found) return found;
+    }
+    return null;
+  };
+  const browserTarget = await bound([...browserTargetRegistry.values()].reverse(), "browser_target");
+  if (browserTarget) return browserTarget;
+  const conversation = await bound(
+    [...conversationRegistry.values()].reverse(),
+    "bridge_conversation",
+  );
+  if (conversation) return conversation;
+  // Le filtre d'URL est refait ici : le diagnostic ne dépend pas de la
+  // sémantique exacte de `chrome.tabs.query({ url })` côté navigateur.
+  const tabs = (
+    await chrome.tabs.query({
+      url: ["https://chatgpt.com/*", "https://chat.openai.com/*"],
+    })
+  ).filter((tab) => isAllowedChatOrigin(tab.url));
+  if (tabs.length === 0) return null;
+  const ownedWindows = new Set();
+  for (const entry of [...browserTargetRegistry.values(), ...conversationRegistry.values()]) {
+    if (entry?.bridge_owned_window !== true || !Number.isInteger(entry.window_id)) continue;
+    ownedWindows.add(entry.window_id);
+  }
+  const ownedTab = tabs.find((tab) => ownedWindows.has(tab.windowId));
+  if (ownedTab) {
+    return { tab: ownedTab, source: "bridge_owned_tab", bridge_owned: true };
+  }
+  const active = tabs.find((tab) => tab.active);
+  if (active) return { tab: active, source: "generic_chatgpt_tab", bridge_owned: false };
+  const recent = tabs.reduce((newest, tab) => {
+    if (typeof tab.lastAccessed === "number" && typeof newest.lastAccessed === "number") {
+      return tab.lastAccessed > newest.lastAccessed ? tab : newest;
+    }
+    return tabs.indexOf(tab) > tabs.indexOf(newest) ? tab : newest;
+  });
+  return { tab: recent, source: "generic_chatgpt_tab", bridge_owned: false };
+}
+
+/**
+ * État de connexion du point de vue du worker, sans contenu ni secret :
+ * seuls des préfixes d'identifiants, des compteurs et des âges bornés.
+ */
+function connectionDiagnostic(now = Date.now()) {
+  const open = socket?.readyState === WebSocket.OPEN;
+  let state;
+  if (now < suppressUntil) state = "conflict";
+  else if (!socket) state = "disconnected";
+  else if (!open) state = "connecting";
+  else if (lastPingAt !== null && now - lastPingAt > PING_STALE_MS) state = "stale";
+  else state = "stable";
+  const prefix = (value) => (typeof value === "string" ? value.slice(0, 8) : null);
+  const current = open ? connectionIdentity : null;
+  return {
+    state,
+    conflict_reason: state === "conflict" ? suppressReason : null,
+    instance_id_prefix: prefix(current?.instance_id),
+    worker_session_prefix: prefix(workerSessionId),
+    connection_id_prefix: prefix(current?.connection_id),
+    reconnections: Math.max(0, openedConnections - 1),
+    seconds_since_ping:
+      open && lastPingAt !== null ? Math.max(0, Math.round((now - lastPingAt) / 1000)) : null,
+  };
+}
+
+function diagnosticCount(value) {
+  return Number.isInteger(value) ? Math.max(0, Math.min(value, 999)) : 0;
+}
+
+const RESPONSE_STRATEGIES = new Set(["semantic_assistant", "markdown_root_delta"]);
+const SURFACE_STRATEGIES = new Set([
+  "composer_main",
+  "composer_scroll_container",
+  "composer_parent",
+  "document_main",
+  "document_body",
+]);
+
+/**
+ * Contrat de réponse (ResponseRoot) : surface, stratégie, comptages et
+ * dernière décision du locator. Liste blanche fermée — jamais un texte, jamais
+ * un nœud, jamais une référence DOM.
+ */
+function safeResponseLocator(raw) {
+  const locator = raw || {};
+  const tag = ["DIV", "ARTICLE", "SECTION", "SPAN", "P"].includes(
+    locator.candidate_root_tag,
+  )
+    ? locator.candidate_root_tag
+    : null;
+  return {
+    conversation_surface: locator.conversation_surface === true,
+    surface_strategy: SURFACE_STRATEGIES.has(locator.surface_strategy)
+      ? locator.surface_strategy
+      : null,
+    strategy: RESPONSE_STRATEGIES.has(locator.strategy) ? locator.strategy : null,
+    baseline_root_count: diagnosticCount(locator.baseline_root_count),
+    current_root_count: diagnosticCount(locator.current_root_count),
+    candidate_found: locator.candidate_found === true,
+    candidate_root_tag: tag,
+    markdown_root: locator.markdown_root === true,
+    inline_leaf_count: diagnosticCount(locator.inline_leaf_count),
+    ambiguity_count: diagnosticCount(locator.ambiguity_count),
+    candidate_state: ["idle", "pending", "found", "broken"].includes(locator.candidate_state)
+      ? locator.candidate_state
+      : "idle",
+    reason: ["ambiguous_root", "inline_without_root", "surface_missing"].includes(locator.reason)
+      ? locator.reason
+      : null,
+  };
+}
+
+function safeDomHealth(raw, tabId, diagnosticTarget) {
+  const statuses = new Set(["ok", "degraded", "missing", "ambiguous", "invalid", "not_rendered_idle"]);
+  const composerStrategies = new Set(["named_selector", "structural_fallback"]);
+  const sendStrategies = composerStrategies;
+  const composerSelectors = new Set([
+    "[data-composer-markdown][contenteditable='true'][role='textbox']",
+    "#prompt-textarea",
+    "[data-testid='prompt-textarea']",
+    "div[contenteditable='true'][id^='prompt']",
+    "textarea[data-id]",
+    "[contenteditable='true'][role='textbox']",
+  ]);
+  const sendSelectors = new Set([
+    "button[data-testid='send-button']",
+    "#composer-submit-button",
+    "button[aria-label*='Envoyer']",
+    "button[aria-label*='Send']",
+    "button[type='submit']",
+  ]);
+  const surface = raw?.surface || {};
+  const composer = raw?.composer || {};
+  const send = raw?.send || {};
+  const normalizeStatus = (value, fallback = "missing") =>
+    statuses.has(value) ? value : fallback;
+  const strategy = (value, allowed) => (allowed.has(value) ? value : null);
+  const fixedSelector = (value, allowed) => (allowed.has(value) ? value : null);
+  const tag = ["DIV", "TEXTAREA", "INPUT"].includes(composer.tag) ? composer.tag : null;
+  const sendType = ["button", "submit", "reset", "other"].includes(send.type)
+    ? send.type
+    : null;
+
+  return {
+    ok: raw?.ok === true,
+    content_script_version:
+      typeof raw?.content_script_version === "string"
+        ? raw.content_script_version.slice(0, 20)
+        : null,
+    tab_id: Number.isInteger(tabId) ? tabId : null,
+    diagnostic_target: {
+      source: ["inflight", "browser_target", "bridge_conversation", "bridge_owned_tab", "generic_chatgpt_tab"].includes(diagnosticTarget?.source)
+        ? diagnosticTarget.source
+        : "generic_chatgpt_tab",
+      bridge_owned: diagnosticTarget?.bridge_owned === true,
+    },
+    extension_state: "active",
+    websocket_state: status.connected ? "connected" : "disconnected",
+    connection: connectionDiagnostic(),
+    surface: {
+      origin_ok: surface.origin_ok === true,
+      pathname: typeof surface.pathname === "string" ? surface.pathname.slice(0, 128) : "",
+      temporary_query: surface.temporary_query === true,
+      temporary_status: normalizeStatus(surface.temporary_status, "invalid"),
+      visibility_state: ["visible", "hidden", "prerender", "unloaded"].includes(
+        surface.visibility_state,
+      )
+        ? surface.visibility_state
+        : "unknown",
+      has_focus: surface.has_focus === true,
+    },
+    composer: {
+      status: normalizeStatus(composer.status),
+      strategy: strategy(composer.strategy, composerStrategies),
+      selector: fixedSelector(composer.selector, composerSelectors),
+      visible_candidates: diagnosticCount(composer.visible_candidates),
+      known_selector_candidates: diagnosticCount(composer.known_selector_candidates),
+      structural_candidates: diagnosticCount(composer.structural_candidates),
+      tag,
+      role: composer.role === "textbox" ? "textbox" : null,
+      contenteditable: composer.contenteditable === true,
+      data_composer_markdown: composer.data_composer_markdown === true,
+      form_found: composer.form_found === true,
+    },
+    send: {
+      status: normalizeStatus(send.status),
+      strategy: strategy(send.strategy, sendStrategies),
+      selector: fixedSelector(send.selector, sendSelectors),
+      visible_candidates: diagnosticCount(send.visible_candidates),
+      type: sendType,
+      disabled: send.disabled === true,
+      aria_disabled: send.aria_disabled === true,
+      same_form_as_composer: typeof send.same_form_as_composer === "boolean"
+        ? send.same_form_as_composer
+        : null,
+    },
+    response_locator: safeResponseLocator(raw?.response_locator),
+    // État vivant du run : le worker le recopie filtré, il ne le recompute pas.
+    run: safeRunState(raw?.run),
+  };
+}
+
+async function handleUiDiagnostic() {
+  const target = await findDiagnosticChatTab();
+  if (!target) {
+    return {
+      ok: false,
+      error: "no_chatgpt_tab",
+      extension_state: "active",
+      websocket_state: status.connected ? "connected" : "disconnected",
+      connection: connectionDiagnostic(),
+    };
+  }
+  const { tab } = target;
+  try {
+    const health = await chrome.tabs.sendMessage(tab.id, { type: "dom_health" });
+    return safeDomHealth(health, tab.id, target);
+  } catch {
+    return {
+      ok: false,
+      error: "content_script_unavailable",
+      tab_id: Number.isInteger(tab.id) ? tab.id : null,
+      diagnostic_target: {
+        source: target.source,
+        bridge_owned: target.bridge_owned === true,
+      },
+      extension_state: "active",
+      websocket_state: status.connected ? "connected" : "disconnected",
+      connection: connectionDiagnostic(),
+    };
+  }
+}
+
+// --------------------------------------------------------------------------- //
+// Snapshot structurel borné (« Copy response structure »)
+//
+// Le worker ne recopie jamais la page : chaque champ traverse une liste
+// blanche fermée (tag, tokens de classe bornés, role, data-testid, data-*
+// autorisés, profondeur, nombre d'enfants, dimensions, visibilité). Aucune
+// propriété textuelle n'est jamais acceptée — ni texte, ni innerHTML, ni
+// corps de réponse, ni prompt.
+// --------------------------------------------------------------------------- //
+
+const STRUCTURE_LIMITS = {
+  depth: 6,
+  nodes: 200,
+  children: 40,
+  class_tokens: 8,
+  token_length: 40,
+  value_length: 64,
+};
+const STRUCTURE_DATA_KEYS = new Set([
+  "testid",
+  "author_role",
+  "turn",
+  "state",
+  "is_streaming",
+  "composer_markdown",
+  "aria_hidden",
+]);
+const STRUCTURE_TAGS = new Set([
+  "DIV",
+  "SPAN",
+  "P",
+  "UL",
+  "OL",
+  "LI",
+  "PRE",
+  "CODE",
+  "TABLE",
+  "TBODY",
+  "THEAD",
+  "TR",
+  "TD",
+  "TH",
+  "BLOCKQUOTE",
+  "H1",
+  "H2",
+  "H3",
+  "H4",
+  "H5",
+  "H6",
+  "A",
+  "STRONG",
+  "EM",
+  "HR",
+  "BR",
+  "IMG",
+  "VIDEO",
+  "CANVAS",
+  "MAIN",
+  "SECTION",
+  "ARTICLE",
+  "FORM",
+  "BUTTON",
+]);
+
+/** Compteur borné : jamais un NaN, jamais une valeur non finie. */
+function structureCount(value) {
+  return Number.isInteger(value) ? Math.max(0, Math.min(value, 999)) : 0;
+}
+
+/** Token de classe : borné, jamais un caractère de balisage ni d'espace. */
+function structureToken(value) {
+  return typeof value === "string" &&
+    value.length <= STRUCTURE_LIMITS.token_length &&
+    !/[\s"'<>\\]/.test(value)
+    ? value
+    : null;
+}
+
+/** Valeur d'attribut sûre : courte et sans caractère de balisage. */
+function structureValue(value) {
+  return typeof value === "string" &&
+    value.length <= STRUCTURE_LIMITS.value_length &&
+    !/[\s"'<>\\]/.test(value)
+    ? value
+    : null;
+}
+
+function safeStructureData(raw) {
+  const data = {};
+  if (!raw || typeof raw !== "object") return data;
+  for (const [key, value] of Object.entries(raw)) {
+    if (!STRUCTURE_DATA_KEYS.has(key)) continue;
+    if (value === true) {
+      data[key] = true;
+      continue;
+    }
+    const bounded = structureValue(value);
+    if (bounded !== null) data[key] = bounded;
+  }
+  return data;
+}
+
+function safeStructureNode(raw, depth, budget) {
+  if (!raw || typeof raw !== "object" || depth > STRUCTURE_LIMITS.depth) return null;
+  budget.nodes += 1;
+  const children = [];
+  if (Array.isArray(raw.children)) {
+    for (const child of raw.children.slice(0, STRUCTURE_LIMITS.children)) {
+      if (budget.nodes >= STRUCTURE_LIMITS.nodes) break;
+      const node = safeStructureNode(child, depth + 1, budget);
+      if (node) children.push(node);
+    }
+  }
+  const dimension = (value) =>
+    Number.isInteger(value) && value >= 0 && value <= 100000 ? value : null;
+  return {
+    tag: STRUCTURE_TAGS.has(raw.tag) ? raw.tag : null,
+    class_tokens: Array.isArray(raw.class_tokens)
+      ? raw.class_tokens
+          .slice(0, STRUCTURE_LIMITS.class_tokens)
+          .map(structureToken)
+          .filter((token) => token !== null && token !== "")
+      : [],
+    role: structureValue(raw.role),
+    data_testid: structureValue(raw.data_testid),
+    data: safeStructureData(raw.data),
+    has_message_id: raw.has_message_id === true,
+    depth,
+    children_count: structureCount(raw.children_count),
+    children,
+    width: dimension(raw.width),
+    height: dimension(raw.height),
+    visible: raw.visible === true,
+  };
+}
+
+function safeRootStrategy(value) {
+  return RESPONSE_STRATEGIES.has(value) ? value : null;
+}
+
+/** Copie bornée du snapshot structurel : aucune propriété textuelle, jamais. */
+function safeResponseStructure(raw, tabId, diagnosticTarget) {
+  const surface = raw?.conversation_surface || {};
+  const roots = Array.isArray(raw?.roots) ? raw.roots : [];
+  return {
+    ok: raw?.ok === true,
+    content_script_version:
+      typeof raw?.content_script_version === "string"
+        ? raw.content_script_version.slice(0, 20)
+        : null,
+    tab_id: Number.isInteger(tabId) ? tabId : null,
+    diagnostic_target: {
+      source: ["inflight", "browser_target", "bridge_conversation", "bridge_owned_tab", "generic_chatgpt_tab"].includes(diagnosticTarget?.source)
+        ? diagnosticTarget.source
+        : "generic_chatgpt_tab",
+      bridge_owned: diagnosticTarget?.bridge_owned === true,
+    },
+    conversation_surface: {
+      found: surface.found === true,
+      strategy: SURFACE_STRATEGIES.has(surface.strategy) ? surface.strategy : null,
+      node: surface.node ? safeStructureNode(surface.node, 0, { nodes: 0 }) : null,
+    },
+    strategy: safeRootStrategy(raw?.strategy),
+    markdown_root_matches: structureCount(raw?.markdown_root_matches),
+    semantic_assistant_matches: structureCount(raw?.semantic_assistant_matches),
+    inline_leaf_matches: structureCount(raw?.inline_leaf_matches),
+    roots: roots
+      .slice(0, STRUCTURE_LIMITS.nodes)
+      .map((root) => ({
+        strategy: safeRootStrategy(root?.strategy),
+        node: safeStructureNode(root?.node, 0, { nodes: 0 }),
+      }))
+      .filter((root) => root.node !== null),
+  };
+}
+
+const RUN_STATES = new Set(["idle", "waiting", "active", "quiescent", "final"]);
+const RUN_SIGNALS = new Set([
+  "unknown",
+  "streaming",
+  "reasoning",
+  "stop_button",
+  "assistant_actions",
+  "output_stable",
+  "quiescent_stability",
+]);
+const RUN_MODES = new Set(["terminal_action", "quiescent_stability"]);
+const RUN_CONFIDENCES = new Set(["low", "medium", "high"]);
+const RUN_PHASES = /^[a-z_]{1,32}$/;
+const RUN_SERIALIZER = /^[a-z][a-z0-9.-]{0,31}$/;
+
+/**
+ * État vivant du run (finalisation + sérialisation + réveils), en liste blanche
+ * fermée : comptages, booléens, durées, chaînes bornées. Jamais un contenu,
+ * jamais un nœud, jamais un identifiant d'onglet complet. Le worker et le popup
+ * ne recalculent aucune finalisation : ils recopient l'état que la boucle du
+ * content script a réellement maintenu et utilisé pour décider.
+ */
+function safeRunState(raw) {
+  const run = raw || {};
+  const bounded = (value) =>
+    Number.isInteger(value) && value >= 0 && value <= 1000000 ? value : 0;
+  const duration = (value) =>
+    Number.isFinite(value) ? Math.max(0, Math.round(value)) : null;
+  const signals = run.signals || {};
+  const serialization = run.serialization || {};
+  const observation = run.observation || {};
+  const lastWake = observation.last_wake || {};
+  const threshold = run.stable_threshold_ms;
+  return {
+    active: run.active === true,
+    phase: typeof run.phase === "string" && RUN_PHASES.test(run.phase) ? run.phase : "idle",
+    state: RUN_STATES.has(run.state) ? run.state : "idle",
+    mode: RUN_MODES.has(run.mode) ? run.mode : null,
+    signal: RUN_SIGNALS.has(run.signal) ? run.signal : null,
+    confidence: RUN_CONFIDENCES.has(run.confidence) ? run.confidence : null,
+    output_chars: bounded(run.output_chars),
+    stable_for_ms: bounded(run.stable_for_ms),
+    stable_threshold_ms: Number.isFinite(threshold) && threshold >= 0
+      ? Math.round(threshold)
+      : null,
+    stable_observations: bounded(run.stable_observations),
+    signals: {
+      actions: signals.actions === true,
+      streaming: signals.streaming === true,
+      reasoning: signals.reasoning === true,
+      stop: signals.stop === true,
+    },
+    serialization: {
+      root_found: typeof serialization.root_found === "boolean"
+        ? serialization.root_found
+        : null,
+      serializer: typeof serialization.serializer === "string" &&
+        RUN_SERIALIZER.test(serialization.serializer)
+        ? serialization.serializer
+        : null,
+      last_serialize: ["ok", "error"].includes(serialization.last_serialize)
+        ? serialization.last_serialize
+        : null,
+      ms: bounded(serialization.ms),
+    },
+    observation: {
+      last_wake: {
+        mutation: bounded(lastWake.mutation),
+        observe_tick: bounded(lastWake.observe_tick),
+        timer: bounded(lastWake.timer),
+      },
+      ms_since_observation: duration(observation.ms_since_observation),
+      ms_since_dom_mutation: duration(observation.ms_since_dom_mutation),
+    },
+  };
+}
+/**
+ * État vivant seul, pour le popup ouvert pendant un run : même sélection de
+ * cible que le diagnostic complet, même liste blanche, aucune observation de
+ * plus. Un onglet sans run rend `active: false` — jamais un état hérité.
+ */
+async function handleRunState() {
+  const target = await findDiagnosticChatTab();
+  if (!target) {
+    return {
+      ok: false,
+      error: "no_chatgpt_tab",
+      diagnostic_target: { source: "generic_chatgpt_tab", bridge_owned: false },
+      run: safeRunState(null),
+    };
+  }
+  const { tab } = target;
+  const diagnostic_target = {
+    source: target.source,
+    bridge_owned: target.bridge_owned === true,
+  };
+  try {
+    const run = await chrome.tabs.sendMessage(tab.id, { type: "run_state" });
+    return {
+      ok: true,
+      error: null,
+      tab_id: Number.isInteger(tab.id) ? tab.id : null,
+      diagnostic_target,
+      run: safeRunState(run),
+    };
+  } catch {
+    return {
+      ok: false,
+      error: "content_script_unavailable",
+      tab_id: Number.isInteger(tab.id) ? tab.id : null,
+      diagnostic_target,
+      run: safeRunState(null),
+    };
+  }
+}
+
+async function handleResponseStructure() {
+  const target = await findDiagnosticChatTab();
+  if (!target) return { ok: false, error: "no_chatgpt_tab" };
+  const { tab } = target;
+  try {
+    const structure = await chrome.tabs.sendMessage(tab.id, {
+      type: "response_structure",
+    });
+    return safeResponseStructure(structure, tab.id, target);
+  } catch {
+    return {
+      ok: false,
+      error: "content_script_unavailable",
+      tab_id: Number.isInteger(tab.id) ? tab.id : null,
+    };
+  }
 }
 
 /** Un onglet appartient-il à une origine ChatGPT autorisée ? Jamais une identité. */
@@ -1390,14 +2063,51 @@ async function handleUiRequest(msg) {
 
 // Remontée des paquets du content script vers le serveur.
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg?.type === "diagnose_ui") {
+    void handleUiDiagnostic().then(
+      sendResponse,
+      () => sendResponse({
+        ok: false,
+        error: "diagnostic_failed",
+        extension_state: "active",
+        websocket_state: status.connected ? "connected" : "disconnected",
+        connection: connectionDiagnostic(),
+      }),
+    );
+    return true;
+  }
   if (msg?.type === "status") {
-    sendResponse(status);
+    sendResponse({ ...status, connection: connectionDiagnostic() });
+    return true;
+  }
+  if (msg?.type === "run_state") {
+    // État vivant du run (finalisation / sérialisation / réveils), relu à
+    // chaque rafraîchissement du popup : le popup n'invente aucun état.
+    void handleRunState().then(
+      sendResponse,
+      () => sendResponse({
+        ok: false,
+        error: "diagnostic_failed",
+        diagnostic_target: { source: "generic_chatgpt_tab", bridge_owned: false },
+        run: safeRunState(null),
+      }),
+    );
+    return true;
+  }
+  if (msg?.type === "response_structure") {
+    // Snapshot structurel borné, demandé par le popup : le worker transmet la
+    // question à l'onglet diagnostiqué puis ne recopie que la liste blanche.
+    void handleResponseStructure().then(
+      sendResponse,
+      () => sendResponse({ ok: false, error: "diagnostic_failed" }),
+    );
     return true;
   }
   if (msg?.type === "reconnect") {
     // Reconnexion manuelle : reprend le pont même si on vient d'être remplacé.
     reconnectDelay = RECONNECT_MIN;
     suppressUntil = 0;
+    suppressReason = null;
     connect();
     sendResponse({ ok: true });
     return true;

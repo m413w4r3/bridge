@@ -12,14 +12,21 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import FakeExtension, isolated_registry, request_with_key
+from conftest import (
+    FakeExtension,
+    final_output_metadata,
+    isolated_registry,
+    request_with_key,
+)
 from fastapi import HTTPException
 from pydantic import ValidationError
 
 from bridge.app import BridgeApplication
-from bridge.contracts import BridgeRunRequest
+from bridge.contracts import BridgeRunRequest, ChatRequest, ResponseRequest
 from bridge.generation import _response_chat_request
+from bridge.routes_openai import _chat_response_request
 from bridge.registry import RunRegistry
+from bridge.run_service import requires_continuation_identity
 
 
 def test_native_bridge_contract_reports_honest_capabilities(runtime: BridgeApplication) -> None:
@@ -88,6 +95,140 @@ def test_conversation_contract_is_explicit_and_rejects_arbitrary_navigation(
                 "external_locator": "https://example.org/internal",
             },
         )
+
+
+def test_continuation_identity_requirement_is_normalized_across_facades(
+    runtime: BridgeApplication,
+) -> None:
+    fresh_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    chat_request = _chat_response_request(
+        ChatRequest(messages=[{"role": "user", "content": "one shot"}])
+    )
+    response_request = ResponseRequest(input="one shot")
+    bridge_request = runtime.bridge_routes._bridge_response_request(
+        BridgeRunRequest(input="one shot")
+    )
+    assert not requires_continuation_identity(chat_request)
+    assert not requires_continuation_identity(response_request)
+    assert not requires_continuation_identity(bridge_request)
+
+    response_continue = ResponseRequest(
+        input="continue", conversation={"mode": "fresh", "id": fresh_id}
+    )
+    bridge_continue = runtime.bridge_routes._bridge_response_request(
+        BridgeRunRequest(
+            input="continue",
+            conversation={"mode": "fresh", "id": fresh_id},
+        )
+    )
+    assert requires_continuation_identity(response_continue)
+    assert requires_continuation_identity(bridge_continue)
+
+
+async def test_requested_continuation_without_external_turn_id_stays_fail_closed(
+    runtime: BridgeApplication, tmp_path: Path
+) -> None:
+    isolated_registry(runtime, tmp_path)
+    extension = FakeExtension(runtime)
+    extension.answer_text = "BRIDGE_OK"
+    extension.omit_external_turn_id = True
+    runtime.bridge.ws = extension
+
+    result = await runtime.bridge_routes.create_bridge_run(
+        BridgeRunRequest(
+            input="continue this conversation",
+            conversation={
+                "mode": "fresh",
+                "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            },
+        ),
+        request_with_key("continuation-needs-turn-id"),
+    )
+
+    assert result["status"] == "needs_review"
+    assert result["error"]["code"] == "external_turn_identity_unavailable"
+    assert result["error"]["message"].startswith("La réponse finale existe")
+    assert result["metadata"]["candidate_output_present"] is True
+    assert result["metadata"]["external_turn_id_verified"] is False
+    record = runtime.registry.get_by_idempotency_key("continuation-needs-turn-id")
+    assert record["state"] == "needs_review"
+    assert extension.prompt_count == 1
+
+
+async def test_stateless_terminal_action_without_external_turn_id_succeeds(
+    runtime: BridgeApplication, tmp_path: Path
+) -> None:
+    isolated_registry(runtime, tmp_path)
+    extension = FakeExtension(runtime)
+    extension.answer_text = "terminal output"
+    runtime.bridge.ws = extension
+
+    result = await runtime.bridge_routes.create_bridge_run(
+        BridgeRunRequest(input="one shot"),
+        request_with_key("stateless-terminal-no-turn-id"),
+    )
+
+    assert result["status"] == "completed"
+    assert result["output_text"] == "terminal output"
+    assert result["metadata"]["external_turn_id"] is None
+    assert result["metadata"]["external_turn_id_verified"] is False
+    assert result["metadata"]["continuation_available"] is False
+    assert result["metadata"]["finalization"]["mode"] == "terminal_action"
+    assert result["metadata"]["finalization_evidence"]["mode"] == "terminal_action"
+    assert extension.prompt_count == 1
+
+
+async def test_stateless_external_turn_id_is_retained_without_reuse_claim(
+    runtime: BridgeApplication, tmp_path: Path
+) -> None:
+    isolated_registry(runtime, tmp_path)
+    extension = FakeExtension(runtime)
+    extension.stateless_external_turn_id = "verified-stateless-turn"
+    runtime.bridge.ws = extension
+
+    result = await runtime.bridge_routes.create_bridge_run(
+        BridgeRunRequest(input="one shot"),
+        request_with_key("stateless-with-optional-turn-id"),
+    )
+
+    assert result["status"] == "completed"
+    assert result["metadata"]["external_turn_id"] == "verified-stateless-turn"
+    assert result["metadata"]["external_turn_id_verified"] is True
+    assert result["metadata"]["continuation_available"] is False
+    assert result["metadata"]["conversation"] is None
+
+
+@pytest.mark.parametrize(
+    "metadata_override",
+    [
+        {"finalization": {"finalization_state": "quiescent"}},
+        {"finalization_evidence": {"mode": "quiescent_stability"}},
+    ],
+    ids=["non-final-state", "invalid-evidence"],
+)
+async def test_visible_candidate_without_final_evidence_is_never_success(
+    runtime: BridgeApplication, tmp_path: Path, metadata_override: dict[str, Any]
+) -> None:
+    isolated_registry(runtime, tmp_path)
+    extension = FakeExtension(runtime)
+    extension.answer_text = "visible candidate"
+    extension.final_metadata_overrides = metadata_override
+    runtime.bridge.ws = extension
+
+    result = await runtime.bridge_routes.create_bridge_run(
+        BridgeRunRequest(input="one shot"),
+        request_with_key("candidate-without-final-evidence"),
+    )
+
+    assert result["status"] == "needs_review"
+    assert result["error"]["code"] == "finalization_evidence_invalid"
+    assert result["metadata"]["candidate_output_present"] is True
+    assert result["output_text"] == ""
+    record = runtime.registry.get_by_idempotency_key(
+        "candidate-without-final-evidence"
+    )
+    assert record["state"] == "needs_review"
+    assert extension.prompt_count == 1
 
 
 def test_requested_model_is_a_label_and_only_ui_model_drives_the_interface(
@@ -173,6 +314,107 @@ async def test_three_http_retries_with_same_key_submit_one_prompt_and_replay_res
     assert first["metadata"]["content_script_version"] == "14"
 
 
+async def test_quiescent_finalization_survives_into_run_metadata(
+    runtime: BridgeApplication, tmp_path: Path
+) -> None:
+    """UI moderne : réponse complète, aucune barre Copy/actions jamais montrée.
+
+    Le mode de conclusion (`quiescent_stability`, confiance `medium`) doit
+    survivre jusqu'aux métadonnées du run — le refuser effacerait la seule trace
+    permettant de distinguer une fin prouvée par Copy d'une fin conclue sur
+    stabilité quiescente.
+    """
+    from bridge.generation import generation_progress
+
+    isolated_registry(runtime, tmp_path)
+    answer = "BRIDGE_OK"
+
+    class QuiescentExtension(FakeExtension):
+        async def _respond(self, payload: dict[str, Any]) -> None:
+            if payload["type"] != "prompt":
+                await super()._respond(payload)
+                return
+            self.prompt_count += 1
+            browser_target = payload.get("browser_target")
+            route = (
+                {"target_id": browser_target["id"], "tab_id": 1}
+                if isinstance(browser_target, dict)
+                else {}
+            )
+            self.runtime.bridge.dispatch(
+                {
+                    "type": "heartbeat",
+                    "id": payload["id"],
+                    "event_id": "1",
+                    "progress": {
+                        "phase": "generating",
+                        "output_chars": len(answer),
+                        "stable_for_ms": 16_000,
+                        "completion_signal": "output_stable",
+                        "completion_confidence": "medium",
+                        "finalization": {
+                            "finalization_state": "final",
+                            "signal": "quiescent_stability",
+                            "output_chars": len(answer),
+                            "stable_for_ms": 16_000,
+                            "stable_observations": 5,
+                            "streaming_visible": False,
+                            "reasoning_visible": False,
+                            "stop_visible": False,
+                            "terminal_action_visible": False,
+                            "response_strategy": "markdown_root_delta",
+                        },
+                    },
+                    **route,
+                }
+            )
+            self.runtime.bridge.dispatch(
+                {
+                    "type": "done",
+                    "id": payload["id"],
+                    "event_id": "2",
+                    "text": answer,
+                    "metadata": final_output_metadata(
+                        answer,
+                        mode="quiescent_stability",
+                        stable_for_ms=16_000,
+                        stable_observations=5,
+                        content_script_version="38",
+                    ),
+                    **route,
+                }
+            )
+
+    extension = QuiescentExtension(runtime, prompt_delay=0)
+    runtime.bridge.ws = extension
+
+    result = await runtime.bridge_routes.create_bridge_run(
+        BridgeRunRequest(input="mission"), request_with_key("quiescent-final")
+    )
+
+    assert result["status"] == "completed"
+    assert result["output_text"] == answer
+    assert result["metadata"]["completion_signal"] == "quiescent_stability"
+    assert result["metadata"]["completion_confidence"] == "medium"
+    assert result["metadata"]["content_script_version"] == "38"
+    # Le dernier état observé reste lisible pendant le run, dans un vocabulaire
+    # fermé : même un contenu glissé dans un diagnostic serait écarté.
+    progress = generation_progress(result["id"])
+    assert progress["finalization"] == {
+        "finalization_state": "final",
+        "signal": "quiescent_stability",
+        "output_chars": len(answer),
+        "stable_for_ms": 16_000,
+        "stable_observations": 5,
+        "streaming_visible": False,
+        "reasoning_visible": False,
+        "stop_visible": False,
+        "terminal_action_visible": False,
+        "response_strategy": "markdown_root_delta",
+    }
+    assert extension.prompt_count == 1
+
+
 async def test_background_bridge_run_returns_immediately_and_is_polled_to_completion(
     runtime: BridgeApplication, tmp_path: Path
 ) -> None:
@@ -195,14 +437,7 @@ async def test_background_bridge_run_returns_immediately_and_is_polled_to_comple
                     "id": payload["id"],
                     "event_id": "1",
                     "text": "snapshot final unique",
-                    "metadata": {
-                        "completion_signal": "assistant_actions",
-                        "completion_confidence": "high",
-                        "stable_for_ms": 2_100,
-                        "output_chars": 21,
-                        "visible_citation_count": 0,
-                        "content_script_version": "14",
-                    },
+                    "metadata": final_output_metadata("snapshot final unique"),
                     "target_id": browser_target["id"],
                     "tab_id": 1,
                 }
@@ -321,6 +556,25 @@ def _stalled_extension(
                                 "data_state": None,
                             }
                         ],
+                        # Dernier état de la machine de finalisation, tel que le
+                        # content script le publie : c'est lui, et rien d'autre,
+                        # qui explique pourquoi ce run n'a pas conclu.
+                        "finalization": {
+                            "finalization_state": "active",
+                            "signal": "streaming",
+                            "output_chars": len(text),
+                            "stable_for_ms": 300_000,
+                            "stable_observations": 4,
+                            "streaming_visible": True,
+                            "reasoning_visible": False,
+                            "stop_visible": False,
+                            "terminal_action_visible": False,
+                            "response_strategy": "markdown_root_delta",
+                            # Rejets attendus : hors vocabulaire, et jamais un
+                            # contenu qui se glisserait dans un diagnostic.
+                            "answer_text": "réponse confidentielle",
+                        },
+                        "blocking_signal": "streaming",
                     },
                     **route,
                 }
@@ -362,6 +616,24 @@ async def test_visible_answer_survives_active_signal_stall_and_lost_tab(
             "data_state": None,
         }
     ]
+    # Le diagnostic de blocage survit intact : état de finalisation borné, signal
+    # bloquant nommé, et aucun contenu malgré la clé hostile du fixture.
+    assert result["metadata"]["finalization"] == {
+        "finalization_state": "active",
+        "signal": "streaming",
+        "output_chars": len(answer),
+        "stable_for_ms": 300_000,
+        "stable_observations": 4,
+        "streaming_visible": True,
+        "reasoning_visible": False,
+        "stop_visible": False,
+        "terminal_action_visible": False,
+        "response_strategy": "markdown_root_delta",
+    }
+    assert result["error"]["details"]["blocking_signal"] == "streaming"
+    assert "réponse confidentielle" not in json.dumps(result)
+    # Rien n'a été conclu : aucune preuve de fin ne doit être annoncée.
+    assert "finalization_evidence" not in result["metadata"]
     # Le texte lui-même n'entre jamais dans les métadonnées d'erreur.
     assert answer not in json.dumps(result, ensure_ascii=False)
 
@@ -1197,3 +1469,129 @@ async def test_bridge_logs_neither_prompt_nor_idempotency_secret(
     assert "TOP-SECRET-PROMPT" not in rendered
     assert "TOP-SECRET-IDEMPOTENCY-KEY" not in rendered
     assert "idempotency_fingerprint=" in rendered
+
+
+class _SelectorDriftExtension(FakeExtension):
+    """Content script whose composer contract no longer matches the page.
+
+    The error packet mirrors `uiContractError()` in `extension/content.js`:
+    typed code, pre-submission phase, and a bounded `dom_health` snapshot.
+    """
+
+    async def _respond(self, payload: dict[str, Any]) -> None:
+        if payload["type"] != "prompt":
+            await super()._respond(payload)
+            return
+        self.prompt_count += 1
+        await asyncio.sleep(0)
+        browser_target = payload.get("browser_target")
+        route = (
+            {"target_id": browser_target["id"], "tab_id": 1}
+            if isinstance(browser_target, dict) and browser_target.get("id")
+            else {}
+        )
+        self.runtime.bridge.dispatch(
+            {
+                "type": "error",
+                "id": payload["id"],
+                "event_id": "1",
+                "code": "bridge_ui_timeout",
+                "message": "composer introuvable",
+                "phase": "pre_submission",
+                "submission_state": "pre_submission",
+                "diagnostics": {
+                    "ui_contract_error": "composer_missing",
+                    "composer_strategy": "structural_fallback",
+                    "composer_selector": "[contenteditable='true'][role='textbox']",
+                    "composer_candidate_count": 0,
+                    "content_script_version": "38",
+                    "dom_health": {
+                        "ok": True,
+                        "content_script_version": "38",
+                        "surface": {
+                            "origin_ok": True,
+                            "pathname": "/",
+                            "temporary_query": True,
+                            "temporary_status": "ok",
+                            "visibility_state": "hidden",
+                            "has_focus": False,
+                        },
+                        "composer": {
+                            "status": "missing",
+                            "strategy": "structural_fallback",
+                            "selector": "[contenteditable='true'][role='textbox']",
+                            "visible_candidates": 0,
+                            "known_selector_candidates": 0,
+                            "structural_candidates": 0,
+                            "tag": None,
+                            "role": None,
+                            "contenteditable": False,
+                            "data_composer_markdown": False,
+                            "form_found": False,
+                        },
+                        "send": {
+                            "status": "missing",
+                            "strategy": "structural_fallback",
+                            "selector": "button[type='submit']",
+                            "visible_candidates": 0,
+                            "type": None,
+                            "disabled": False,
+                            "aria_disabled": False,
+                            "same_form_as_composer": False,
+                        },
+                    },
+                },
+                **route,
+            }
+        )
+
+
+async def test_pre_submission_selector_drift_is_a_typed_502_with_dom_health(
+    runtime: BridgeApplication, tmp_path: Path
+) -> None:
+    isolated_registry(runtime, tmp_path)
+    extension = _SelectorDriftExtension(runtime)
+    runtime.bridge.ws = extension
+
+    with pytest.raises(HTTPException) as raised:
+        await runtime.bridge_routes.create_bridge_run(
+            BridgeRunRequest(input="SECRET_PROMPT_BODY"), request_with_key("selector-drift")
+        )
+
+    assert raised.value.status_code == 502
+    rendered = await runtime.openai_error(None, raised.value)  # type: ignore[arg-type]
+    assert rendered.status_code == 502
+    error = json.loads(rendered.body)["error"]
+    assert error["code"] == "bridge_ui_timeout"
+    assert error["phase"] == "pre_submission"
+    assert error["submission_state"] == "pre_submission"
+    assert error["retryable"] is True
+    details = error["details"]
+    assert details["ui_contract_error"] == "composer_missing"
+    assert details["dom_health"]["content_script_version"] == "38"
+    # `_safe_diagnostics` drops null leaves (tag/role) and keeps the rest.
+    assert details["dom_health"]["composer"] == {
+        "status": "missing",
+        "strategy": "structural_fallback",
+        "selector": "[contenteditable='true'][role='textbox']",
+        "visible_candidates": 0,
+        "known_selector_candidates": 0,
+        "structural_candidates": 0,
+        "contenteditable": False,
+        "data_composer_markdown": False,
+        "form_found": False,
+    }
+    assert details["dom_health"]["send"]["status"] == "missing"
+    assert "SECRET_PROMPT_BODY" not in rendered.body.decode()
+    # Pre-submission: nothing was sent to ChatGPT, so the target is released,
+    # never retained for recovery, and the prompt was delivered exactly once.
+    assert extension.prompt_count == 1
+    assert not [m for m in extension.sent if m["type"] == "browser_target_retain"]
+    # The durable record replays the same diagnostic for the same key.
+    with pytest.raises(HTTPException) as replay:
+        await runtime.bridge_routes.create_bridge_run(
+            BridgeRunRequest(input="SECRET_PROMPT_BODY"), request_with_key("selector-drift")
+        )
+    assert replay.value.status_code == 502
+    assert replay.value.detail["details"]["dom_health"]["composer"]["status"] == "missing"
+    assert extension.prompt_count == 1

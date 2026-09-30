@@ -31,7 +31,16 @@ def test_extension_reserves_request_before_real_send_trigger() -> None:
     # émis avant tout `continue` dépendant du DOM, sinon une phase de recherche
     # web qui remplace le tour assistant provoque un faux idle timeout.
     assert 'type: "heartbeat"' in content
-    assert content.index('type: "heartbeat"') < content.index("if (!turn) continue;")
+    # Le `continue` dépendant du DOM est désormais un bloc (il réarme la machine
+    # de finalisation sur `waiting`), mais l'ordre est le même invariant.
+    heartbeat_at = content.index('type: "heartbeat"')
+    no_candidate_at = content.index("if (!candidate) {")
+    assert heartbeat_at < no_candidate_at
+    # Le bloc réarme explicitement la machine : un tour illisible ne finalise
+    # jamais sur un état antérieur, et le heartbeat reste émis sans contenu.
+    no_candidate_block = content[no_candidate_at : content.index("\n      }", no_candidate_at)]
+    assert 'state: "waiting"' in no_candidate_block
+    assert "finalizationDiagnostics(" in no_candidate_block
     assert 'type: "chunk"' not in content
     assert "text: serialized.text" in content
     send_start = background.index("async function sendToTab(")
@@ -362,7 +371,9 @@ def test_stall_guards_require_several_real_observations() -> None:
 
     assert "const MIN_STALL_OBSERVATIONS = 3;" in content
     assert content.count("stableObservations >= MIN_STALL_OBSERVATIONS") == 2
-    assert "observationsSinceActivity >= MIN_STALL_OBSERVATIONS" in content
+    # Avant le premier ResponseRoot, 300 s sans mutation peuvent être une
+    # réflexion normale ; seule la borne totale serveur clôt cette attente.
+    assert "FIRST_ASSISTANT_ACTIVITY_STALL_MS" not in content
     # La sémantique v29 de `.streaming-animation` reste intacte.
     assert 'longRunningStreaming: [".streaming-animation"]' in content
-    assert "!longRunningStreamingSignalActive(signalSources)" in content
+    assert "activeSignalStallApplies(finalization.signal, signalSources)" in content

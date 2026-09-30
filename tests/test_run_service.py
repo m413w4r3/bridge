@@ -6,6 +6,7 @@ import asyncio
 from types import SimpleNamespace
 
 from starlette.requests import Request
+from fastapi.testclient import TestClient
 
 from conftest import FakeExtension, isolated_registry
 from bridge.app import BridgeApplication
@@ -82,6 +83,79 @@ async def test_chat_completions_uses_the_same_durable_service(
     assert response["model"] == "client-label"
     assert response["choices"][0]["message"]["content"] == "chat result"
     assert runtime.registry.get_by_idempotency_key("chat-once")["state"] == "completed"
+
+
+def test_stateless_chat_final_without_external_turn_id_is_http_success_and_idempotent(
+    runtime: BridgeApplication, tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr("bridge.app.API_KEY", None)
+    isolated_registry(runtime, tmp_path)
+    extension = FakeExtension(runtime)
+    extension.answer_text = "BRIDGE_OK"
+    extension.final_metadata_overrides = {
+        "completion_signal": "quiescent_stability",
+        "completion_confidence": "medium",
+        "stable_for_ms": 15_104,
+        "serializer_version": "chatgpt-dom-v3",
+        "finalization": {
+            "finalization_state": "final",
+            "mode": "quiescent_stability",
+            "signal": "quiescent_stability",
+            "confidence": "medium",
+            "output_chars": 9,
+            "stable_for_ms": 15_104,
+            "stable_observations": 111,
+            "streaming_visible": False,
+            "reasoning_visible": False,
+            "stop_visible": False,
+            "terminal_action_visible": False,
+            "response_strategy": "markdown_root_delta",
+        },
+        "finalization_evidence": {
+            "mode": "quiescent_stability",
+            "signal": "quiescent_stability",
+            "stable_for_ms": 15_104,
+            "stable_observations": 111,
+            "output_chars": 9,
+            "candidate_strategy": "markdown_root_delta",
+        },
+    }
+    runtime.bridge.ws = extension
+    request = {
+        "model": "chatgpt-web",
+        "messages": [{"role": "user", "content": "Reply with exactly: BRIDGE_OK"}],
+    }
+
+    with TestClient(runtime.app) as client:
+        first = client.post(
+            "/v1/chat/completions",
+            json=request,
+            headers={"X-Idempotency-Key": "stateless-final-without-turn-id"},
+        )
+        second = client.post(
+            "/v1/chat/completions",
+            json=request,
+            headers={"X-Idempotency-Key": "stateless-final-without-turn-id"},
+        )
+        record = runtime.registry.get_by_idempotency_key(
+            "stateless-final-without-turn-id"
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json() == second.json()
+    body = first.json()
+    assert body["choices"][0]["message"]["content"] == "BRIDGE_OK"
+    assert body["metadata"]["external_turn_id"] is None
+    assert body["metadata"]["external_turn_id_verified"] is False
+    assert body["metadata"]["continuation_available"] is False
+    assert body["metadata"]["completion_signal"] == "quiescent_stability"
+    assert body["metadata"]["completion_confidence"] == "medium"
+    assert body["metadata"]["serializer_version"] == "chatgpt-dom-v3"
+    assert body["metadata"]["finalization"]["finalization_state"] == "final"
+    assert body["metadata"]["finalization_evidence"]["mode"] == "quiescent_stability"
+    assert record["state"] == "completed"
+    assert extension.prompt_count == 1
 
 
 async def test_chat_stream_is_final_delta_only_and_transport_independent(

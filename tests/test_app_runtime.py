@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from conftest import FakeExtension, isolated_registry, request_with_key
 
 from bridge.app import BridgeApplication
 from bridge.contracts import BridgeRunRequest
+from bridge.transport import ExtensionIdentity
 
 
 async def test_ready_distinguishes_incomplete_absent_and_available_states(
@@ -37,7 +39,16 @@ async def test_ready_distinguishes_incomplete_absent_and_available_states(
     assert absent.status_code == 503
     assert json.loads(absent.body)["status"] == "extension_absent"
 
-    runtime.bridge.ws = FakeExtension(runtime)
+    await runtime.bridge.attach(
+        FakeExtension(runtime),
+        ExtensionIdentity(
+            instance_id="11111111-1111-4111-8111-111111111111",
+            worker_session_id="22222222-2222-4222-8222-222222222222",
+            connection_id="33333333-3333-4333-8333-333333333333",
+            client_name="extension-chrome",
+            extension_version="1.0.0",
+        ),
+    )
     available = await runtime.ready()
     assert available.status_code == 200
     assert json.loads(available.body)["status"] == "extension_available"
@@ -106,3 +117,85 @@ async def test_shutdown_during_run_fails_safe_without_second_prompt(
     assert retains[0]["run_id"] == body["id"]
     assert retains[0]["browser_target"]["id"] == f"bridge-run-{body['id']}"
     assert replacement.prompt_count == 0
+
+
+async def test_readiness_matrix_only_a_healthy_accepting_owner_is_200(
+    runtime: BridgeApplication,
+) -> None:
+    """One row per operator-visible state of `/ready`."""
+    globals_ = runtime.ready.__globals__
+    globals_["HOST"] = "127.0.0.1"
+    globals_["API_KEY"] = "matrix-http-secret"
+    globals_["WS_TOKEN"] = "matrix-ws-secret"
+    runtime.bridge.ws = None
+
+    async def ready() -> tuple[int, dict]:
+        response = await runtime.ready()
+        return response.status_code, json.loads(response.body)
+
+    def owner(instance: str = "11111111-1111-4111-8111-111111111111") -> ExtensionIdentity:
+        return ExtensionIdentity(
+            instance_id=instance,
+            worker_session_id="22222222-2222-4222-8222-222222222222",
+            connection_id="33333333-3333-4333-8333-333333333333",
+            client_name="extension-chrome",
+            extension_version="1.0.0",
+        )
+
+    # No extension.
+    code, body = await ready()
+    assert (code, body["status"]) == (503, "extension_absent")
+
+    # Socket accepted, hello not received yet.
+    pending = FakeExtension(runtime)
+    runtime.bridge.begin_handshake(pending)  # type: ignore[arg-type]
+    code, body = await ready()
+    assert (code, body["status"]) == (503, "extension_handshake_pending")
+    runtime.bridge.end_handshake(pending)  # type: ignore[arg-type]
+
+    # Fresh hello, first pong not due yet: available within the first-pong grace.
+    socket = FakeExtension(runtime)
+    assert await runtime.bridge.attach(socket, owner())  # type: ignore[arg-type]
+    code, body = await ready()
+    assert (code, body["status"]) == (200, "extension_available")
+    assert body["seconds_since_pong"] is None
+
+    # Healthy pong.
+    runtime.bridge.last_pong_at = time.time()
+    code, body = await ready()
+    assert (code, body["status"]) == (200, "extension_available")
+
+    # Hello too old and never ponged: stale, like an old pong.
+    runtime.bridge.last_pong_at = None
+    runtime.bridge.connected_at = time.time() - 10_000
+    code, body = await ready()
+    assert (code, body["status"]) == (503, "extension_stale")
+    runtime.bridge.connected_at = time.time()
+    runtime.bridge.last_pong_at = time.time() - 10_000
+    code, body = await ready()
+    assert (code, body["status"]) == (503, "extension_stale")
+
+    # A second healthy instance is refused; readiness shows the conflict.
+    runtime.bridge.last_pong_at = time.time()
+    contender = FakeExtension(runtime)
+    assert not await runtime.bridge.attach(  # type: ignore[arg-type]
+        contender, owner("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    )
+    code, body = await ready()
+    assert (code, body["status"]) == (503, "extension_conflict")
+    assert runtime.bridge.ws is socket, "the healthy owner keeps its lease"
+    runtime.bridge.connection_conflict_at = None
+    assert (await ready())[0] == 200
+
+    # Server shutdown: draining refuses new runs, so readiness is 503 even
+    # while the extension is still healthy, and stays 503 after close.
+    runtime.accepting_runs = False
+    code, body = await ready()
+    assert (code, body["status"]) == (503, "server_shutting_down")
+    assert body["accepting_runs"] is False
+    await runtime.bridge.close()
+    code, body = await ready()
+    assert (code, body["status"]) == (503, "server_shutting_down")
+    rendered = json.dumps(body)
+    assert "matrix-http-secret" not in rendered
+    assert "matrix-ws-secret" not in rendered

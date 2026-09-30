@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "33";
+const VERSION = "41";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -18,9 +18,12 @@ const DEBUG = false;
 
 const SELECTORS = {
   composer: [
+    "[data-composer-markdown][contenteditable='true'][role='textbox']",
     "#prompt-textarea",
+    "[data-testid='prompt-textarea']",
     "div[contenteditable='true'][id^='prompt']",
     "textarea[data-id]",
+    "[contenteditable='true'][role='textbox']",
   ],
   send: [
     "button[data-testid='send-button']",
@@ -34,6 +37,44 @@ const SELECTORS = {
     "button[aria-label*='rrêter']",
   ],
   fileInput: ["input[type='file']"],
+  // Payload contract: an explicit file state OR the observed completed file
+  // preview. Unrecognised cards remain UNKNOWN. Enabled Send is never evidence.
+  // Current card/preview classes come from the user's 2026-09-28 DOM recorder;
+  // data-state/data-upload-status retain support for explicit state variants.
+  composerSurface: ["form", "[data-testid='composer']"],
+  attachment: [
+    // Observed in the user's 2026-09-28 structural recorder. The generated
+    // ComposerLayoutAttachments-* token is intentionally not hard-coded.
+    "[data-composer-attachments] [class~='group/composer-attachment']",
+    "[data-testid='file-upload']",
+    "[data-testid='attachment']",
+    "[data-testid='composer-attachment']",
+  ],
+  attachmentPending: [
+    "[aria-busy='true']", "[role='progressbar']", "progress",
+    "[data-state='uploading']", "[data-state='processing']", "[data-state='pending']",
+    "[data-upload-status='uploading']", "[data-upload-status='processing']",
+    "[data-testid='attachment-progress']",
+    "[data-loading='true']", "[data-state='loading']",
+    "[data-status='uploading']", "[data-status='processing']", "[data-status='pending']",
+  ],
+  attachmentAnimationPending: [".animate-spin", ".animate-pulse"],
+  // Completed preview observed on an auto-converted Pasted text.txt: a file
+  // type badge AND an interactive full-surface preview inside the same card.
+  attachmentPreviewSurface: "span.composer-attachment-surface:not([aria-hidden='true'])",
+  attachmentPreviewButton: "button.composer-attachment-surface.cursor-interaction",
+  attachmentFileBadge: "svg[class^='text-file-'], svg[class*=' text-file-']",
+  attachmentUnavailable: "[inert], [aria-hidden='true']",
+  attachmentReady: [
+    "[data-state='ready']", "[data-state='complete']",
+    "[data-upload-status='complete']", "[data-upload-status='success']",
+  ],
+  attachmentError: [
+    "[data-state='error']", "[data-state='failed']",
+    "[data-upload-status='error']", "[data-upload-status='failed']",
+    "[data-testid='attachment-error']", "[role='alert']",
+    "[data-status='error']", "[data-status='failed']", "[aria-invalid='true']",
+  ],
   assistant: "[data-message-author-role='assistant']",
   user: "[data-message-author-role='user']",
   markdown: ".markdown",
@@ -113,6 +154,38 @@ const SELECTORS = {
     "button[aria-label*='Temporary chat']",
     "button[aria-label*='temporaire']",
   ],
+
+  // --- Réponse (ResponseRoot) --- //
+  // La nouvelle UI ne pose plus ni rôle, ni message id, ni tour : le contenu
+  // de la réponse est rendu dans un div dont UNE CLASSE COMMENCE par ce
+  // préfixe. Le suffixe est généré : il ne doit jamais être écrit en dur dans
+  // un sélecteur (`.MarkdownRoot-rZKhxa`). Le sélecteur ci-dessous n'est qu'un
+  // pré-filtre borné ; c'est `isMarkdownRootElement()` qui tranche sur les
+  // tokens de classe.
+  responseRootClassPrefix: "MarkdownRoot-",
+  markdownRootCandidate: "[class*='MarkdownRoot-']",
+  // Feuilles inline : preuve qu'un ResponseRoot porte du contenu
+  // conversationnel, JAMAIS une réponse en soi (jamais « le dernier span »).
+  inlineMarkdown: ["[class*='inline-markdown']", "[class*='InlineMarkdown']"],
+  // Chrome applicatif : en-tête, navigation, panneaux, menus, popovers,
+  // modales. Rien de tout cela n'est une conversation — le diagnostic réel a
+  // déjà montré `data-testid="app-shell-header-context-menu-surface"` sur un
+  // nœud qui ne doit jamais être pris pour une réponse.
+  nonConversationSurface: [
+    "header",
+    "nav",
+    "aside",
+    "footer",
+    "[role='dialog']",
+    "[role='menu']",
+    "[role='listbox']",
+    "[role='toolbar']",
+    "[role='tooltip']",
+    "[data-testid*='menu']",
+    "[data-testid*='modal']",
+    "[data-testid*='popover']",
+    "[data-testid*='header']",
+  ],
 };
 
 // Libellés reconnus comme « recherche web » dans un menu d'outils (FR/EN).
@@ -181,25 +254,93 @@ const FINALIZATION_STALL_MS = 45000;
 // conclure » de « la boucle n'a tourné qu'une fois, tard ».
 const MIN_STALL_OBSERVATIONS = 3;
 
-// Deux garde-fous distincts, longtemps confondus sous un même nom.
-//
-// 1) AVANT le premier tour assistant : rien n'est encore observable côté
-//    réponse, seule l'activité des signaux de génération dit que quelque chose
-//    se passe. Une UI totalement figée après Send doit échouer de façon bornée,
-//    sans attendre la borne totale du serveur.
-const FIRST_ASSISTANT_ACTIVITY_STALL_MS = 300000;
+// Même exigence pour conclure sur la seule stabilité : une quiescence n'est
+// jamais un unique réveil tardif, même quand le texte n'a pas bougé. Une durée
+// de SETTLE_UNKNOWN_MS sans plusieurs observations réelles ne conclut rien.
+const MIN_QUIESCENT_OBSERVATIONS = 3;
 
-// 2) APRÈS le premier tour assistant : l'UI se prétend encore active
-//    (`finished=false`, donc le garde-fou de finalisation ci-dessus est
-//    désarmé) alors que la réponse n'a plus bougé d'un caractère. On ne conclut
-//    pas « terminé » — un Stop réellement visible peut signifier que ChatGPT
-//    travaille — mais on rend la main en `incomplete` plutôt que de rester
-//    « running » indéfiniment.
-//    Exception : cf. `longRunningStreamingSignalActive()` — quand
-//    `.streaming-animation` est visible dans le tour surveillé, la stabilité du
-//    texte n'est PAS une preuve d'échec et ce garde-fou est désarmé ; la borne
-//    dure redevient alors le `bridge_total_timeout` du serveur.
+// Après le premier tour assistant, seuls `.result-streaming` et
+// `[data-is-streaming='true']` gardent un garde-fou local de stabilité.
+// Stop et reasoning peuvent rester visibles pendant une réflexion longue ;
+// `.streaming-animation` a la même sémantique prouvée en production. Pour ces
+// signaux, la borne dure est le `bridge_total_timeout` du serveur.
 const WATCHED_TURN_ACTIVE_SIGNAL_STALL_MS = 300000;
+
+// Le contrat de réponse (ResponseRoot) a ses propres bornes, distinctes de
+// celles de l'activité :
+//
+//   - `RESPONSE_CONTRACT_DRIFT_MS` : des feuilles `inline-markdown` sont
+//     visibles alors qu'AUCUN ResponseRoot n'est résolvable. C'est la
+//     signature exacte d'un nouveau changement d'UI : au-delà de cette
+//     fenêtre bornée, on échoue en `bridge_response_contract_drift` — la borne
+//     d'activité locale, elle, ne dit rien de la structure.
+//   - `RESPONSE_AMBIGUITY_HOLD_MS` : deux ResponseRoots nouveaux simultanés.
+//     React peut monter deux nœuds le temps d'une frame ; l'ambiguïté doit
+//     persister avant de conclure. Aucun choix arbitraire n'est jamais fait.
+const RESPONSE_CONTRACT_DRIFT_MS = 20000;
+const RESPONSE_AMBIGUITY_HOLD_MS = 1500;
+
+// Raisons bornées d'un locator qui refuse de conclure. Elles sont produites par
+// la décision réelle du runtime (jamais re-dérivées par le popup) et voyagent
+// telles quelles dans le diagnostic : « ligne rouge » lisible sans DevTools.
+const RESPONSE_LOCATOR_REASONS = new Set([
+  "ambiguous_root",
+  "inline_without_root",
+  "surface_missing",
+]);
+
+// Les bornes de finalisation, dans un seul objet : la même référence sert à la
+// décision (`finalizationOutcome`) et au diagnostic (`stable / threshold`). Le
+// popup ne peut donc pas afficher un seuil que le runtime n'applique pas.
+const FINALIZATION_THRESHOLDS = {
+  settle_ms: SETTLE_MS,
+  settle_unknown_ms: SETTLE_UNKNOWN_MS,
+  empty_final_settle_ms: EMPTY_FINAL_SETTLE_MS,
+  min_quiescent_observations: MIN_QUIESCENT_OBSERVATIONS,
+  finalization_stall_ms: FINALIZATION_STALL_MS,
+  active_signal_stall_ms: WATCHED_TURN_ACTIVE_SIGNAL_STALL_MS,
+};
+
+// --------------------------------------------------------------------------- //
+// État vivant du run : la boucle d'observation en est la seule autrice.
+//
+// Le popup ne reconstruit jamais un état de finalisation « à lui » : il lit cet
+// objet, écrit par les mêmes itérations qui émettent les heartbeats et qui
+// décident (ou refusent de décider) la fin. Borné et sans contenu — comptages,
+// booléens, durées, jamais un caractère de prompt ni de réponse.
+// --------------------------------------------------------------------------- //
+/** Version du sérialiseur chargé avant ce script (`serializer.js`). */
+function serializerVersion() {
+  return globalThis.ChatGPTBridgeSerializer?.SERIALIZER_VERSION || null;
+}
+
+const liveRun = {
+  active: false,
+  phase: "idle",
+  progress: null,
+  page_state: null,
+  serialization: {
+    root_found: null,
+    serializer: serializerVersion(),
+    last_serialize: null,
+    ms: 0,
+  },
+};
+
+// Bornes de taille : une signature ou un snapshot structurel ne doivent jamais
+// pouvoir être gonflés par une page pathologique.
+const RESPONSE_SIGNATURE_MAX_TOKENS = 6;
+const RESPONSE_SIGNATURE_MAX_TOKEN_LENGTH = 40;
+const MAX_INLINE_LEAF_COUNT = 999;
+const STRUCTURE_LIMITS = {
+  max_depth: 6,
+  max_nodes: 200,
+  max_children: 40,
+  max_roots: 4,
+  max_class_tokens: 8,
+  max_token_length: 40,
+  max_value_length: 64,
+};
 
 let currentJob = null;
 const claimedRequestIds = new Set();
@@ -234,6 +375,528 @@ const $in = (root, list) => {
 };
 
 const $ = (list) => $in(document, list);
+
+const STRUCTURAL_COMPOSER_SELECTOR =
+  "[contenteditable='true'][role='textbox']";
+
+/** Visible in the current document, without reading or logging user content. */
+function isVisibleElement(el) {
+  if (!el || !el.isConnected) return false;
+  const style = globalThis.getComputedStyle?.(el);
+  if (style?.display === "none" || style?.visibility === "hidden") return false;
+  if (typeof el.getClientRects === "function" && el.getClientRects().length === 0) {
+    return false;
+  }
+  return true;
+}
+
+function isComposerElement(el) {
+  if (!el) return false;
+  const tag = el.tagName;
+  return (
+    tag === "TEXTAREA" ||
+    tag === "INPUT" ||
+    el.getAttribute("contenteditable") === "true"
+  );
+}
+
+function looksLikeStructuralComposer(el) {
+  return (
+    el.hasAttribute("data-composer-markdown") ||
+    el.getAttribute("aria-multiline") === "true" ||
+    el.classList?.contains("ProseMirror") ||
+    Boolean(el.querySelector("p[data-placeholder]"))
+  );
+}
+
+function uiResolution(strategy, selector, candidateCount, element) {
+  return {
+    element: element || null,
+    strategy,
+    selector,
+    candidate_count: candidateCount,
+  };
+}
+
+function visibleMatches(root, selector, predicate = () => true) {
+  return [...root.querySelectorAll(selector)].filter(
+    (el) => isVisibleElement(el) && predicate(el),
+  );
+}
+
+/** Inspect composer structure without reading any editable or rendered text. */
+function inspectComposer(root = document) {
+  const namedSelectors = SELECTORS.composer.filter(
+    (selector) => selector !== STRUCTURAL_COMPOSER_SELECTOR,
+  );
+  const knownElements = new Set();
+  for (const selector of namedSelectors) {
+    const candidates = visibleMatches(root, selector, isComposerElement);
+    for (const candidate of candidates) knownElements.add(candidate);
+    if (candidates.length > 1) {
+      return {
+        element: null,
+        status: "ambiguous",
+        strategy: "named_selector",
+        selector,
+        visible_candidates: candidates.length,
+        known_selector_candidates: knownElements.size,
+        structural_candidates: visibleMatches(root, STRUCTURAL_COMPOSER_SELECTOR).length,
+      };
+    }
+    if (candidates.length === 1) {
+      return {
+        element: candidates[0],
+        status: "ok",
+        strategy: "named_selector",
+        selector,
+        visible_candidates: candidates.length,
+        known_selector_candidates: knownElements.size,
+        structural_candidates: visibleMatches(root, STRUCTURAL_COMPOSER_SELECTOR).length,
+      };
+    }
+  }
+
+  const candidates = visibleMatches(root, STRUCTURAL_COMPOSER_SELECTOR);
+  const structural = {
+    element: null,
+    status: candidates.length > 1 ? "ambiguous" : "missing",
+    strategy: "structural_fallback",
+    selector: STRUCTURAL_COMPOSER_SELECTOR,
+    visible_candidates: candidates.length,
+    known_selector_candidates: knownElements.size,
+    structural_candidates: candidates.length,
+  };
+  if (candidates.length !== 1) return structural;
+
+  const candidate = candidates[0];
+  if (
+    (candidate.closest("form") || candidate.hasAttribute("data-composer-markdown")) &&
+    looksLikeStructuralComposer(candidate)
+  ) {
+    return { ...structural, element: candidate, status: "degraded" };
+  }
+  return { ...structural, visible_candidates: 0 };
+}
+
+/** Inspect Send in the exact composer form when one exists. */
+function inspectSendButton(composer, root = document) {
+  const form = composer?.closest("form") || null;
+  const searchRoot = form || root;
+  for (const selector of SELECTORS.send) {
+    const candidates = visibleMatches(
+      searchRoot,
+      selector,
+      (el) => el.tagName === "BUTTON",
+    );
+    if (candidates.length > 1) {
+      return {
+        element: null,
+        status: "ambiguous",
+        strategy: "named_selector",
+        selector,
+        visible_candidates: candidates.length,
+        same_form_as_composer: false,
+      };
+    }
+    if (candidates.length === 1) {
+      return {
+        element: candidates[0],
+        status: "ok",
+        strategy: "named_selector",
+        selector,
+        visible_candidates: 1,
+        same_form_as_composer: Boolean(form && candidates[0].closest("form") === form),
+      };
+    }
+  }
+
+  const candidates = form
+    ? visibleMatches(form, "button[type='submit']", (el) => el.tagName === "BUTTON")
+    : [];
+  if (candidates.length > 1) {
+    return {
+      element: null,
+      status: "ambiguous",
+      strategy: "structural_fallback",
+      selector: "button[type='submit']",
+      visible_candidates: candidates.length,
+      same_form_as_composer: false,
+    };
+  }
+  if (candidates.length === 1) {
+    return {
+      element: candidates[0],
+      status: "degraded",
+      strategy: "structural_fallback",
+      selector: "button[type='submit']",
+      visible_candidates: 1,
+      same_form_as_composer: candidates[0].closest("form") === form,
+    };
+  }
+  return {
+    element: null,
+    status: "missing",
+    strategy: "structural_fallback",
+    selector: "button[type='submit']",
+    visible_candidates: 0,
+    same_form_as_composer: false,
+  };
+}
+
+/**
+ * État du contrat de réponse pour le diagnostic, sans contenu : surface,
+ * comptages de roots, verdict et raison bornée de la dernière décision réelle
+ * du locator pendant un run.
+ *
+ * Un onglet où le locator n'a rien eu à décider (onglet ChatGPT générique,
+ * aucun run) rend `idle` : jamais une fausse alarme BROKEN. Un verdict
+ * `broken` vient toujours d'une décision du runtime — ambiguïté de roots,
+ * feuilles inline sans root, surface absente — jamais d'une reconstruction
+ * côté popup.
+ */
+function responseLocatorHealth() {
+  const collected = resolveResponseRoots();
+  const last = lastResponseLocatorDiagnostic;
+  const failure = lastResponseLocatorFailure;
+  const roots = collected.markdown.length;
+  const leaves = collected.inline_leaf_count;
+  const surface = Boolean(collected.surface_element);
+  let candidateState = "idle";
+  let reason = null;
+  if (failure) {
+    candidateState = "broken";
+    reason = failure;
+  } else if (last) {
+    if ((last.ambiguity_count ?? 0) > 0) {
+      candidateState = "broken";
+      reason = "ambiguous_root";
+    } else if (!surface) {
+      candidateState = "broken";
+      reason = "surface_missing";
+    } else if (last.candidate_found === true) {
+      candidateState = "found";
+    } else if (leaves > 0 && roots === 0) {
+      candidateState = "broken";
+      reason = "inline_without_root";
+    } else {
+      candidateState = "pending";
+    }
+  }
+  return {
+    conversation_surface: surface,
+    surface_strategy: collected.surface_strategy || null,
+    strategy: last?.strategy ?? null,
+    baseline_root_count: last?.baseline_root_count ?? roots,
+    current_root_count: roots,
+    candidate_found: last?.candidate_found === true,
+    candidate_root_tag: last?.candidate_root_tag ?? null,
+    markdown_root: last ? last.markdown_root : roots > 0,
+    inline_leaf_count: leaves,
+    ambiguity_count: last?.ambiguity_count ?? 0,
+    candidate_state: candidateState,
+    reason: RESPONSE_LOCATOR_REASONS.has(reason) ? reason : null,
+  };
+}
+
+/** Compteur borné du diagnostic vivant : jamais un NaN, jamais un négatif. */
+function boundedRunMetric(value) {
+  return Number.isInteger(value) && value >= 0 && value <= 1000000 ? value : 0;
+}
+
+/** Durée bornée du diagnostic vivant : jamais un NaN, jamais un négatif. */
+function boundedRunDuration(value) {
+  return Number.isFinite(value) ? Math.max(0, Math.round(value)) : null;
+}
+
+/**
+ * État vivant du run, tel que la boucle l'a réellement maintenu.
+ *
+ * `finalization_state`, `signal`, `output_chars`, `stable_for_ms` et les
+ * signaux sont ceux qui ont servi à décider la fin (ou à refuser de la
+ * décider) — une observation figée pendant une recherche web est donc lisible
+ * ici sans DevTools. Aucun contenu, aucun nœud, aucun identifiant complet.
+ */
+function runDiagnosticSnapshot() {
+  const active = liveRun.active === true && currentJob !== null;
+  const progress = active ? liveRun.progress : null;
+  const page = active ? liveRun.page_state : null;
+  const finalization = progress?.finalization || {};
+  const state = active ? finalization.finalization_state || "waiting" : "idle";
+  const serialization = active
+    ? liveRun.serialization
+    : { root_found: null, serializer: serializerVersion(), last_serialize: null, ms: 0 };
+  const thresholdMs = active
+    ? globalThis.ChatGPTBridgeFinalOutput.finalizationThresholdMs({
+        state,
+        outputChars: boundedRunMetric(finalization.output_chars),
+        activeStallEnabled: activeSignalStallApplies(
+          finalization.signal,
+          progress?.streaming_signal_sources,
+        ),
+        thresholds: FINALIZATION_THRESHOLDS,
+      })
+    : null;
+  return {
+    active,
+    phase: active ? progress?.phase || liveRun.phase : "idle",
+    state,
+    signal: active ? finalization.signal || "unknown" : null,
+    mode: finalization.mode || null,
+    confidence: finalization.confidence || null,
+    output_chars: boundedRunMetric(finalization.output_chars),
+    stable_for_ms: boundedRunMetric(finalization.stable_for_ms),
+    stable_threshold_ms: Number.isFinite(thresholdMs) ? thresholdMs : null,
+    stable_observations: boundedRunMetric(finalization.stable_observations),
+    signals: {
+      actions: finalization.terminal_action_visible === true,
+      streaming: finalization.streaming_visible === true,
+      reasoning: finalization.reasoning_visible === true,
+      stop: finalization.stop_visible === true,
+    },
+    serialization: {
+      root_found:
+        serialization.root_found === true
+          ? true
+          : serialization.root_found === false
+            ? false
+            : null,
+      serializer:
+        typeof serialization.serializer === "string"
+          ? serialization.serializer.slice(0, 40)
+          : null,
+      last_serialize: ["ok", "error"].includes(serialization.last_serialize)
+        ? serialization.last_serialize
+        : null,
+      ms: boundedRunMetric(serialization.ms),
+    },
+    // Réveils et fraîcheur d'observation : c'est ici qu'un onglet throttlé
+    // (minuterie d'arrière-plan) se distingue d'une réponse réellement figée.
+    observation: {
+      last_wake: {
+        mutation: boundedRunMetric(page?.wake_mutation),
+        observe_tick: boundedRunMetric(page?.wake_tick),
+        timer: boundedRunMetric(page?.wake_timer),
+      },
+      ms_since_observation: boundedRunDuration(page?.ms_since_observation),
+      ms_since_dom_mutation: boundedRunDuration(page?.ms_since_dom_mutation),
+    },
+  };
+}
+
+/** Publie l'état vivant du run. Appelé par la boucle, jamais par le popup. */
+function publishRunProgress(progress, pageState) {
+  liveRun.progress = progress || null;
+  if (pageState) liveRun.page_state = pageState;
+  if (currentJob) liveRun.phase = currentJob.phase;
+}
+
+/** Publie le dernier résultat de sérialisation (root trouvé, ok/erreur, durée). */
+function publishRunSerialization({ rootFound, lastSerialize, ms }) {
+  liveRun.serialization = {
+    root_found: typeof rootFound === "boolean" ? rootFound : null,
+    serializer: serializerVersion(),
+    last_serialize: ["ok", "error"].includes(lastSerialize) ? lastSerialize : null,
+    ms: boundedRunMetric(ms),
+  };
+}
+
+/** Bounded UI snapshot. This function deliberately never reads page text. */
+function domHealthSnapshot() {
+  let url = null;
+  try {
+    url = new URL(window.location.href);
+  } catch {
+    // A failed URL parse is represented by the fixed safe defaults below.
+  }
+  const originOk = Boolean(url && TEMPORARY_CHAT_ORIGINS.has(url.origin));
+  const pathname = typeof url?.pathname === "string" ? url.pathname.slice(0, 128) : "";
+  const temporaryQuery = url?.searchParams.get("temporary-chat") === "true";
+  const composer = inspectComposer();
+  const send = composer.element
+    ? inspectSendButton(composer.element)
+    : {
+        element: null,
+        status: "missing",
+        strategy: "structural_fallback",
+        selector: "button[type='submit']",
+        visible_candidates: 0,
+        same_form_as_composer: false,
+      };
+  const composerElement = composer.element;
+  const composerText = composerElement
+    ? ("value" in composerElement ? composerElement.value : composerElement.textContent)
+    : "";
+  const pageSendButtons = composerElement
+    ? new Set([
+        ...SELECTORS.send.flatMap((selector) => visibleMatches(document, selector, (el) => el.tagName === "BUTTON")),
+        ...visibleMatches(document, "button[type='submit']", (el) => el.tagName === "BUTTON"),
+      ])
+    : new Set();
+  const idleSendNotRendered =
+    composer.status === "ok" && !String(composerText || "").trim() &&
+    !send.element && send.status === "missing" && pageSendButtons.size === 0;
+  const visibilityState = ["visible", "hidden", "prerender", "unloaded"].includes(
+    document.visibilityState,
+  )
+    ? document.visibilityState
+    : "unknown";
+
+  return {
+    ok: true,
+    content_script_version: VERSION,
+    // État vivant du run courant : lu dans la boucle, jamais recalculé.
+    run: runDiagnosticSnapshot(),
+    surface: {
+      origin_ok: originOk,
+      pathname,
+      temporary_query: temporaryQuery,
+      temporary_status: originOk && pathname === "/" && temporaryQuery ? "ok" : "invalid",
+      visibility_state: visibilityState,
+      has_focus: Boolean(document.hasFocus?.()),
+    },
+    composer: {
+      status: composer.status,
+      strategy: composer.strategy,
+      selector: composer.selector,
+      visible_candidates: composer.visible_candidates,
+      known_selector_candidates: composer.known_selector_candidates,
+      structural_candidates: composer.structural_candidates,
+      tag: composer.element?.tagName || null,
+      role: composer.element?.getAttribute("role") === "textbox" ? "textbox" : null,
+      contenteditable: composer.element?.getAttribute("contenteditable") === "true",
+      data_composer_markdown: Boolean(
+        composer.element?.hasAttribute("data-composer-markdown"),
+      ),
+      form_found: Boolean(composer.element?.closest("form")),
+    },
+    response_locator: responseLocatorHealth(),
+    send: {
+      // dom_health est un diagnostic read-only : un composer vide n'affiche
+      // pas toujours Send. Le runtime, lui, garde son attente post-injection.
+      status: idleSendNotRendered ? "not_rendered_idle" : send.status,
+      strategy: send.strategy,
+      selector: send.selector,
+      visible_candidates: send.visible_candidates,
+      type: send.element && ["button", "submit", "reset"].includes(send.element.type)
+        ? send.element.type
+        : send.element
+          ? "other"
+          : null,
+      disabled: Boolean(send.element?.disabled),
+      aria_disabled: send.element?.getAttribute("aria-disabled") === "true",
+      same_form_as_composer: idleSendNotRendered ? null : send.same_form_as_composer,
+    },
+  };
+}
+
+function warnIfDegraded(component, resolution) {
+  if (resolution?.strategy !== "structural_fallback" || !resolution.element) return;
+  console.warn("bridge_dom_contract_degraded", {
+    component,
+    strategy: resolution.strategy,
+    selector: resolution.selector,
+    candidate_count: resolution.candidate_count,
+    content_script_version: VERSION,
+  });
+}
+
+function uiContractError(kind, resolution, message) {
+  const error = new BridgeError("bridge_ui_timeout", message);
+  error.diagnostics = {
+    ui_contract_error: kind,
+    ...(kind.includes("composer")
+      ? {
+          composer_strategy: resolution.strategy,
+          composer_selector: resolution.selector,
+          composer_candidate_count: resolution.candidate_count,
+        }
+      : {
+          send_strategy: resolution.strategy,
+          send_selector: resolution.selector,
+          send_candidate_count: resolution.candidate_count,
+        }),
+    content_script_version: VERSION,
+  };
+  error.diagnostics.dom_health = domHealthSnapshot();
+  return error;
+}
+
+function addPostInjectionUiDiagnostics(error) {
+  const health = domHealthSnapshot();
+  const composer = health.composer || {};
+  const send = health.send || {};
+  // À l'instant runtime, l'injection a eu lieu : idle n'est plus une
+  // explication recevable pour l'absence de Send.
+  if (health.send?.status === "not_rendered_idle") health.send.status = "missing";
+  error.diagnostics = {
+    ...(error.diagnostics || {}),
+    composer_status: composer.status || "missing",
+    send_status: send.status === "not_rendered_idle" ? "missing" : send.status || "missing",
+    prompt_injected: true,
+    send_candidates: Number.isInteger(send.visible_candidates) ? send.visible_candidates : 0,
+    form_found: composer.form_found === true,
+    content_script_version: VERSION,
+    dom_health: health,
+  };
+  return error;
+}
+
+/** Resolve a unique, visible composer or report the UI contract ambiguity. */
+function resolveComposer(root = document) {
+  const inspected = inspectComposer(root);
+  const resolution = uiResolution(
+    inspected.strategy,
+    inspected.selector,
+    inspected.visible_candidates,
+    inspected.element,
+  );
+  if (inspected.status === "ambiguous") {
+    throw uiContractError(
+      "ambiguous_composer",
+      resolution,
+      inspected.strategy === "named_selector"
+        ? "plusieurs composers correspondent au même sélecteur"
+        : "plusieurs zones de texte peuvent être le composer",
+    );
+  }
+  return resolution;
+}
+
+/** Resolve Send inside the composer's form whenever the form is available. */
+function resolveSendButton(composer, root = document) {
+  const inspected = inspectSendButton(composer, root);
+  if (inspected.status === "ambiguous") {
+    throw uiContractError(
+      "ambiguous_send_button",
+      uiResolution(inspected.strategy, inspected.selector, inspected.visible_candidates),
+      inspected.strategy === "named_selector"
+        ? "plusieurs boutons Send correspondent au même sélecteur"
+        : "plusieurs boutons submit sont présents dans le formulaire du composer",
+    );
+  }
+  return uiResolution(
+    inspected.strategy,
+    inspected.selector,
+    inspected.visible_candidates,
+    inspected.element,
+  );
+}
+
+async function waitForComposer(timeout, label) {
+  const deadline = Date.now() + timeout;
+  let resolution = resolveComposer();
+  while (Date.now() < deadline) {
+    if (resolution.element) return resolution;
+    await sleep(100);
+    resolution = resolveComposer();
+  }
+  throw uiContractError(
+    "composer_missing",
+    resolution,
+    label || "composer introuvable",
+  );
+}
 
 /** Premier ancêtre de `el` correspondant à l'un des sélecteurs. */
 const closestOf = (el, list) => {
@@ -500,6 +1163,144 @@ function isSendButtonReady(button) {
   return button.getAttribute("aria-disabled") !== "true";
 }
 
+/**
+ * @typedef {"EMPTY" | "TEXT_READY" | "ATTACHMENT_PENDING" |
+ *   "ATTACHMENT_READY" | "ATTACHMENT_ERROR" | "UNKNOWN"} ComposerPayloadState
+ */
+/**
+ * Positive evidence from the recorded current UI, not just absence of upload
+ * activity: the rendered file badge and usable file-preview control must be
+ * inside the SAME content surface. The remove button is never READY evidence.
+ */
+function attachmentHasCompletedPreview(card) {
+  const surfaces = [...card.querySelectorAll(SELECTORS.attachmentPreviewSurface)]
+    .filter(isVisibleElement);
+  if (surfaces.length !== 1) return false;
+  const surface = surfaces[0];
+  const badge = surface.querySelector(SELECTORS.attachmentFileBadge);
+  if (!isVisibleElement(badge)) return false;
+  const buttons = [...surface.querySelectorAll(SELECTORS.attachmentPreviewButton)]
+    .filter(isVisibleElement);
+  if (buttons.length !== 1) return false;
+  const button = buttons[0];
+  return isSendButtonReady(button) &&
+    !button.closest(SELECTORS.attachmentUnavailable) &&
+    globalThis.getComputedStyle?.(button)?.pointerEvents !== "none";
+}
+
+/** Pure, composer-scoped payload inspection. Never reads file names/content. */
+function inspectComposerPayload(composer, expectedAttachmentCount = 0) {
+  const surface = composer && closestOf(composer, SELECTORS.composerSurface);
+  if (!composer?.isConnected || !surface?.isConnected) {
+    return { state: "UNKNOWN", observed_attachment_count: 0,
+      attachment_pending: false, attachment_error: false, payload_ready: false };
+  }
+  const matches = (node, selectors) => selectors.some(
+    (selector) => node.matches(selector) || Boolean(node.querySelector(selector)),
+  );
+  // Deduplicate nested card selectors: one file must not count twice.
+  const candidates = [...surface.querySelectorAll(SELECTORS.attachment.join(","))]
+    .filter(isVisibleElement);
+  const cards = candidates.filter((node) => !candidates.some(
+    (other) => other !== node && other.contains(node),
+  ));
+  const pending = matches(surface, SELECTORS.attachmentPending) ||
+    cards.some((card) => matches(card, SELECTORS.attachmentAnimationPending));
+  const error = (cards.length > 0 || expectedAttachmentCount > 0) &&
+    matches(surface, SELECTORS.attachmentError);
+  const allReady = cards.length > 0 && cards.every(
+    // A nested tooltip/menu state cannot prove that the file itself is ready.
+    (card) => SELECTORS.attachmentReady.some((selector) => card.matches(selector)) ||
+      attachmentHasCompletedPreview(card),
+  );
+  let state;
+  if (error) state = "ATTACHMENT_ERROR";
+  else if (pending) state = "ATTACHMENT_PENDING";
+  else if (cards.length < expectedAttachmentCount) state = "UNKNOWN";
+  else if (cards.length) state = allReady ? "ATTACHMENT_READY" : "UNKNOWN";
+  else state = composerHasText(composer) ? "TEXT_READY" : "EMPTY";
+  return {
+    state, observed_attachment_count: cards.length,
+    attachment_pending: pending, attachment_error: error,
+    payload_ready: state === "TEXT_READY" || state === "ATTACHMENT_READY",
+  };
+}
+
+/** Re-resolve React nodes on EVERY observation, including immediately pre-Send. */
+function inspectSubmissionPayload(context) {
+  const composerResolution = resolveComposer();
+  const composer = composerResolution.element;
+  const sendResolution = resolveSendButton(composer);
+  const send = sendResolution.element;
+  const observed = inspectComposerPayload(composer, context.expected_attachment_count);
+  // A consumed paste with no text still needs a card. Latch cards seen during
+  // preparation so a transient React removal cannot turn an upload into text.
+  context.expected_attachment_count = Math.max(
+    context.expected_attachment_count,
+    observed.observed_attachment_count,
+    context.explicit_attachment_count +
+      (context.paste_consumed && composer && !composerHasText(composer) ? 1 : 0),
+  );
+  const payload = inspectComposerPayload(composer, context.expected_attachment_count);
+  const surface = composer && closestOf(composer, SELECTORS.composerSurface);
+  const sameSurface = Boolean(composer?.isConnected && send?.isConnected &&
+    surface?.contains(send));
+  const diagnostics = {
+    payload_mode: context.payload_mode, prompt_bytes: context.prompt_bytes,
+    paste_consumed: context.paste_consumed,
+    expected_attachment_count: context.expected_attachment_count,
+    observed_attachment_count: payload.observed_attachment_count,
+    attachment_state: payload.state,
+    attachment_pending: payload.attachment_pending,
+    attachment_error: payload.attachment_error,
+    send_present: Boolean(send?.isConnected),
+    send_disabled: send ? send.disabled === true : null,
+    send_aria_disabled: send ? send.getAttribute("aria-disabled") === "true" : null,
+    payload_ready: payload.payload_ready,
+  };
+  if (payload.attachment_error) {
+    console.log("bridge_composer_payload", diagnostics);
+    const error = new BridgeError("bridge_attachment_upload_error", "échec de préparation de la pièce jointe avant soumission");
+    error.diagnostics = diagnostics;
+    throw error;
+  }
+  return { composerResolution, sendResolution, diagnostics,
+    ready: sameSurface && payload.payload_ready && isSendButtonReady(send) };
+}
+
+async function waitForComposerPayloadReady(context, timeout) {
+  let last;
+  context.diagnostic_count ??= 0;
+  let previous = null;
+  try {
+    return await waitFor(() => {
+      last = inspectSubmissionPayload(context);
+      const signature = JSON.stringify(last.diagnostics);
+      if (signature !== previous && context.diagnostic_count < (last.ready ? 13 : 12)) {
+        console.log("bridge_composer_payload", last.diagnostics);
+        context.diagnostic_count += 1;
+        previous = signature;
+      }
+      return last.ready ? last : null;
+    }, timeout, "payload du composer non prêt");
+  } catch (error) {
+    if (error instanceof BridgeError) throw error;
+    if (last) console.log("bridge_composer_payload", last.diagnostics);
+    if (last && !last.composerResolution.element) {
+      throw uiContractError("composer_missing", last.composerResolution, "composer introuvable pendant la préparation");
+    }
+    if (last && !last.sendResolution.element) {
+      throw uiContractError("send_missing", last.sendResolution, "bouton d’envoi introuvable");
+    }
+    if (last?.diagnostics.payload_ready) {
+      throw uiContractError("send_not_ready", last.sendResolution, "bouton d’envoi jamais actif sur la surface courante");
+    }
+    const failure = new BridgeError("bridge_composer_payload_not_ready", "payload du composer non prêt avant soumission");
+    failure.diagnostics = last?.diagnostics || {};
+    throw failure;
+  }
+}
+
 function submissionForm(composer, sendBtn) {
   const form = sendBtn?.form || sendBtn?.closest("form") || composer?.closest("form");
   if (!form) return null;
@@ -566,10 +1367,34 @@ const MAX_SIGNAL_SOURCES = 10;
  * `aria-hidden`, `data-state`) — jamais de texte, de HTML ni d'attribut
  * arbitraire.
  */
+/** Description bornée d'un détecteur de streaming actif : aucun contenu. */
+function streamingSignalSource(element, selector) {
+  return {
+    source: selector,
+    visible: true,
+    data_is_streaming: element.getAttribute("data-is-streaming"),
+    aria_hidden: element.getAttribute("aria-hidden"),
+    data_state: element.getAttribute("data-state"),
+  };
+}
+
 function streamingSignalSources(scope) {
   const root = scope || document;
   const sources = [];
   for (const selector of SELECTORS.streaming) {
+    // Le scope lui-même peut porter le détecteur (un MarkdownRoot moderne porte
+    // `result-streaming` sur son propre nœud) : `querySelectorAll` seul le
+    // manquerait et le diagnostic contredirait le signal lu.
+    let self = false;
+    try {
+      self = typeof root.matches === "function" && root.matches(selector);
+    } catch (_) {
+      self = false;
+    }
+    if (self && submissionSignalVisible(root)) {
+      sources.push(streamingSignalSource(root, selector));
+      if (sources.length >= MAX_SIGNAL_SOURCES) return sources;
+    }
     let nodes;
     try {
       nodes = root.querySelectorAll(selector);
@@ -578,13 +1403,7 @@ function streamingSignalSources(scope) {
     }
     for (const element of nodes) {
       if (!submissionSignalVisible(element)) continue;
-      sources.push({
-        source: selector,
-        visible: true,
-        data_is_streaming: element.getAttribute("data-is-streaming"),
-        aria_hidden: element.getAttribute("aria-hidden"),
-        data_state: element.getAttribute("data-state"),
-      });
+      sources.push(streamingSignalSource(element, selector));
       if (sources.length >= MAX_SIGNAL_SOURCES) return sources;
     }
   }
@@ -606,6 +1425,12 @@ function longRunningStreamingSignalActive(signalSources) {
       entry.visible === true &&
       SELECTORS.longRunningStreaming.includes(entry.source),
   );
+}
+
+/** Un signal actif dont la seule stabilité du texte peut justifier un stall. */
+function activeSignalStallApplies(signal, signalSources) {
+  return signal === "streaming" &&
+    !longRunningStreamingSignalActive(signalSources);
 }
 
 function currentSubmissionGenerationSignals() {
@@ -662,8 +1487,8 @@ function captureSubmissionSnapshot(composer, sendBtn) {
  * Compares two generation-signal states and names the transition between them.
  *
  * Returns `null` when the signals are strictly unchanged — same elements, same
- * signatures. Persistence is not activity: a Stop/reasoning/streaming node that
- * appeared once and then froze must stop refreshing any liveness deadline.
+ * signatures. Persistence is not a new submission proof: a Stop/reasoning/
+ * streaming node that appeared before Send cannot confirm the new Send.
  */
 function generationSignalTransition(previous, current) {
   for (const element of current.elements) {
@@ -761,70 +1586,98 @@ async function waitForSubmissionConfirmation(composer, sendBtn, snapshot, method
   throw error;
 }
 
-function firstAssistantWaitDiagnostics(
-  composer,
-  sendBtn,
-  snapshot,
-  before,
-  startedAt,
-) {
-  const after = captureSubmissionSnapshot(composer, sendBtn);
+/**
+ * Détails sûrs d'une dérive de contrat de réponse : comptages et booléens
+ * uniquement — jamais un caractère de contenu, jamais un identifiant externe.
+ */
+function responseContractDriftDetails(reason, candidate) {
+  const collected = resolveResponseRoots();
+  const strategies = [];
+  if (collected.semantic.length) strategies.push("semantic_assistant");
+  if (collected.markdown.length) strategies.push("markdown_root_delta");
   return {
+    reason,
+    response_root_strategies: strategies,
+    semantic_assistant_matches: collected.semantic.length,
+    markdown_root_matches: collected.markdown.length,
+    inline_leaf_matches: collected.inline_leaf_count,
+    baseline_root_count: candidate?.baseline_root_count ?? 0,
+    current_root_count: candidate?.current_root_count ?? collected.markdown.length,
+    conversation_surface_found: Boolean(collected.surface_element),
+    conversation_surface_strategy: collected.surface_strategy || null,
+    candidate_root_count: candidate?.candidate_count ?? 0,
+    submission_state: "post_submission",
     content_script_version: VERSION,
-    elapsed_ms: Math.max(0, Date.now() - startedAt),
-    assistant_turns_before: before,
-    assistant_turns_after: after.assistantTurns,
-    user_turns_before: snapshot.userTurns,
-    user_turns_after: after.userTurns,
-    composer_has_text: after.composerHasText,
-    send_enabled: after.sendState.ready,
-    send_disabled: !after.sendState.ready,
-    stop_visible: after.generation.stop,
-    reasoning_visible: after.generation.reasoning,
-    streaming_generation_signal_visible: after.generation.present,
-    streaming_signal_sources: streamingSignalSources(document),
   };
 }
 
 /**
- * Waits for the first assistant turn created by the already-confirmed send.
- *
- * This is deliberately not a wall-clock appearance timeout. ChatGPT can spend
- * several minutes in web research or reasoning before it creates the visible
- * assistant turn.
- *
- * Activity is a *transition* from the last observed signal state, never a
- * repeated comparison against the pre-submission snapshot. That distinction
- * matters for two symmetric failures:
- *   - a signal already visible before Send never counts (it never transitions);
- *   - a signal that appears after Send and then freezes counts exactly once,
- *     so a stuck UI still reaches FIRST_ASSISTANT_ACTIVITY_STALL_MS instead of being kept
- *     alive forever by its own persistence.
- * Real activity — appearance, disappearance, signature/state change, a new
- * element — keeps refreshing the deadline for as long as the UI truly moves.
+ * Contrat de réponse illisible après un Send confirmé : deux candidats
+ * simultanés impossibles à départager, ou des feuilles `inline-markdown` sans
+ * ResponseRoot résolvable. Fail closed : aucun choix arbitraire, aucune
+ * resoumission, et surtout pas de réponse inventée.
  */
-async function waitForFirstAssistantTurn(
+function responseContractDriftError(reason, candidate) {
+  lastResponseLocatorFailure =
+    reason === "ambiguous_response_roots" ? "ambiguous_root" : "inline_without_root";
+  const details = responseContractDriftDetails(reason, candidate);
+  console.warn("bridge_response_contract_drift", details);
+  const error = new BridgeError(
+    "bridge_response_contract_drift",
+    `contrat DOM de la réponse non résolu après la soumission (${reason})`,
+  );
+  error.diagnostics = details;
+  return error;
+}
+
+/**
+ * Attend le premier ResponseRoot créé par le Send déjà confirmé.
+ *
+ * Ce n'est délibérément pas une borne murale d'apparition : ChatGPT peut
+ * passer plusieurs minutes en recherche web ou en réflexion avant de rendre
+ * quoi que ce soit de lisible.
+ *
+ * Avant le premier ResponseRoot, l'absence de mutation ou de signal reconnu
+ * ne prouve pas que ChatGPT a cessé de réfléchir. Le serveur borne l'attente
+ * totale et les heartbeats distinguent une extension vivante d'une panne.
+ *
+ * Le candidat vient du DELTA structurel : la stratégie historique d'abord,
+ * puis le delta des MarkdownRoots contre le baseline d'avant-Send. Deux
+ * dérives de contrat sont détectées ici, bornées et fail closed :
+ *   - ambiguïté persistante : deux nouveaux ResponseRoots simultanés ;
+ *   - feuilles inline visibles mais aucun ResponseRoot résolvable.
+ */
+async function waitForResponseCandidate(
   job,
-  composer,
-  sendBtn,
-  submissionSnapshot,
-  assistantTurnsBefore,
+  responseBaseline,
   run,
+  isSubmittedPromptRoot = null,
 ) {
-  const startedAt = Date.now();
-  let lastActivityAt = startedAt;
-  let lastHeartbeatAt = startedAt;
-  let lastObservationAt = startedAt;
-  let observationsSinceActivity = 0;
-  // Baseline = the state observed at submission time, so a pre-existing signal
-  // is already "seen" and cannot register as an appearance.
-  let observedSignals = submissionSnapshot.generation;
-  const watcher = createDomWatcher("first_assistant_turn");
+  let lastHeartbeatAt = Date.now();
+  let lastObservationAt = lastHeartbeatAt;
+  // Fenêtres bornées propres au contrat de réponse (cf. constantes).
+  let ambiguousSince = null;
+  let unresolvedLeavesSince = null;
+  let candidate = null;
+  const watcher = createDomWatcher("response_root");
 
   try {
     while (!job.aborted) {
       await watcher.wait(POLL_MS);
       const now = Date.now();
+      // Réveils et fraîcheur d'observation de CETTE itération : publiés même
+      // quand aucun heartbeat n'est dû, pour que le diagnostic vivant du popup
+      // distingue « boucle vivante » de « boucle throttlée » sans DevTools.
+      const page = pageStateDiagnostics(now, {
+        watcher,
+        lastObservationAt,
+        lastHeartbeatAt,
+        run,
+      });
+      publishRunProgress(
+        { phase: "waiting_answer", output_chars: 0, stable_for_ms: 0 },
+        page,
+      );
 
       if (now - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) {
         reply({
@@ -836,56 +1689,44 @@ async function waitForFirstAssistantTurn(
             stable_for_ms: 0,
             completion_signal: "unknown",
             completion_confidence: "low",
-            page_state: pageStateDiagnostics(now, {
-              watcher,
-              lastObservationAt,
-              lastHeartbeatAt,
-              run,
-            }),
+            page_state: page,
           },
         });
         lastHeartbeatAt = now;
       }
       lastObservationAt = now;
 
-      const turns = document.querySelectorAll(SELECTORS.assistant);
-      if (turns.length > assistantTurnsBefore) return turns[turns.length - 1];
+      candidate = resolveResponseCandidate(responseBaseline, document, isSubmittedPromptRoot);
+      recordResponseLocator(candidate);
+      if (candidate.status === "found") return candidate;
 
-      const currentSignals = currentSubmissionGenerationSignals();
-      if (generationSignalTransition(observedSignals, currentSignals)) {
-        lastActivityAt = now;
-        observationsSinceActivity = 0;
+      if (candidate.status === "ambiguous") {
+        if (ambiguousSince === null) ambiguousSince = now;
+        if (now - ambiguousSince >= RESPONSE_AMBIGUITY_HOLD_MS) {
+          throw responseContractDriftError("ambiguous_response_roots", candidate);
+        }
       } else {
-        observationsSinceActivity += 1;
+        ambiguousSince = null;
       }
-      observedSignals = currentSignals;
-      // Même règle que dans `streamAnswer` : une unique itération throttlée ne
-      // prouve pas qu'une UI est figée (cf. MIN_STALL_OBSERVATIONS).
+
+      // Le contenu conversationnel est là (feuilles inline visibles) mais aucun
+      // ResponseRoot n'est résolvable : c'est un changement d'UI, pas une
+      // attente. Borné, donc : fail closed avec un diagnostic attribuable.
       if (
-        now - lastActivityAt >= FIRST_ASSISTANT_ACTIVITY_STALL_MS &&
-        observationsSinceActivity >= MIN_STALL_OBSERVATIONS
+        candidate.inline_leaf_count > 0 &&
+        candidate.raw_candidate_count === 0
       ) {
-        const error = new BridgeError(
-          "bridge_ui_timeout",
-          "aucun tour assistant après la soumission du prompt",
-        );
-        error.diagnostics = {
-          ...firstAssistantWaitDiagnostics(
-            composer,
-            sendBtn,
-            submissionSnapshot,
-            assistantTurnsBefore,
-            startedAt,
-          ),
-          page_state: pageStateDiagnostics(now, {
-            watcher,
-            lastObservationAt,
-            lastHeartbeatAt,
-            run,
-          }),
-        };
-        throw error;
+        if (unresolvedLeavesSince === null) unresolvedLeavesSince = now;
+        if (now - unresolvedLeavesSince >= RESPONSE_CONTRACT_DRIFT_MS) {
+          throw responseContractDriftError(
+            "inline_markdown_without_response_root",
+            candidate,
+          );
+        }
+      } else {
+        unresolvedLeavesSince = null;
       }
+
     }
     return null;
   } finally {
@@ -1033,7 +1874,7 @@ async function attachFileObjects(fileObjects) {
   input.files = dt.files;
   input.dispatchEvent(new Event("change", { bubbles: true }));
   // Repli : certaines versions de l'UI n'écoutent que le drop sur le composer.
-  const composer = $(SELECTORS.composer);
+  const composer = resolveComposer().element;
   if (composer) {
     composer.dispatchEvent(
       new DragEvent("drop", {
@@ -1138,60 +1979,770 @@ function turnSignalScope(turn) {
 }
 
 /**
- * La réponse est-elle terminée ?  true / false / null quand aucun signal connu
- * n'est reconnaissable — ce dernier cas est capital : conclure « terminé » par
- * défaut tronquait la réponse pendant la phase de réflexion (« Thinking »).
+ * Périmètre des signaux d'activité d'une réponse : le ResponseRoot et son plus
+ * proche wrapper qui ne contient AUCUNE autre réponse. Jamais la page, jamais
+ * la conversation entière : un indicateur de streaming laissé par un ancien
+ * tour ne doit pas maintenir cette réponse en vie, et un Stop d'un widget
+ * latéral ne doit jamais compter.
+ *
+ * Un wrapper qui contient déjà un autre ResponseRoot candidat décrit le
+ * transcript (tours précédents inclus) : la remontée s'arrête avant lui.
  */
-function completionState(turn) {
-  const scope = turnSignalScope(turn);
-  // Le Stop est un contrôle de la génération courante : il ne se cherche que
-  // dans le composer. Un bouton portant le même libellé ailleurs dans la page
-  // ne doit jamais maintenir ce tour en état « running ». Volontairement sans
-  // `composerRoot()`, dont le repli sur document.body rendrait le scope inutile :
-  // composer introuvable => pas de signal, plutôt qu'un signal de toute la page.
-  const composer = $(SELECTORS.composer);
-  const generationControls =
-    composer && (closestOf(composer, ["form"]) || composer.parentElement);
-  const visible = (element) => {
-    if (!element || element.getAttribute?.("aria-hidden") === "true")
-      return false;
-    const style = globalThis.getComputedStyle?.(element);
-    if (style?.display === "none" || style?.visibility === "hidden")
-      return false;
-    return (
-      typeof element.getClientRects !== "function" ||
-      element.getClientRects().length > 0
-    );
+function responseSignalScope(candidate, root = document) {
+  const element = candidate?.element;
+  if (!element) return null;
+  if (candidate.strategy === "semantic_assistant") return turnSignalScope(element);
+  const surface = resolveConversationSurface(root).element;
+  const holdsAnotherResponse = (container) => {
+    for (const other of container.querySelectorAll(
+      SELECTORS.markdownRootCandidate,
+    )) {
+      if (other === element) continue;
+      if (isResponseRootCandidate(other, surface, root)) return true;
+    }
+    return false;
   };
-  const activeReasoning = (element) => {
-    if (element?.tagName === "DETAILS" && !element.open) return false;
-    if (["closed", "collapsed"].includes(element?.getAttribute?.("data-state")))
-      return false;
-    return visible(element);
-  };
-  return globalThis.ChatGPTBridgeCompletion.completionState({
-    stopVisible: Boolean(
-      generationControls &&
-      SELECTORS.stop.some((selector) =>
-        [...generationControls.querySelectorAll(selector)].some(visible),
-      ),
-    ),
-    // Le streaming se lit dans le tour surveillé : un indicateur laissé par un
-    // ancien tour ou par un widget latéral ne doit pas empêcher sa finalisation.
-    streamingVisible: Boolean(
-      [...scope.querySelectorAll(SELECTORS.streaming.join(", "))].some(visible),
-    ),
-    reasoningVisible: SELECTORS.reasoning.some((selector) =>
-      [...scope.querySelectorAll(selector)].some(activeReasoning),
-    ),
-    actionsVisible: SELECTORS.turnActions.some((selector) =>
-      [...scope.querySelectorAll(selector)].some(visible),
-    ),
-    // Conservé uniquement comme observation : le moteur pur l'ignore volontairement.
-    sendVisible: Boolean($(SELECTORS.send)),
-  });
+  let scope = element;
+  let ancestor = element.parentElement;
+  while (ancestor && ancestor !== surface && !isApplicationChrome(ancestor)) {
+    if (holdsAnotherResponse(ancestor)) break;
+    scope = ancestor;
+    ancestor = ancestor.parentElement;
+  }
+  return scope;
 }
 
+/**
+ * Un sélecteur est-il visible dans `scope` — scope lui-même inclus ?
+ * Le ResponseRoot moderne peut porter `result-streaming` directement sur son
+ * propre nœud : `querySelectorAll` seul manquerait ce signal et conclurait
+ * « quiescent » pendant que ChatGPT écrit.
+ */
+function scopedSignalVisible(scope, selectors, predicate = submissionSignalVisible) {
+  if (!scope) return false;
+  for (const selector of selectors) {
+    let self = false;
+    try {
+      self = typeof scope.matches === "function" && scope.matches(selector);
+    } catch (_) {
+      self = false;
+    }
+    if (self && predicate(scope)) return true;
+    if (typeof scope.querySelectorAll !== "function") continue;
+    for (const element of scope.querySelectorAll(selector)) {
+      if (predicate(element)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Signaux bruts de finalisation d'une réponse, tous lus dans SON périmètre.
+ * Observation pure : les `inspect*` ne lèvent jamais. Un composer introuvable
+ * signifie « pas de signal Stop », jamais une erreur de contrat UI.
+ * Les clés sont celles du diagnostic borné (heartbeat, fin de run).
+ */
+function finalizationSignals(scope, root = document) {
+  const composer = inspectComposer(root).element;
+  // Le Stop est un contrôle de la génération courante : il ne se cherche que
+  // dans le composer. Volontairement sans `composerRoot()`, dont le repli sur
+  // document.body rendrait le cloisonnement inutile.
+  const generationControls =
+    composer && (closestOf(composer, ["form"]) || composer.parentElement);
+  return {
+    streaming_visible: scopedSignalVisible(scope, SELECTORS.streaming),
+    reasoning_visible: scopedSignalVisible(
+      scope,
+      SELECTORS.reasoning,
+      activeReasoningSignal,
+    ),
+    stop_visible: scopedSignalVisible(generationControls, SELECTORS.stop),
+    terminal_action_visible: scopedSignalVisible(scope, SELECTORS.turnActions),
+  };
+}
+
+/**
+ * État de finalisation le plus récent, dans une forme strictement bornée :
+ * aucun texte, aucun identifiant, aucun attribut arbitraire. C'est exactement
+ * l'objet joint aux heartbeats et aux fins de run — jamais recalculé après coup.
+ */
+function finalizationDiagnostics(
+  finalization,
+  signals,
+  strategy,
+  outputChars,
+  stableForMs,
+  stableObservations,
+) {
+  const scope = signals || {};
+  return {
+    finalization_state: finalization?.state || "waiting",
+    mode: finalization?.mode || null,
+    signal: finalization?.signal || "unknown",
+    confidence: finalization?.confidence || "low",
+    output_chars: outputChars || 0,
+    stable_for_ms: stableForMs || 0,
+    stable_observations: stableObservations || 0,
+    streaming_visible: scope.streaming_visible === true,
+    reasoning_visible: scope.reasoning_visible === true,
+    stop_visible: scope.stop_visible === true,
+    terminal_action_visible: scope.terminal_action_visible === true,
+    response_strategy: strategy || null,
+  };
+}
+
+// --------------------------------------------------------------------------- //
+// Localisation de la réponse : ResponseRoot
+//
+// Un ResponseRoot est « le contenu rendu de la réponse produite APRÈS la
+// soumission du prompt ». Deux stratégies le résolvent, dans cet ordre :
+//
+//   1. `semantic_assistant`  — UI historique :
+//      `[data-message-author-role="assistant"]` et son answer root historique
+//      (`answerRoot`). Ce sélecteur est intrinsèquement sémantique (il ne peut
+//      désigner qu'un message), il garde donc son périmètre d'origine.
+//   2. `markdown_root_delta` — UI observée en production : ni
+//      `data-message-author-role`, ni `data-message-id`, ni `data-turn`, ni
+//      `conversation-turn`, ni `<article>`. Le contenu vit dans un `div` dont
+//      une classe COMMENCE par « MarkdownRoot- » (suffixe généré : jamais
+//      écrit en dur dans un sélecteur). L'identité du candidat vient d'un
+//      DELTA structurel mesuré contre le baseline capturé juste avant le Send —
+//      jamais « le dernier MarkdownRoot de la page ».
+//
+// Une réponse reste UN seul ResponseRoot, quel que soit le nombre de feuilles
+// `inline-markdown` / `InlineMarkdown…` qu'elle contient : ces feuilles ne sont
+// qu'une preuve de contenu conversationnel, jamais une réponse.
+// --------------------------------------------------------------------------- //
+
+/** Un token de classe commence-t-il par `prefix` ? (suffixe généré toléré) */
+function hasClassPrefix(el, prefix) {
+  if (!el || !el.classList) return false;
+  for (const token of el.classList) {
+    if (token.startsWith(prefix)) return true;
+  }
+  return false;
+}
+
+/** `div MarkdownRoot-*` : content root d'une réponse dans la nouvelle UI. */
+function isMarkdownRootElement(el) {
+  return (
+    el?.nodeType === Node.ELEMENT_NODE &&
+    hasClassPrefix(el, SELECTORS.responseRootClassPrefix)
+  );
+}
+
+/** Tout élément du chrome applicatif : jamais une conversation. */
+function isApplicationChrome(el) {
+  if (!el?.closest) return false;
+  for (const selector of SELECTORS.nonConversationSurface) {
+    if (el.closest(selector)) return true;
+  }
+  return false;
+}
+
+/** Composer courant (jamais une référence gardée) : le périmètre interdit. */
+function composerScope(root = document) {
+  const composer = inspectComposer(root).element;
+  if (!composer) return null;
+  return composer.closest("form") || composer;
+}
+
+function isInsideComposer(el, root = document) {
+  const scope = composerScope(root);
+  return Boolean(scope && (el === scope || scope.contains(el)));
+}
+
+/** Premier ancêtre scrollable : la zone de transcript réellement rendue. */
+function nearestScrollableAncestor(el, maxDepth = 12) {
+  let node = el?.parentElement || null;
+  let depth = 0;
+  while (node && depth < maxDepth) {
+    const style = globalThis.getComputedStyle?.(node);
+    if (style?.overflowY === "auto" || style?.overflowY === "scroll") {
+      return node;
+    }
+    node = node.parentElement;
+    depth += 1;
+  }
+  return null;
+}
+
+/**
+ * Surface de conversation : la plus petite zone réellement reliée au composer.
+ * Stratégie bornée, du plus précis au plus large — jamais un scan aveugle de
+ * la page. Le chrome applicatif (header/nav/aside/menus/popovers/modales) ne
+ * peut jamais devenir une surface.
+ */
+function resolveConversationSurface(root = document) {
+  const usable = (element, strategy) => {
+    if (!element || element.nodeType !== Node.ELEMENT_NODE) return null;
+    if (isApplicationChrome(element)) return null;
+    if (!isVisibleElement(element)) return null;
+    return { element, strategy };
+  };
+  const composer = inspectComposer(root).element;
+  if (composer) {
+    const main = usable(composer.closest("main"), "composer_main");
+    if (main) return main;
+    const scroller = usable(
+      nearestScrollableAncestor(composer),
+      "composer_scroll_container",
+    );
+    if (scroller) return scroller;
+    const form = composer.closest("form");
+    const parent = usable(
+      form?.parentElement || composer.parentElement,
+      "composer_parent",
+    );
+    if (parent) return parent;
+  }
+  const main = usable(root.querySelector?.("main"), "document_main");
+  if (main) return main;
+  return {
+    element: root.body || root.documentElement || null,
+    strategy: "document_body",
+  };
+}
+
+/** Clé locale d'un nœud (WeakMap) : jamais persistée, jamais exportée. */
+const responseRootKeys = new WeakMap();
+let responseRootKeySeq = 0;
+
+function responseRootKey(el) {
+  let key = responseRootKeys.get(el);
+  if (!key) {
+    responseRootKeySeq += 1;
+    key = `root-${responseRootKeySeq}`;
+    responseRootKeys.set(el, key);
+  }
+  return key;
+}
+
+/** Tokens de classe bornés : structure seulement, jamais du contenu. */
+function boundedClassTokens(el) {
+  return [...(el?.classList || [])]
+    .slice(0, RESPONSE_SIGNATURE_MAX_TOKENS)
+    .map((token) => token.slice(0, RESPONSE_SIGNATURE_MAX_TOKEN_LENGTH))
+    .join(".");
+}
+
+/**
+ * Signature structurelle d'un MarkdownRoot : identité locale valable pendant
+ * le run, sans aucun texte. React peut recréer le nœud : la signature permet
+ * de rattacher le nouveau nœud au même candidat logique.
+ */
+function markdownRootSignature(el) {
+  const parent = el?.parentElement || null;
+  return [
+    el?.tagName || "?",
+    boundedClassTokens(el),
+    `${parent?.tagName || "?"}.${boundedClassTokens(parent)}`,
+  ].join("|");
+}
+
+/** Contenu sérialisable : du texte non blanc, ou un média réellement rendu. */
+function hasSerializableContent(el) {
+  if (!el) return false;
+  const doc = el.ownerDocument || document;
+  const walker = doc.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  let node;
+  while ((node = walker.nextNode())) {
+    if (/\S/.test(node.nodeValue || "")) return true;
+  }
+  return Boolean(el.querySelector("img[src], video, canvas"));
+}
+
+/**
+ * L'UI moderne peut rendre le message utilisateur dans un MarkdownRoot sans
+ * attribut de rôle. Son texte vient du prompt fiable déjà soumis : on l'écarte
+ * du locator sans jamais le journaliser. Un écho assistant indiscernable est
+ * écarté lui aussi (fail closed), plutôt que de relivrer le prompt comme réponse.
+ */
+function createSubmittedPromptMatcher(prompt) {
+  const expected = typeof prompt === "string" ? prompt.trim() : "";
+  const cache = new WeakMap();
+  return (element) => {
+    if (!expected || !element) return false;
+    const sourceText = element.textContent || "";
+    const cached = cache.get(element);
+    if (cached?.sourceText === sourceText) return cached.matches;
+    const rendered = (readAnswer(element, false)?.text || "").trim();
+    const prefixLength = Math.min(expected.length, 256);
+    const matches = rendered.length >= expected.length * 0.7 &&
+      rendered.length <= expected.length * 1.3 &&
+      rendered.startsWith(expected.slice(0, prefixLength));
+    cache.set(element, { sourceText, matches });
+    return matches;
+  };
+}
+
+/**
+ * Un MarkdownRoot est-il un ResponseRoot plausible ?
+ * Candidat moderne = descendant de la surface, hors composer, hors chrome, hors
+ * réflexion, hors message utilisateur, visible, et non ambigu par lui-même.
+ */
+function isResponseRootCandidate(el, surfaceElement, root = document) {
+  if (!isMarkdownRootElement(el) || !el.isConnected) return false;
+  if (surfaceElement && !surfaceElement.contains(el)) return false;
+  // Un tour assistant historique contient déjà ce contenu : la stratégie
+  // sémantique le couvre, il ne doit pas être compté deux fois.
+  if (el.closest(SELECTORS.assistant)) return false;
+  // Le prompt de l'utilisateur est rendu en markdown lui aussi.
+  if (el.closest(SELECTORS.user)) return false;
+  // « Thinking » n'est pas la réponse.
+  for (const selector of SELECTORS.reasoning) {
+    if (el.closest(selector)) return false;
+  }
+  if (isApplicationChrome(el) || isInsideComposer(el, root)) return false;
+  return isVisibleElement(el);
+}
+
+/**
+ * Tous les ResponseRoots visibles, par stratégie. Observation pure : aucun
+ * choix, aucune écriture, aucun texte lu ni journalisé.
+ */
+function resolveResponseRoots(root = document, isSubmittedPromptRoot = null) {
+  const surface = resolveConversationSurface(root);
+  const surfaceElement = surface.element;
+  const semantic = [];
+  const markdown = [];
+  const submittedPromptRoots = [];
+  let inlineLeafCount = 0;
+  if (surfaceElement) {
+    for (const element of surfaceElement.querySelectorAll(
+      SELECTORS.markdownRootCandidate,
+    )) {
+      if (isResponseRootCandidate(element, surfaceElement, root)) {
+        if (isSubmittedPromptRoot?.(element)) submittedPromptRoots.push(element);
+        else markdown.push(element);
+      }
+    }
+    let leaves = 0;
+    for (const leaf of surfaceElement.querySelectorAll(
+      SELECTORS.inlineMarkdown.join(", "),
+    )) {
+      if (
+        isVisibleElement(leaf) &&
+        !isInsideComposer(leaf, root) &&
+        !submittedPromptRoots.some((element) => element.contains(leaf))
+      ) leaves += 1;
+    }
+    inlineLeafCount = Math.min(leaves, MAX_INLINE_LEAF_COUNT);
+  }
+  for (const element of root.querySelectorAll(SELECTORS.assistant)) {
+    if (isVisibleElement(element) && !isApplicationChrome(element)) {
+      semantic.push(element);
+    }
+  }
+  return {
+    surface_element: surfaceElement,
+    surface_strategy: surface.strategy,
+    semantic,
+    markdown,
+    inline_leaf_count: inlineLeafCount,
+  };
+}
+
+/**
+ * Baseline structurelle capturée juste AVANT le Send. Elle ne contient que des
+ * comptages, des clés locales (WeakMap) et des signatures de classes — jamais
+ * un caractère de contenu utilisateur, jamais un identifiant externe.
+ */
+function captureResponseBaseline(root = document) {
+  const collected = resolveResponseRoots(root);
+  return {
+    surface_strategy: collected.surface_strategy,
+    semanticRootKeys: collected.semantic.map(responseRootKey),
+    semanticRootCount: collected.semantic.length,
+    markdownRootKeys: collected.markdown.map(responseRootKey),
+    markdownRootCount: collected.markdown.length,
+    rootSignatures: collected.markdown.map(markdownRootSignature),
+  };
+}
+
+function emptyResponseBaseline() {
+  return {
+    surface_strategy: null,
+    semanticRootKeys: [],
+    semanticRootCount: 0,
+    markdownRootKeys: [],
+    markdownRootCount: 0,
+    rootSignatures: [],
+  };
+}
+
+/**
+ * Un ResponseRoot observé est-il *structurellement* nouveau par rapport au
+ * baseline ? Deux conditions, jamais une de moins :
+ *
+ * - son nœud n'était pas déjà présent au baseline (identité locale WeakMap) ;
+ * - son rang est au-delà de l'enveloppe des roots du baseline.
+ *
+ * La seconde est ce qui protège l'ancien tour d'un re-rendu React : le nœud
+ * recréé au même rang reste l'ancienne conversation, même quand sa signature
+ * de classes a changé — il ne doit jamais devenir la réponse du run. Fail
+ * closed : un DOM tronqué (tours démontés) retombe en attente typée et bornée,
+ * jamais sur un ancien texte.
+ */
+function isFreshResponseRoot(el, ordinal, baselineCount, baselineKeys) {
+  if (baselineKeys.has(responseRootKey(el))) return false;
+  return ordinal >= (Number.isFinite(baselineCount) ? baselineCount : 0);
+}
+
+/** Candidat décrit par les mêmes champs, quelle que soit la stratégie. */
+function describeResponseCandidate(status, strategy, element, collected, baseline) {
+  const roots = collected || { markdown: [], inline_leaf_count: 0 };
+  return {
+    status,
+    strategy,
+    element: element || null,
+    candidate_root_tag: element?.tagName || null,
+    candidate_count: status === "found" ? 1 : 0,
+    raw_candidate_count: 0,
+    markdown_root: strategy === "markdown_root_delta",
+    baseline_root_count: baseline?.markdownRootCount || 0,
+    current_root_count: roots.markdown.length,
+    semantic_root_count: roots.semantic?.length || 0,
+    inline_leaf_count: roots.inline_leaf_count || 0,
+    surface_found: Boolean(roots.surface_element),
+    surface_strategy: roots.surface_strategy || null,
+  };
+}
+
+/**
+ * Candidat de réponse par DELTA contre le baseline.
+ *
+ * - `found`     : exactement un nouveau ResponseRoot porteur de contenu.
+ * - `pending`   : rien de nouveau (ou un nœud monté mais encore vide).
+ * - `ambiguous` : plusieurs nouveaux ResponseRoots plausibles — on ne devine
+ *                 pas, l'appelant décide (fail closed).
+ *
+ * « Nouveau » est strict : identité locale absente du baseline ET rang au-delà
+ * de son enveloppe (cf. `isFreshResponseRoot`). Un ancien tour recréé par
+ * React, même avec une signature de classes neuve, reste l'ancien tour.
+ */
+function resolveResponseCandidate(baseline, root = document, isSubmittedPromptRoot = null) {
+  const safeBaseline = baseline || emptyResponseBaseline();
+  const collected = resolveResponseRoots(root, isSubmittedPromptRoot);
+  const markdownKeys = new Set(safeBaseline.markdownRootKeys || []);
+  // Stratégie historique : un tour assistant de plus, dans l'ordre du
+  // document. Le sélecteur est intrinsèquement sémantique (il ne peut désigner
+  // qu'un message), donc la CROISSANCE du compteur suffit — et elle est plus
+  // sûre qu'une comparaison nœud par nœud : React peut recréer au passage les
+  // tours précédents, ce qui produirait sinon plusieurs « nouveaux » tours et
+  // une fausse ambiguïté sur une UI parfaitement lisible.
+  const semanticCandidates =
+    collected.semantic.length > (safeBaseline.semanticRootCount || 0)
+      ? [collected.semantic[collected.semantic.length - 1]]
+      : [];
+
+  let strategy = null;
+  let raw = [];
+  if (semanticCandidates.length) {
+    strategy = "semantic_assistant";
+    raw = semanticCandidates;
+  } else {
+    // Sélection par delta : une occurrence n'est retenue que si sa signature
+    // dépasse le compte du baseline (les occurrences antérieures consomment
+    // l'autorisation) ET si elle est réellement fraîche — nœud absent du
+    // baseline et rang au-delà de son enveloppe (cf. `isFreshResponseRoot`).
+    const allowance = new Map();
+    for (const signature of safeBaseline.rootSignatures || []) {
+      allowance.set(signature, (allowance.get(signature) || 0) + 1);
+    }
+    const baselineCount = safeBaseline.markdownRootCount || 0;
+    const freshSurplus = [];
+    collected.markdown.forEach((el, ordinal) => {
+      const signature = markdownRootSignature(el);
+      const left = allowance.get(signature) || 0;
+      if (left > 0) {
+        // Occurrence « autorisée » : elle existait au baseline, ou un re-rendu
+        // React l'a recréée à l'identique (même signature).
+        allowance.set(signature, left - 1);
+        return;
+      }
+      if (!isFreshResponseRoot(el, ordinal, baselineCount, markdownKeys)) return;
+      freshSurplus.push(el);
+    });
+    if (freshSurplus.length) {
+      strategy = "markdown_root_delta";
+      raw = freshSurplus;
+    }
+  }
+
+  const withContent = raw.filter((el) => hasSerializableContent(el));
+  const status =
+    withContent.length > 1
+      ? "ambiguous"
+      : withContent.length === 1
+        ? "found"
+        : "pending";
+  const candidate = describeResponseCandidate(
+    status,
+    raw.length ? strategy : null,
+    status === "found" ? withContent[0] : null,
+    collected,
+    safeBaseline,
+  );
+  candidate.candidate_count = withContent.length;
+  candidate.raw_candidate_count = raw.length;
+  return candidate;
+}
+
+/**
+ * Content root d'un candidat : le nœud moderne est lui-même le content root
+ * (ne pas remonter vers des wrappers de layout moins stables), tandis que la
+ * stratégie historique garde son answer root `.markdown`.
+ */
+function resolveResponseContentRoot(candidate, fallbackOk = true) {
+  if (!candidate?.element) return null;
+  if (candidate.strategy === "semantic_assistant") {
+    return answerRoot(candidate.element, fallbackOk);
+  }
+  return candidate.element;
+}
+
+/**
+ * Locator local d'un ResponseRoot : valable pendant le run, jamais persisté,
+ * jamais comparé à un identifiant externe (conversation, tour, message).
+ */
+function createResponseLocator(candidate, baseline, root = document, isSubmittedPromptRoot = null) {
+  if (!candidate?.element) return null;
+  if (candidate.strategy === "semantic_assistant") {
+    const surface = resolveConversationSurface(root).element;
+    const turns = surface
+      ? [...surface.querySelectorAll(SELECTORS.assistant)]
+      : [];
+    return {
+      kind: "semantic_assistant",
+      strategy: "semantic_assistant",
+      turn_locator: turnLocator(candidate.element),
+      baseline_count: baseline?.semanticRootCount || 0,
+      ordinal: turns.indexOf(candidate.element),
+    };
+  }
+  const collected = resolveResponseRoots(root, isSubmittedPromptRoot);
+  return {
+    kind: "markdown_root",
+    strategy: "markdown_root_delta",
+    ordinal: collected.markdown.indexOf(candidate.element),
+    signature: markdownRootSignature(candidate.element),
+  };
+}
+
+/**
+ * Re-résout le candidat depuis son locator : React recrée volontiers le nœud
+ * (le locator doit rattacher le nouveau nœud au même candidat logique), mais
+ * deux candidats restent indistinguables — on ne devine alors pas.
+ */
+function locateResponseCandidate(locator, baseline, root = document, isSubmittedPromptRoot = null) {
+  if (!locator) return null;
+  if (locator.kind === "semantic_assistant") {
+    const turn = findTurn(locator.turn_locator, locator.baseline_count);
+    if (!turn) return null;
+    return describeResponseCandidate(
+      "found",
+      "semantic_assistant",
+      turn,
+      resolveResponseRoots(root, isSubmittedPromptRoot),
+      baseline,
+    );
+  }
+  const collected = resolveResponseRoots(root, isSubmittedPromptRoot);
+  const ordinalRoot = collected.markdown[locator.ordinal] || null;
+  if (ordinalRoot && markdownRootSignature(ordinalRoot) === locator.signature) {
+    return describeResponseCandidate(
+      "found",
+      "markdown_root_delta",
+      ordinalRoot,
+      collected,
+      baseline,
+    );
+  }
+  const baselineKeys = new Set(baseline?.markdownRootKeys || []);
+  const baselineCount = baseline?.markdownRootCount || 0;
+  // Même contrat de fraîcheur que la résolution initiale : un ancien root
+  // recréé par React n'est pas une identité de repli pour le candidat.
+  const fresh = collected.markdown.filter((el, ordinal) =>
+    isFreshResponseRoot(el, ordinal, baselineCount, baselineKeys),
+  );
+  if (fresh.length === 1) {
+    return describeResponseCandidate(
+      "found",
+      "markdown_root_delta",
+      fresh[0],
+      collected,
+      baseline,
+    );
+  }
+  return null;
+}
+
+// Dernière décision du locator : observabilité sans contenu, exposée au popup.
+let lastResponseLocatorDiagnostic = null;
+// Raison bornée du dernier refus de locator (`ambiguous_root`,
+// `inline_without_root`). Posée par la décision qui a échoué, elle survit à
+// l'erreur pour être lisible dans le diagnostic sans DevTools.
+let lastResponseLocatorFailure = null;
+let recordedResponseLocatorSignature = null;
+
+/** Charge utile de log § « bridge_response_locator » : aucun contenu. */
+function responseLocatorDiagnostic(candidate) {
+  return {
+    strategy: candidate?.strategy ?? null,
+    baseline_root_count: candidate?.baseline_root_count ?? 0,
+    current_root_count: candidate?.current_root_count ?? 0,
+    candidate_found: candidate?.status === "found",
+    candidate_root_tag: candidate?.candidate_root_tag ?? null,
+    markdown_root: candidate?.markdown_root === true,
+    inline_leaf_count: candidate?.inline_leaf_count ?? 0,
+    ambiguity_count:
+      candidate?.status === "ambiguous" ? candidate.candidate_count : 0,
+    version: VERSION,
+  };
+}
+
+/** Mémorise et journalise la dernière décision, à chaque changement seulement. */
+function recordResponseLocator(candidate) {
+  const diagnostic = responseLocatorDiagnostic(candidate);
+  const signature = [
+    diagnostic.strategy,
+    diagnostic.candidate_found,
+    diagnostic.current_root_count,
+    diagnostic.inline_leaf_count,
+    diagnostic.ambiguity_count,
+  ].join("|");
+  if (signature === recordedResponseLocatorSignature) return diagnostic;
+  recordedResponseLocatorSignature = signature;
+  lastResponseLocatorDiagnostic = diagnostic;
+  console.log("bridge_response_locator", diagnostic);
+  return diagnostic;
+}
+
+// --------------------------------------------------------------------------- //
+// Snapshot structurel borné (« Copy response structure »)
+//
+// Sortie autorisée : tag, tokens de classe bornés, role, data-testid,
+// data-* en liste blanche, profondeur, nombre d'enfants, dimensions,
+// visibilité, stratégie de root. Interdit : innerText, textContent, innerHTML,
+// corps de réponse, prompt.
+// --------------------------------------------------------------------------- //
+
+const STRUCTURE_SAFE_ATTRIBUTES = {
+  "data-testid": "testid",
+  "data-message-author-role": "author_role",
+  "data-turn": "turn",
+  "data-state": "state",
+  "data-is-streaming": "is_streaming",
+  "data-composer-markdown": "composer_markdown",
+  "aria-hidden": "aria_hidden",
+};
+
+function boundedStructureValue(value) {
+  return typeof value === "string" &&
+    value.length <= STRUCTURE_LIMITS.max_value_length &&
+    /^[A-Za-z0-9 _.:#-]*$/.test(value)
+    ? value
+    : null;
+}
+
+function boundedStructureData(el) {
+  const data = {};
+  for (const [attribute, key] of Object.entries(STRUCTURE_SAFE_ATTRIBUTES)) {
+    const raw = el.getAttribute(attribute);
+    if (raw === null) continue;
+    if (raw === "") {
+      data[key] = true;
+      continue;
+    }
+    const bounded = boundedStructureValue(raw);
+    if (bounded !== null) data[key] = bounded;
+  }
+  return data;
+}
+
+function boundedStructureNode(el, depth, budget) {
+  budget.nodes += 1;
+  let rect = null;
+  try {
+    rect = typeof el.getBoundingClientRect === "function"
+      ? el.getBoundingClientRect()
+      : null;
+  } catch (_) {
+    // Une dimension indisponible ne doit jamais faire échouer un diagnostic.
+  }
+  const children = [];
+  if (
+    depth < STRUCTURE_LIMITS.max_depth &&
+    budget.nodes < STRUCTURE_LIMITS.max_nodes
+  ) {
+    for (const child of el.children) {
+      if (children.length >= STRUCTURE_LIMITS.max_children) break;
+      if (budget.nodes >= STRUCTURE_LIMITS.max_nodes) break;
+      children.push(boundedStructureNode(child, depth + 1, budget));
+    }
+  }
+  return {
+    tag: el.tagName,
+    class_tokens: [...(el.classList || [])]
+      .slice(0, STRUCTURE_LIMITS.max_class_tokens)
+      .map((token) => token.slice(0, STRUCTURE_LIMITS.max_token_length)),
+    role: boundedStructureValue(el.getAttribute("role")),
+    data_testid: boundedStructureValue(el.getAttribute("data-testid")),
+    data: boundedStructureData(el),
+    has_message_id: Boolean(el.getAttribute("data-message-id")),
+    depth,
+    children_count: el.children.length,
+    children,
+    width: rect && Number.isFinite(rect.width) ? Math.round(rect.width) : null,
+    height: rect && Number.isFinite(rect.height) ? Math.round(rect.height) : null,
+    visible: isVisibleElement(el),
+  };
+}
+
+/**
+ * Snapshot structurel de la surface de conversation et des ResponseRoots.
+ * Aucune propriété textuelle n'est jamais lue : ni innerText, ni textContent,
+ * ni innerHTML, ni valeur d'attribut hors liste blanche.
+ */
+function responseStructureSnapshot(root = document) {
+  const collected = resolveResponseRoots(root);
+  const surfaceElement = collected.surface_element;
+  const roots = [
+    ...collected.markdown
+      .slice(0, STRUCTURE_LIMITS.max_roots)
+      .map((element) => ({
+        strategy: "markdown_root_delta",
+        node: boundedStructureNode(element, 0, { nodes: 0 }),
+      })),
+    ...collected.semantic
+      .slice(0, STRUCTURE_LIMITS.max_roots)
+      .map((element) => ({
+        strategy: "semantic_assistant",
+        node: boundedStructureNode(element, 0, { nodes: 0 }),
+      })),
+  ];
+  return {
+    ok: true,
+    content_script_version: VERSION,
+    conversation_surface: {
+      found: Boolean(surfaceElement),
+      strategy: collected.surface_strategy || null,
+      node: surfaceElement
+        ? boundedStructureNode(surfaceElement, 0, { nodes: 0 })
+        : null,
+    },
+    strategy: collected.markdown.length
+      ? "markdown_root_delta"
+      : collected.semantic.length
+        ? "semantic_assistant"
+        : null,
+    markdown_root_matches: collected.markdown.length,
+    semantic_assistant_matches: collected.semantic.length,
+    inline_leaf_matches: collected.inline_leaf_count,
+    roots,
+  };
+}
 // --------------------------------------------------------------------------- //
 // Contrôles typés de l'interface : modèle, profil, recherche web
 //
@@ -1266,7 +2817,7 @@ function pressedState(el) {
 
 /** Formulaire du composer : périmètre des boutons d'outils de l'envoi. */
 function composerRoot() {
-  const composer = $(SELECTORS.composer);
+  const composer = resolveComposer().element;
   return (
     (composer && (closestOf(composer, ["form"]) || composer.parentElement)) ||
     document.body
@@ -1765,8 +3316,13 @@ function incompleteAnswer({
   reason,
   text,
   snapshot,
-  completion,
+  finalization,
+  evidence,
+  signals,
+  strategy,
+  blockingSignal,
   stableForMs,
+  stableObservations,
   turn,
   signalSources,
   pageState,
@@ -1777,11 +3333,24 @@ function incompleteAnswer({
     text: candidate,
     visible_citations: candidate ? snapshot?.visible_citations || [] : [],
     serializer_version: DOM_SERIALIZER.SERIALIZER_VERSION,
-    completion_signal: completion.signal,
-    completion_confidence: completion.confidence,
+    completion_signal: finalization.signal,
+    completion_confidence: finalization.confidence,
     stable_for_ms: stableForMs,
     output_chars: globalThis.ChatGPTBridgeFinalOutput.outputChars(candidate),
     streaming_signal_sources: signalSources || [],
+    // Dernier état de la machine à états, exactement celui du dernier
+    // heartbeat : un stall se diagnostique sur cet objet, jamais sur une
+    // reconstruction a posteriori.
+    finalization: finalizationDiagnostics(
+      finalization,
+      signals,
+      strategy,
+      globalThis.ChatGPTBridgeFinalOutput.outputChars(candidate),
+      stableForMs,
+      stableObservations,
+    ),
+    finalization_evidence: evidence || null,
+    blocking_signal: blockingSignal || null,
     incomplete: true,
     incomplete_reason: reason,
     // Identité lue sur le tour *courant* — celui qui vient d'être re-résolu et
@@ -1795,29 +3364,61 @@ function incompleteAnswer({
 /**
  * Suit la réponse dans le DOM sans transmettre les snapshots intermédiaires.
  * Chaque observation remplace la précédente, car le rendu n'est pas append-only.
+ *
+ * La décision est une machine à états explicite (ACTIVE / QUIESCENT / FINAL) :
+ *
+ *   - ACTIVE    : streaming, reasoning ou Stop visible — la stabilité du texte
+ *                 ne conclut JAMAIS tant qu'un signal actif est présent ;
+ *   - QUIESCENT : réponse non vide, aucun signal actif, aucune preuve
+ *                 terminale — finalisable seulement après une longue
+ *                 stabilité réellement observée ;
+ *   - FINAL     : preuve terminale (barre d'actions historique) ou quiescence
+ *                 confirmée. FINAL est terminal : un unique `done`/`incomplete`
+ *                 est émis par l'appelant, jamais un second.
  */
-async function streamAnswer(job, locator, before, run) {
+async function streamAnswer(job, locator, responseBaseline, run, isSubmittedPromptRoot = null) {
   const output = globalThis.ChatGPTBridgeFinalOutput.createAccumulator();
   let vu = ""; // relevé précédent, pour mesurer la stabilité
   let stableSince = null;
   // Observations consécutives où le texte n'a pas bougé (cf. MIN_STALL_OBSERVATIONS).
   let stableObservations = 0;
   let full = "";
+  let outputChars = 0;
   let debugSig = "";
-  let completionSignature = "";
   const debut = Date.now();
   let lastHeartbeatAt = debut;
   let finalSerialized = null;
   // Identité externe et locator du tour re-résolu qui a produit/vérifié le
   // snapshot final. Ils sont capturés dans la même itération que le texte : le
   // texte et l'identité décrivent toujours le même nœud DOM courant.
-  let finalTurnLocator = locator;
+  let finalTurnLocator =
+    locator.kind === "semantic_assistant" ? locator.turn_locator : null;
   let finalExternalTurnId = null;
+  // Signal et confiance de la fin retenue : `finished` n'existe plus ici, c'est
+  // la machine à états (`finalization`) qui porte l'état, et une seule fois.
   let finalCompletion = {
-    finished: null,
     signal: "unknown",
     confidence: "low",
   };
+  // Preuve exacte retenue pour la fin : mode, signal, fenêtre de stabilité,
+  // nombre d'observations, taille de sortie et stratégie du candidat. Jamais
+  // un caractère de contenu, jamais un identifiant externe.
+  let finalEvidence = null;
+  // Machine à états : le dernier état observé est la seule vérité du heartbeat,
+  // des garde-fous et des diagnostics de fin.
+  let finalization = {
+    state: "waiting",
+    mode: null,
+    signal: "unknown",
+    confidence: "low",
+  };
+  let signals = {
+    streaming_visible: false,
+    reasoning_visible: false,
+    stop_visible: false,
+    terminal_action_visible: false,
+  };
+  let responseStrategy = locator?.strategy || null;
   let stableForMs = 0;
   let lastSerializationMs = 0;
   let lastRuntimeMetricsAt = 0;
@@ -1863,7 +3464,16 @@ async function streamAnswer(job, locator, before, run) {
     stable_for_ms: 0,
     completion_signal: "unknown",
     completion_confidence: "low",
+    finalization: finalizationDiagnostics(
+      finalization,
+      signals,
+      responseStrategy,
+      0,
+      0,
+      0,
+    ),
   };
+  publishRunProgress(lastProgress, pageState());
 
   try {
     while (!job.aborted) {
@@ -1892,28 +3502,77 @@ async function streamAnswer(job, locator, before, run) {
       }
       lastObservationAt = now;
 
-      // Re-recherche du tour à chaque itération, jamais de référence gardée :
-      // React remplace le nœud du message entre la phase de réflexion et la
-      // réponse, et un nœud détaché resterait figé sur « Thinking ».
-      const turn = findTurn(locator, before);
-      if (!turn) continue;
-
-      // `finished === false` (ChatGPT écrit encore) interdit de sortir ; `null`
-      // (aucun signal reconnu) exige une stabilité bien plus longue.
-      const completion = completionState(turn);
-      const finished = completion.finished;
-      const nextCompletionSignature = `${finished}:${completion.signal}`;
-      if (nextCompletionSignature !== completionSignature) {
-        completionSignature = nextCompletionSignature;
+      // Re-résolution du candidat à chaque itération, jamais de référence
+      // gardée : React remplace le nœud entre la réflexion et la réponse, et
+      // un nœud détaché resterait figé sur « Thinking ».
+      const candidate = locateResponseCandidate(
+        locator, responseBaseline, document, isSubmittedPromptRoot,
+      );
+      if (!candidate) {
+        // Aucune identité résoluble (nœud pas encore monté, ou deux roots
+        // indistinguables) : on ne finalise JAMAIS sur un état antérieur. La
+        // fenêtre de stabilité repart de zéro et l'état retombe sur `waiting`.
         stableSince = null;
         stableObservations = 0;
+        stableForMs = 0;
+        finalization = {
+          state: "waiting",
+          mode: null,
+          signal: "unknown",
+          confidence: "low",
+        };
+        signals = {
+          streaming_visible: false,
+          reasoning_visible: false,
+          stop_visible: false,
+          terminal_action_visible: false,
+        };
+        lastProgress = {
+          phase: "waiting_answer",
+          output_chars: 0,
+          stable_for_ms: 0,
+          completion_signal: "unknown",
+          completion_confidence: "low",
+          serialization_ms: lastSerializationMs,
+          finalization: finalizationDiagnostics(
+            finalization,
+            signals,
+            responseStrategy,
+            0,
+            0,
+            0,
+          ),
+          ...sampledRuntimeMetrics(now),
+        };
+        publishRunProgress(lastProgress, pageState());
+        continue;
       }
-      const root = answerRoot(
-        turn,
-        finished === true || Date.now() - debut > NO_MARKDOWN_FALLBACK_MS,
+      const turn = candidate.element;
+      responseStrategy = candidate.strategy;
+
+      // Signaux actifs ET terminaux, tous lus dans le périmètre de CETTE
+      // réponse : son ResponseRoot et son wrapper (le composer courant pour le
+      // Stop). Jamais un scan de la page.
+      const scope = responseSignalScope(candidate);
+      signals = finalizationSignals(scope);
+      const root = resolveResponseContentRoot(
+        candidate,
+        signals.terminal_action_visible ||
+          Date.now() - debut > NO_MARKDOWN_FALLBACK_MS,
       );
       const serializationStartedAt = globalThis.performance?.now?.();
-      const snapshot = root ? readAnswer(root, finished !== true) : null;
+      let snapshot = null;
+      try {
+        // Le dernier bloc de code reste « ouvert » tant qu'AUCUNE preuve
+        // terminale n'est visible : la réponse peut encore s'écrire
+        // (sémantique historique, cf. `dernierPre`).
+        snapshot = root ? readAnswer(root, !signals.terminal_action_visible) : null;
+      } catch (error) {
+        // Une sérialisation qui échoue est un fait de diagnostic à part
+        // entière : le popup doit pouvoir la nommer, pas seulement la subir.
+        publishRunSerialization({ rootFound: Boolean(root), lastSerialize: "error", ms: 0 });
+        throw error;
+      }
       const serializationFinishedAt = globalThis.performance?.now?.();
       if (
         Number.isFinite(serializationStartedAt) &&
@@ -1924,12 +3583,18 @@ async function streamAnswer(job, locator, before, run) {
           Math.round(serializationFinishedAt - serializationStartedAt),
         );
       }
+      publishRunSerialization({
+        rootFound: Boolean(root),
+        lastSerialize: "ok",
+        ms: lastSerializationMs,
+      });
       full = snapshot ? snapshot.text : "";
       output.observe(full);
+      outputChars = globalThis.ChatGPTBridgeFinalOutput.outputChars(full);
 
       if (DEBUG) {
         const pres = root ? root.querySelectorAll("pre") : [];
-        const sig = `fini=${finished} root=${root ? root.tagName + "." + (root.className || "-").slice(0, 24) : "null"} pre=${pres.length}`;
+        const sig = `fini=${finalization.state} root=${root ? root.tagName + "." + (root.className || "-").slice(0, 24) : "null"} pre=${pres.length}`;
         if (sig !== debugSig) {
           debugSig = sig;
           console.log(
@@ -1938,34 +3603,70 @@ async function streamAnswer(job, locator, before, run) {
         }
       }
 
+      const previousFinalization = finalization;
+      finalization = globalThis.ChatGPTBridgeCompletion.finalizationState({
+        ...signals,
+        output_chars: outputChars,
+      });
+      const stateChanged =
+        finalization.state !== previousFinalization.state ||
+        finalization.signal !== previousFinalization.signal;
+
       if (full !== vu) {
+        // La sortie a changé : la fenêtre de stabilité repart de zéro, quelle
+        // qu'en soit la cause (nouveau texte, réécriture React).
         vu = full;
         stableSince = null;
         stableObservations = 0;
-      } else if (stableSince === null) {
-        stableSince = Date.now();
+      } else if (stateChanged || stableSince === null) {
+        // Un changement d'état (ACTIVE → QUIESCENT, ou l'apparition de la
+        // preuve terminale) OUVRE une nouvelle période, et cette observation
+        // en est la première : le texte est déjà identique, mais l'ancienne
+        // période ne compte plus. Pendant ACTIVE, la stabilité continue d'être
+        // *mesurée* — c'est ce qui rend un signal figé diagnosticable — mais
+        // aucune durée ne conclut : cf. `finalizationOutcome`.
+        stableSince = now;
         stableObservations = 1;
       } else {
+        // Même texte sérialisé, même état : un nœud recréé par React reste le
+        // même candidat logique et ne perd pas sa fenêtre — la stabilité est
+        // une propriété du *contenu*, pas d'un nœud DOM. Une identité réellement
+        // ambiguë n'arrive jamais jusqu'ici : `locateResponseCandidate` a déjà
+        // rendu `null`.
         stableObservations += 1;
       }
+      stableForMs = stableSince === null ? 0 : now - stableSince;
 
-      const need =
-        finished === true && full.length === 0
-          ? EMPTY_FINAL_SETTLE_MS
-          : finished === null
-            ? SETTLE_UNKNOWN_MS
-            : SETTLE_MS;
-      stableForMs = stableSince === null ? 0 : Date.now() - stableSince;
-      const stable = stableForMs >= need;
+      const outcome = globalThis.ChatGPTBridgeFinalOutput.finalizationOutcome({
+        state: finalization.state,
+        mode: finalization.mode,
+        signal: finalization.signal,
+        confidence: finalization.confidence,
+        text: full,
+        stableForMs,
+        stableObservations,
+        // Même objet que celui publié dans le diagnostic : le seuil affiché
+        // par le popup est celui qui vient d'être appliqué ici.
+        thresholds: FINALIZATION_THRESHOLDS,
+      });
+
+      const diagnostics = finalizationDiagnostics(
+        finalization,
+        signals,
+        candidate.strategy,
+        outputChars,
+        stableForMs,
+        stableObservations,
+      );
 
       // Mettre à jour l'état courant pour le prochain heartbeat.
       // Ce calcul n'envoie rien : le heartbeat lui-même est émis plus haut,
       // indépendamment de la présence du tour.
       const phase =
-        completion.signal === "reasoning"
+        finalization.signal === "reasoning"
           ? "reasoning"
-          : completion.signal === "stop_button" ||
-              completion.signal === "streaming"
+          : finalization.signal === "stop_button" ||
+              finalization.signal === "streaming"
             ? "generating"
             : full.length === 0
               ? "waiting_answer"
@@ -1977,39 +3678,41 @@ async function streamAnswer(job, locator, before, run) {
       // dire *quel* détecteur l'affirme. Un stall futur doit être imputable à un
       // sélecteur nommé, jamais à un booléen agrégé.
       const signalSources =
-        completion.signal === "streaming"
-          ? streamingSignalSources(turnSignalScope(turn))
+        finalization.state === "active" && finalization.signal === "streaming"
+          ? streamingSignalSources(scope)
           : [];
 
       lastProgress = {
         phase,
-        output_chars:
-          globalThis.ChatGPTBridgeFinalOutput.outputChars(full),
+        output_chars: outputChars,
         stable_for_ms: stableForMs,
-        completion_signal: completion.signal,
-        completion_confidence: completion.confidence,
+        completion_signal: finalization.signal,
+        completion_confidence: finalization.confidence,
         serialization_ms: lastSerializationMs,
+        finalization: diagnostics,
         ...(signalSources.length
           ? { streaming_signal_sources: signalSources }
           : {}),
         ...sampledRuntimeMetrics(now),
       };
-      const outcome = globalThis.ChatGPTBridgeFinalOutput.settledOutcome({
-        completion,
-        text: full,
-        stableForMs,
-        emptySettleMs: EMPTY_FINAL_SETTLE_MS,
-      });
+      publishRunProgress(lastProgress, pageState());
+
       const incompleteFields = {
         snapshot,
-        completion,
+        finalization,
+        evidence: null,
+        signals,
+        strategy: candidate.strategy,
         stableForMs,
+        stableObservations,
         turn,
         signalSources,
         pageState: pageState(),
       };
-      if (outcome === "incomplete") {
-        // Fin confirmée mais rien d'écrit : il n'y a honnêtement aucun candidat.
+
+      if (outcome.outcome === "no_final_answer") {
+        // Fin terminale confirmée mais rien d'écrit : il n'y a honnêtement
+        // aucun candidat (le DOM peut monter la barre d'actions avant le texte).
         return incompleteAnswer({
           reason: "no_final_answer",
           text: "",
@@ -2017,98 +3720,142 @@ async function streamAnswer(job, locator, before, run) {
         });
       }
 
-      let verifyFinal = false;
-      if (finished === true) {
-        // `assistant_actions` est une finalité explicite : elle ne peut jamais
-        // devenir `finalization_stalled`, même après un réveil tardif.
-        verifyFinal = stable && full.length > 0;
-      } else if (finished === false) {
-        // Un texte stable n'est PAS la preuve qu'une génération active a échoué.
-        // Quand `.streaming-animation` est visible dans le tour surveillé,
-        // ChatGPT recherche encore : la borne dure appartient au serveur
-        // (`bridge_total_timeout`).
-        if (
-          full.length > 0 &&
-          stableForMs >= WATCHED_TURN_ACTIVE_SIGNAL_STALL_MS &&
-          stableObservations >= MIN_STALL_OBSERVATIONS &&
-          !longRunningStreamingSignalActive(signalSources)
-        ) {
-          return incompleteAnswer({
-            reason: "active_signal_stalled",
-            text: full,
-            ...incompleteFields,
-          });
-        }
-      } else {
-        // Finalité inconnue : c'est le seul état auquel le stall de finalisation
-        // peut s'appliquer.
-        if (
-          full.length > 0 &&
-          stableForMs >= FINALIZATION_STALL_MS &&
-          stableObservations >= MIN_STALL_OBSERVATIONS
-        ) {
-          return incompleteAnswer({
-            reason: "finalization_stalled",
-            text: full,
-            ...incompleteFields,
-          });
-        }
-        verifyFinal = stable && full.length > 0;
+      // §11 — un signal ACTIVE qui reste allumé anormalement longtemps n'est
+      // JAMAIS transformé en FINAL par la durée seule. On rend la main en
+      // `incomplete` (candidat joint, adoptable), en nommant le signal bloquant.
+      if (
+        finalization.state === "active" &&
+        full.length > 0 &&
+        stableForMs >= WATCHED_TURN_ACTIVE_SIGNAL_STALL_MS &&
+        stableObservations >= MIN_STALL_OBSERVATIONS &&
+        activeSignalStallApplies(finalization.signal, signalSources)
+      ) {
+        return incompleteAnswer({
+          reason: "active_signal_stalled",
+          blocking_signal: finalization.signal,
+          text: full,
+          ...incompleteFields,
+        });
+      }
+      // Borne de dernier recours : l'état quiescent n'a pas pu conclure
+      // (observations insuffisantes ou vérification constamment rejetée) et
+      // l'UI ne bouge plus. Jamais un FINAL inventé.
+      if (
+        finalization.state === "quiescent" &&
+        full.length > 0 &&
+        stableForMs >= FINALIZATION_STALL_MS &&
+        stableObservations >= MIN_STALL_OBSERVATIONS
+      ) {
+        return incompleteAnswer({
+          reason: "finalization_stalled",
+          blocking_signal: finalization.signal,
+          text: full,
+          ...incompleteFields,
+        });
       }
 
-      if (verifyFinal) {
-        // React peut remplacer le nœud entre les observations : re-résoudre le
-        // même tour, puis revérifier finalité, identité et texte sur ce nœud.
-        const verificationTurn = findTurn(
-          turnLocator(turn) || locator,
-          before,
-        );
-        const verificationCompletion = verificationTurn
-          ? completionState(verificationTurn)
-          : null;
-        const verificationRoot = verificationTurn
-          ? answerRoot(verificationTurn, true)
-          : null;
-        const verification = verificationRoot
-          ? readAnswer(verificationRoot, false)
-          : null;
-        const currentExternalTurnId = turnExternalId(turn);
-        const verificationExternalTurnId = verificationTurn
-          ? turnExternalId(verificationTurn)
-          : null;
-        const finalityVerified =
-          finished === true
-            ? verificationCompletion?.finished === true
-            : verificationCompletion?.finished !== false;
-        const externalTurnIdentityStable =
-          currentExternalTurnId === verificationExternalTurnId;
+      if (outcome.outcome !== "final") continue;
 
-        // La décision de fin porte uniquement sur le contenu textuel.
-        // Les citations restent des métadonnées et peuvent encore être
-        // réordonnées/enrichies par l'UI après la fin visible de la réponse.
-        if (
-          finalityVerified &&
-          externalTurnIdentityStable &&
-          verification &&
-          verification.text === full
-        ) {
-          output.observe(verification.text);
-          finalSerialized = verification;
-          finalCompletion = verificationCompletion;
-          finalTurnLocator = turnLocator(verificationTurn) || locator;
-          finalExternalTurnId = verificationExternalTurnId;
-          // État de plan au moment exact où la fin est constatée : c'est cette
-          // valeur qui rend vérifiable « terminé sans focus » après coup.
-          finalPageState = pageState();
-          break;
-        }
+      // --- Double vérification avant de conclure -------------------------- //
+      // React peut remplacer le nœud entre les observations : on re-résout le
+      // même candidat logique, on re-sérialise, on ré-évalue les signaux, puis
+      // on vérifie que l'évidence tient toujours sur CE nœud.
+      //
+      // Invariant capital : une fin `quiescent_stability` ne doit PAS exiger
+      // qu'une action Copy soit apparue entre-temps — c'est exactement la
+      // boucle sans fin que cette machine remplace. L'évidence d'une quiescence
+      // est « aucun signal actif », rien d'autre.
+      const verificationLocator =
+        locator.kind === "semantic_assistant"
+          ? { ...locator, turn_locator: turnLocator(turn) || locator.turn_locator }
+          : locator;
+      const verificationCandidate = locateResponseCandidate(
+        verificationLocator,
+        responseBaseline,
+        document,
+        isSubmittedPromptRoot,
+      );
+      const verificationScope = verificationCandidate
+        ? responseSignalScope(verificationCandidate)
+        : null;
+      const verificationSignals = verificationScope
+        ? finalizationSignals(verificationScope)
+        : null;
+      const verificationRoot = verificationCandidate
+        ? resolveResponseContentRoot(verificationCandidate, true)
+        : null;
+      const verification = verificationRoot
+        ? readAnswer(verificationRoot, !verificationSignals?.terminal_action_visible)
+        : null;
+      const verificationFinalization =
+        verificationSignals && verification
+          ? globalThis.ChatGPTBridgeCompletion.finalizationState({
+              ...verificationSignals,
+              output_chars:
+                globalThis.ChatGPTBridgeFinalOutput.outputChars(
+                  verification.text,
+                ),
+            })
+          : null;
+      const currentExternalTurnId = turnExternalId(turn);
+      const verificationExternalTurnId = verificationCandidate
+        ? turnExternalId(verificationCandidate.element)
+        : null;
+      const externalTurnIdentityStable =
+        currentExternalTurnId === verificationExternalTurnId;
+      const evidenceStillValid =
+        outcome.mode === "terminal_action"
+          ? verificationFinalization?.state === "final"
+          : verificationFinalization?.state !== "active";
 
-        // Le texte, la finalité ou l'identité a réellement changé entre les
-        // deux lectures : on recommence la fenêtre de stabilisation.
-        vu = verification ? verification.text : "";
-        stableSince = null;
-        stableObservations = 0;
+      // La décision de fin porte uniquement sur le contenu textuel.
+      // Les citations restent des métadonnées et peuvent encore être
+      // réordonnées/enrichies par l'UI après la fin visible de la réponse.
+      if (
+        evidenceStillValid &&
+        externalTurnIdentityStable &&
+        verification &&
+        verification.text === full
+      ) {
+        output.observe(verification.text);
+        finalSerialized = verification;
+        finalCompletion = {
+          signal: outcome.signal,
+          confidence: outcome.confidence,
+        };
+        finalEvidence = {
+          mode: outcome.mode,
+          signal: outcome.signal,
+          stable_for_ms: stableForMs,
+          stable_observations: stableObservations,
+          output_chars: outputChars,
+          candidate_strategy: candidate.strategy,
+        };
+        // FINAL est terminal : le dernier état publié est celui de la décision.
+        finalization = {
+          state: "final",
+          mode: outcome.mode,
+          signal: outcome.signal,
+          confidence: outcome.confidence,
+        };
+        signals = verificationSignals || signals;
+        finalTurnLocator = verificationCandidate
+          ? turnLocator(verificationCandidate.element) ||
+            verificationLocator.turn_locator ||
+            null
+          : null;
+        finalExternalTurnId = verificationExternalTurnId;
+        // État de plan au moment exact où la fin est constatée : c'est cette
+        // valeur qui rend vérifiable « terminé sans focus » après coup.
+        finalPageState = pageState();
+        break;
       }
+
+      // Le texte, la finalité ou l'identité a réellement changé entre les
+      // deux lectures : on recommence la fenêtre de stabilisation.
+      vu = verification ? verification.text : "";
+      stableSince = null;
+      stableObservations = 0;
     }
   } finally {
     watcher.disconnect();
@@ -2124,6 +3871,15 @@ async function streamAnswer(job, locator, before, run) {
     completion_signal: finalCompletion.signal,
     completion_confidence: finalCompletion.confidence,
     stable_for_ms: stableForMs,
+    finalization: finalizationDiagnostics(
+      finalization,
+      signals,
+      responseStrategy,
+      outputChars,
+      stableForMs,
+      stableObservations,
+    ),
+    finalization_evidence: finalEvidence,
     turn_locator: finalTurnLocator,
     external_turn_id: finalExternalTurnId,
     page_state: finalPageState || pageState(),
@@ -2140,10 +3896,16 @@ async function streamAnswer(job, locator, before, run) {
  * l'identité capturée par `streamAnswer`, et à défaut on re-résout ce même
  * tour par son locator, sans jamais réutiliser une référence DOM conservée.
  */
-function resolveExternalTurnId(serialized, locator, before) {
+function resolveExternalTurnId(serialized, locator, responseBaseline, isSubmittedPromptRoot = null) {
   if (serialized.external_turn_id) return serialized.external_turn_id;
-  const turn = findTurn(serialized.turn_locator || locator, before);
-  return turn ? turnExternalId(turn) : null;
+  const refined =
+    locator?.kind === "semantic_assistant" && serialized.turn_locator
+      ? { ...locator, turn_locator: serialized.turn_locator }
+      : locator;
+  const candidate = locateResponseCandidate(
+    refined, responseBaseline, document, isSubmittedPromptRoot,
+  );
+  return candidate ? turnExternalId(candidate.element) : null;
 }
 
 /** Erreur de content script typée : `.code` traverse jusqu'au client, jamais aplati. */
@@ -2223,13 +3985,22 @@ const TEMPORARY_CHAT_ORIGINS = new Set([
 ]);
 const TEMPORARY_SURFACE_TIMEOUT_MS = 15000;
 
-function temporaryVerificationFailure(reason, url, composerFound, toggleFound) {
+function temporaryVerificationFailure(
+  reason,
+  url,
+  composerFound,
+  toggleFound,
+  composerResolution = null,
+) {
   console.warn("temporary_chat_verification_failed", {
     reason,
     origin: url?.origin ?? null,
     pathname: url?.pathname ?? null,
     temporary_param: url?.searchParams.get("temporary-chat") ?? null,
     composer_found: composerFound,
+    composer_strategy: composerResolution?.strategy ?? null,
+    composer_selector: composerResolution?.selector ?? null,
+    composer_candidate_count: composerResolution?.candidate_count ?? 0,
     toggle_found: toggleFound,
     content_script_version: VERSION,
   });
@@ -2238,6 +4009,11 @@ function temporaryVerificationFailure(reason, url, composerFound, toggleFound) {
 async function ensureTemporaryChat() {
   const deadline = Date.now() + TEMPORARY_SURFACE_TIMEOUT_MS;
   let lastReason = "temporary_surface_origin_invalid";
+  let lastResolution = uiResolution(
+    "structural_fallback",
+    STRUCTURAL_COMPOSER_SELECTOR,
+    0,
+  );
   while (Date.now() < deadline) {
     let url;
     try {
@@ -2247,7 +4023,6 @@ async function ensureTemporaryChat() {
       throw new BridgeError("conversation_unavailable", "surface Temporary Chat invalide");
     }
 
-    const composer = $(SELECTORS.composer);
     const toggleFound = Boolean($(SELECTORS.temporaryChatToggle));
     if (!TEMPORARY_CHAT_ORIGINS.has(url.origin)) {
       lastReason = "temporary_surface_origin_invalid";
@@ -2257,17 +4032,20 @@ async function ensureTemporaryChat() {
       lastReason = "temporary_query_missing";
     } else if (url.searchParams.get("temporary-chat") !== "true") {
       lastReason = "temporary_query_not_true";
-    } else if (!composer) {
-      lastReason = "temporary_composer_missing";
     } else {
-      console.log("bridge_run_phase", { phase: "temporary_verification", state: "verified", content_script_version: VERSION });
-      return composer;
+      lastResolution = resolveComposer();
+      if (!lastResolution.element) {
+        lastReason = "temporary_composer_missing";
+      } else {
+        console.log("bridge_run_phase", { phase: "temporary_verification", state: "verified", content_script_version: VERSION });
+        return lastResolution.element;
+      }
     }
 
     // Origin/path/query violations are deterministic and must not become a
     // generic 15s timeout. Only a missing composer can be an SPA load race.
     if (lastReason !== "temporary_composer_missing") {
-      temporaryVerificationFailure(lastReason, url, Boolean(composer), toggleFound);
+      temporaryVerificationFailure(lastReason, url, Boolean(lastResolution.element), toggleFound, lastResolution);
       throw new BridgeError(
         lastReason === "temporary_surface_path_invalid" ? "conversation_unavailable" : "bridge_ui_timeout",
         `vérification Temporary Chat refusée (${lastReason})`,
@@ -2278,8 +4056,29 @@ async function ensureTemporaryChat() {
 
   let url = null;
   try { url = new URL(window.location.href); } catch { /* diagnostic below */ }
-  temporaryVerificationFailure(lastReason, url, Boolean($(SELECTORS.composer)), Boolean($(SELECTORS.temporaryChatToggle)));
-  throw new BridgeError("bridge_ui_timeout", "composer Temporary Chat introuvable");
+  try {
+    lastResolution = resolveComposer();
+  } catch (error) {
+    temporaryVerificationFailure(
+      "composer_contract_ambiguous",
+      url,
+      false,
+      Boolean($(SELECTORS.temporaryChatToggle)),
+    );
+    throw error;
+  }
+  temporaryVerificationFailure(
+    lastReason,
+    url,
+    Boolean(lastResolution.element),
+    Boolean($(SELECTORS.temporaryChatToggle)),
+    lastResolution,
+  );
+  throw uiContractError(
+    "composer_missing",
+    lastResolution,
+    "composer Temporary Chat introuvable",
+  );
 }
 
 function isBrowserTarget(value) {
@@ -2304,6 +4103,7 @@ async function handlePrompt({
   files,
   conversation,
   browser_target: browserTarget,
+  requires_continuation_identity: requiresContinuationIdentity = false,
 }) {
   if (currentJob) {
     // L'observation post-clic garde l'onglet réservé : un second prompt ne doit
@@ -2329,9 +4129,28 @@ async function handlePrompt({
     submissionState: "pre_submission",
   };
   const runDiagnostics = captureRunStartDiagnostics();
+  let promptInjected = false;
   currentJob = job;
+  // Nouveau run : le diagnostic vivant repart de zéro. Aucune raison de la
+  // dérive précédente, aucune décision du locator précédent ne sont réutilisées.
+  liveRun.active = true;
+  liveRun.phase = job.phase;
+  liveRun.progress = null;
+  liveRun.page_state = null;
+  liveRun.serialization = {
+    root_found: null,
+    serializer: serializerVersion(),
+    last_serialize: null,
+    ms: 0,
+  };
+  lastResponseLocatorDiagnostic = null;
+  lastResponseLocatorFailure = null;
   if (!(await claimPrompt(id))) {
     if (currentJob === job) currentJob = null;
+    // Requête déjà réclamée : aucun run n'a réellement démarré ici, le
+    // diagnostic vivant ne doit pas prétendre le contraire.
+    liveRun.active = false;
+    liveRun.phase = "idle";
     reply({ type: "ack", id, state: "duplicate", duplicate: true });
     return;
   }
@@ -2384,11 +4203,11 @@ async function handlePrompt({
       }
     }
 
-    let composer = await waitFor(
-      () => $(SELECTORS.composer),
+    let composerResolution = await waitForComposer(
       15000,
       "composer introuvable",
     );
+    let composer = composerResolution.element;
     console.log("bridge_run_phase", { phase: "composer" });
     const assistantTurnsBefore = document.querySelectorAll(SELECTORS.assistant).length;
     const before = assistantTurnsBefore;
@@ -2418,16 +4237,17 @@ async function handlePrompt({
       // L'ajout d'une pièce jointe provoque un rerender du composer :
       // ProseMirror/React peut avoir remplacé le nœud. On ne colle jamais dans
       // une référence potentiellement détachée du document.
-      composer = await waitFor(
-        () => $(SELECTORS.composer),
+      composerResolution = await waitForComposer(
         5000,
         "composer introuvable après ajout des pièces jointes",
       );
+      composer = composerResolution.element;
     }
 
     let injectionMethod = null;
     if (composerPrompt) {
       injectionMethod = await typePrompt(composer, composerPrompt);
+      promptInjected = true;
     }
     // Volumétrie uniquement : ni le prompt, ni le contenu du fichier, ni le
     // DOM du composer ne doivent apparaître dans un log.
@@ -2446,22 +4266,41 @@ async function handlePrompt({
     const mayUploadAfterPaste = injectionMethod === "synthetic_paste";
     const waitsForUpload = hasAttachments || mayUploadAfterPaste;
 
-    // Le bouton d'envoi ne devient actif qu'après le rendu de la saisie — et,
-    // si un upload est possible, qu'une fois celui-ci terminé (bien plus long).
-    // Ce délai long n'ajoute aucune latence : `waitFor` rend la main dès que
-    // Send devient utilisable.
-    const sendBtn = await waitFor(
-      () => {
-        const b = $(SELECTORS.send);
-        return isSendButtonReady(b) ? b : null;
-      },
-      waitsForUpload ? UPLOAD_TIMEOUT_MS : 8000,
-      waitsForUpload
-        ? "contenu collé ou pièce jointe non prêt pour l'envoi"
-        : "bouton d'envoi jamais actif",
-    );
+    const payloadContext = {
+      payload_mode: promptAsFile ? "prompt_file" : hasAttachments ? "text_with_files" : "paste_or_text",
+      prompt_bytes: promptBytes,
+      paste_consumed: mayUploadAfterPaste,
+      explicit_attachment_count: (files?.length || 0) + extraFiles.length,
+      expected_attachment_count: (files?.length || 0) + extraFiles.length,
+    };
+    const payloadDeadline = Date.now() + (waitsForUpload ? UPLOAD_TIMEOUT_MS : 8000);
+    let readyPayload;
+    do {
+      await waitForComposerPayloadReady(payloadContext, Math.max(0, payloadDeadline - Date.now()));
+      // No await between this fresh inspection, the baseline and the trigger.
+      readyPayload = inspectSubmissionPayload(payloadContext);
+    } while (!readyPayload.ready);
+    composerResolution = readyPayload.composerResolution;
+    composer = composerResolution.element;
+    const sendResolution = readyPayload.sendResolution;
+    const sendBtn = sendResolution.element;
+    warnIfDegraded("composer", composerResolution);
+    warnIfDegraded("send", sendResolution);
+    console.log("bridge_dom_contract", {
+      composer_strategy: composerResolution.strategy,
+      composer_selector: composerResolution.selector,
+      composer_candidate_count: composerResolution.candidate_count,
+      send_strategy: sendResolution.strategy,
+      send_selector: sendResolution.selector,
+      send_candidate_count: sendResolution.candidate_count,
+      content_script_version: VERSION,
+    });
     // Capture after typing/upload and immediately before the one allowed
     // trigger: the composer text and send state must describe the actual click.
+    // La baseline de réponse décrit la structure déjà rendue (comptages,
+    // signatures) : aucun texte, et c'est le SEUL état de référence du delta.
+    const responseBaseline = captureResponseBaseline();
+    const isSubmittedPromptRoot = createSubmittedPromptMatcher(composerPrompt);
     const submissionBaseline = captureSubmissionSnapshot(composer, sendBtn);
     job.submissionState = "submission_attempted";
     job.phase = "submission_confirmation";
@@ -2497,42 +4336,43 @@ async function handlePrompt({
       });
     }
 
-    // Attendre le premier tour assistant *nouveau* (pas le précédent), sans
+    // Attendre le premier ResponseRoot *nouveau* (jamais le précédent), sans
     // imposer une courte borne murale à une recherche web ou réflexion longue.
-    const premier = await waitForFirstAssistantTurn(
+    // Le candidat vient du delta structurel contre le baseline d'avant-Send.
+    const candidate = await waitForResponseCandidate(
       job,
-      composer,
-      sendBtn,
-      submissionBaseline,
-      before,
+      responseBaseline,
       runDiagnostics,
+      isSubmittedPromptRoot,
     );
-    if (!premier) return;
-    const streamLocator = turnLocator(premier);
+    if (!candidate) return;
+    const responseLocator = createResponseLocator(
+      candidate, responseBaseline, document, isSubmittedPromptRoot,
+    );
     const serialized = await streamAnswer(
       job,
-      streamLocator,
-      before,
+      responseLocator,
+      responseBaseline,
       runDiagnostics,
+      isSubmittedPromptRoot,
     );
 
     if (!job.aborted) {
-      // Le nœud `premier` peut être détaché : l'identité vient du tour courant
+      // Le nœud candidat peut être détaché : l'identité vient du tour courant
       // qui a produit ce texte, jamais de la référence gardée avant streaming.
       const externalTurnId = resolveExternalTurnId(
         serialized,
-        streamLocator,
-        before,
+        responseLocator,
+        responseBaseline,
+        isSubmittedPromptRoot,
       );
       console.log("bridge_run_phase", { phase: "generation" });
-      // Un `done` promet une conversation poursuivable : sans identité externe
-      // stable, cette promesse serait fausse. Mais détruire un texte final déjà
-      // sérialisé parce que l'UI n'a pas posé de `data-message-id` durable
-      // serait pire : on dégrade en `incomplete` typé, candidat joint, sans
-      // aucune identité de continuation fabriquée.
+      // La finalité de la sortie et l'identité réutilisable sont deux contrats
+      // séparés. Seule une requête explicitement normalisée comme continuable
+      // exige un id externe ; une réponse stateless reste une finale valide.
       let incomplete = serialized.incomplete === true;
       let reason = serialized.incomplete_reason;
-      if (!externalTurnId && !incomplete) {
+      if (!externalTurnId && !incomplete && requiresContinuationIdentity) {
         if (!serialized.text) {
           throw new BridgeError(
             "conversation_unavailable",
@@ -2560,6 +4400,24 @@ async function handlePrompt({
           content_script_version: VERSION,
           submission_state: "post_submission",
           initial_turn_id: externalTurnId,
+          external_turn_id_verified: Boolean(externalTurnId),
+          continuation_available: Boolean(
+            requiresContinuationIdentity && externalTurnId,
+          ),
+          // Dernier état de la machine de finalisation, joint à TOUTE fin de
+          // run (`done`, `incomplete` d'identité, stall) : exactement l'objet
+          // du dernier heartbeat, jamais reconstruit après coup.
+          ...(serialized.finalization
+            ? { finalization: serialized.finalization }
+            : {}),
+          // Preuve exacte retenue quand la fin est conclue (mode, signal,
+          // fenêtre de stabilité, stratégie) : jamais un texte.
+          ...(serialized.finalization_evidence
+            ? { finalization_evidence: serialized.finalization_evidence }
+            : {}),
+          ...(serialized.blocking_signal
+            ? { blocking_signal: serialized.blocking_signal }
+            : {}),
           // Diagnostic d'autonomie : état de plan de l'onglet au moment où la
           // fin a été constatée. Sans contenu, jamais un signal de décision.
           ...(serialized.page_state ? { page_state: serialized.page_state } : {}),
@@ -2580,6 +4438,7 @@ async function handlePrompt({
       });
     }
   } catch (err) {
+    if (promptInjected) addPostInjectionUiDiagnostics(err);
     if (!job.aborted) {
       reply({
         type: "error",
@@ -2600,6 +4459,12 @@ async function handlePrompt({
     }
   } finally {
     if (currentJob === job) currentJob = null;
+    // Le diagnostic vivant redevient « aucun run » : la dernière observation
+    // d'un run terminé n'est jamais présentée comme un état courant.
+    liveRun.active = false;
+    liveRun.phase = "idle";
+    liveRun.progress = null;
+    liveRun.page_state = null;
     // Aucun observateur ne survit à un job : ni fuite entre deux runs, ni
     // réveil d'une boucle qui n'existe plus.
     disconnectDomWatchers();
@@ -2647,32 +4512,45 @@ async function captureLaterResponse(msg) {
 
   for (let index = candidates.length - 1; index >= 0; index -= 1) {
     const turn = candidates[index];
-    const completion = completionState(turn);
-
-    // Stateless recovery is strict: a visible answer must be explicitly final.
-    // Conversation-backed recovery keeps its existing human-preview tolerance
-    // for an unknown completion signal.
-    if (stateless ? completion.finished !== true : completion.finished === false) continue;
-
     const turnId = turnExternalId(turn);
     if (!turnId) continue;
     const root = answerRoot(turn, true);
     const serialized = root ? readAnswer(root, false) : null;
     if (!serialized?.text?.trim()) continue;
+    // La capture de recovery relit un tour historique avec la même machine à
+    // états, mais sans boucle de stabilité : seuls un signal ACTIVE ou l'absence
+    // de preuve terminale discréditent le candidat.
+    const recoveryState = globalThis.ChatGPTBridgeCompletion.finalizationState({
+      ...finalizationSignals(turnSignalScope(turn)),
+      output_chars: globalThis.ChatGPTBridgeFinalOutput.outputChars(
+        serialized.text,
+      ),
+    });
+
+    // Stateless recovery is strict: a visible answer must be explicitly final.
+    // Conversation-backed recovery keeps its existing human-preview tolerance
+    // for an answer that is merely quiescent.
+    if (stateless ? recoveryState.state !== "final" : recoveryState.state === "active") continue;
 
     // React may replace the turn between the two reads. Re-read the same
     // external message id and accept only unchanged text and completion state;
     // this remains entirely read-only (no click, input, or requestSubmit).
     const verificationTurn = findAssistantTurnByExternalId(turnId);
     if (!verificationTurn) continue;
-    const verificationCompletion = completionState(verificationTurn);
-    if (stateless && verificationCompletion.finished !== true) continue;
-    if (!stateless && verificationCompletion.finished === false) continue;
     const verificationRoot = answerRoot(verificationTurn, true);
     const verification = verificationRoot
       ? readAnswer(verificationRoot, false)
       : null;
     if (!verification?.text?.trim() || verification.text !== serialized.text) continue;
+    const verificationState =
+      globalThis.ChatGPTBridgeCompletion.finalizationState({
+        ...finalizationSignals(turnSignalScope(verificationTurn)),
+        output_chars: globalThis.ChatGPTBridgeFinalOutput.outputChars(
+          verification.text,
+        ),
+      });
+    if (stateless && verificationState.state !== "final") continue;
+    if (!stateless && verificationState.state === "active") continue;
 
     return {
       type: "recovery_preview",
@@ -2692,11 +4570,13 @@ async function captureLaterResponse(msg) {
         output_chars: globalThis.ChatGPTBridgeFinalOutput.outputChars(
           verification.text,
         ),
-        completion_signal: verificationCompletion.signal,
-        completion_confidence: verificationCompletion.confidence,
+        completion_signal: verificationState.signal,
+        completion_confidence: verificationState.confidence,
         content_script_version: VERSION,
+        // Une fin explicitement terminale reste la seule capture « vérifiée » ;
+        // une réponse seulement quiescente reste une adoption humaine.
         capture_confidence:
-          verificationCompletion.finished === true
+          verificationState.state === "final"
             ? "verified_final"
             : "visible_unknown",
       },
@@ -2712,6 +4592,17 @@ async function captureLaterResponse(msg) {
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg?.type === "dom_health") {
+    sendResponse(domHealthSnapshot());
+    return true;
+  }
+  if (msg?.type === "run_state") {
+    // État vivant seul : lu dans la boucle du run exact, jamais recalculé par
+    // le popup. Un onglet sans run répond `active: false`, jamais un état
+    // hérité d'un run terminé.
+    sendResponse(runDiagnosticSnapshot());
+    return true;
+  }
   if (msg?.type === "ui_state" || msg?.type === "ui_control") {
     // Requête/réponse : le service worker attend la valeur, d'où le `return true`
     // sans acquittement immédiat (un seul `sendResponse` est autorisé).
@@ -2720,6 +4611,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
   if (msg?.type === "recovery_capture") {
     captureLaterResponse(msg).then(sendResponse);
+    return true;
+  }
+  if (msg?.type === "response_structure") {
+    // Snapshot structurel borné : ni innerText, ni textContent, ni innerHTML.
+    sendResponse(responseStructureSnapshot());
     return true;
   }
   if (msg?.type === "observe_tick") {

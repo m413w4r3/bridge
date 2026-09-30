@@ -109,6 +109,18 @@ class OpenAIRoutes:
         }
 
     async def create_response(self, req: ResponseRequest, http_req: Request):
+        if (req.model_extra or {}).get("previous_response_id") is not None:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "unsupported_parameter",
+                    "message": "previous_response_id n'est pas supporté ; utilise la cible Bridge conversation.",
+                    "param": "previous_response_id",
+                    "retryable": False,
+                    "phase": "request_validation",
+                    "submission_state": "pre_submission",
+                },
+            )
         self.ensure_accepting_runs()
         self._online_or_fail()
         spec = self._response_spec(req)
@@ -158,7 +170,8 @@ class OpenAIRoutes:
         )
         response_id = snapshot.response_id
         chat_id = "chatcmpl-" + response_id.removeprefix("resp_")
-        created = int(time.time())
+        stored_response = (snapshot.result or {}).get("response") or {}
+        created = int(stored_response.get("created_at") or time.time())
         prompt_tokens = _tokens(prompt)
 
         if req.stream:
@@ -167,7 +180,15 @@ class OpenAIRoutes:
                 final = await self.run_service.wait(response_id)
                 if final.state == "completed":
                     result = final.result or {}
-                    yield sse_chunk(chat_id, req.model, created, {"content": result.get("output_text", "")}, None)
+                    response = result.get("response") or {}
+                    yield sse_chunk(
+                        chat_id,
+                        req.model,
+                        created,
+                        {"content": result.get("output_text", "")},
+                        None,
+                        metadata=response.get("metadata"),
+                    )
                     yield sse_chunk(chat_id, req.model, created, {}, "stop")
                 else:
                     detail = final.error_detail() or {
@@ -195,6 +216,7 @@ class OpenAIRoutes:
             created,
             str(result.get("output_text", "")),
             _tokens(prompt),
+            metadata=(result.get("response") or {}).get("metadata"),
         )
 
     async def list_models(self, probe: bool = False):

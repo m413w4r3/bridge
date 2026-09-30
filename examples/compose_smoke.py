@@ -35,7 +35,18 @@ def post_once() -> dict:
 async def main() -> None:
     prompt_count = 0
     async with websockets.connect(f"{WS_URL}?{urlencode({'token': WS_TOKEN})}") as socket:
-        await socket.send(json.dumps({"type": "hello", "client": "compose-smoke"}))
+        await socket.send(
+            json.dumps(
+                {
+                    "type": "hello",
+                    "client": "extension-chrome",
+                    "instance_id": str(uuid.uuid4()),
+                    "worker_session_id": str(uuid.uuid4()),
+                    "connection_id": str(uuid.uuid4()),
+                    "extension_version": "compose-smoke",
+                }
+            )
+        )
 
         async def extension() -> None:
             nonlocal prompt_count

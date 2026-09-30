@@ -31,11 +31,14 @@ node_modules: package.json package-lock.json
 test-js: node_modules
 	node --test \
 		tests/completion.test.js \
+		tests/finalization-state.test.js \
 		tests/content-dom.test.js \
+		tests/response-root.test.js \
 		tests/final-output.test.js \
 		tests/background-conversation.test.js \
 		tests/content-background-tab.test.js \
-		tests/serializer.test.js
+		tests/serializer.test.js \
+		tests/dom-contract.test.js
 
 test: test-python test-js
 

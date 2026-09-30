@@ -12,6 +12,11 @@ const path = require("node:path");
 const vm = require("node:vm");
 
 const EXTENSION = path.join(__dirname, "..", "extension");
+const {
+  CURRENT_CHATGPT_COMPOSER_2026_09_24,
+  CURRENT_CHATGPT_DOCUMENT_ATTACHMENT_2026_09_28,
+  DOM_DRIFT_MATRIX,
+} = require("./fixtures/chatgpt-dom.js");
 
 let JSDOM;
 try {
@@ -42,11 +47,12 @@ function loadExtension(body, url = "https://chatgpt.com/") {
   window.CSS = window.CSS || {
     escape: (value) => String(value).replace(/["\\]/g, "\\$&"),
   };
+  const messageListeners = [];
   window.chrome = {
     storage: { local: { get: async () => ({}), set: async () => {} } },
     runtime: {
       sendMessage: async () => {},
-      onMessage: { addListener: () => {} },
+      onMessage: { addListener: (listener) => messageListeners.push(listener) },
     },
   };
 
@@ -108,6 +114,9 @@ function loadExtension(body, url = "https://chatgpt.com/") {
   return {
     window,
     run: (expression) => vm.runInContext(expression, context),
+    dispatch: (message) => new Promise((resolve) => {
+      for (const listener of messageListeners) listener(message, {}, resolve);
+    }),
     // Les objets nés dans le contexte vm ont un autre prototype : on les
     // recopie pour que deepEqual compare des valeurs, pas des realms.
     state: (expression) => ({ ...vm.runInContext(expression, context) }),
@@ -164,6 +173,14 @@ function page({
 }
 
 const WATCHED = `document.querySelector("[data-testid='conversation-turn-3'] [data-message-author-role='assistant']")`;
+
+/**
+ * État de finalisation du tour surveillé, lu exactement comme `streamAnswer` :
+ * signaux scopés (ResponseRoot/wrapper, composer courant pour le Stop) puis
+ * machine à états. `output_chars` reflète le texte réellement sérialisé.
+ */
+const finalizationOf = (outputChars = 15) =>
+  `ChatGPTBridgeCompletion.finalizationState({ ...finalizationSignals(turnSignalScope(${WATCHED})), output_chars: ${outputChars} })`;
 
 function serializeMarkup(body) {
   const { run } = loadExtension(body);
@@ -284,8 +301,8 @@ function recoverFencedCode(markdown) {
     page({ staleStreaming: true, strayStop: true, actions: true }),
   );
   assert.deepEqual(
-    state(`completionState(${WATCHED})`),
-    { finished: true, signal: "assistant_actions", confidence: "high" },
+    state(finalizationOf()),
+    { state: "final", mode: "terminal_action", signal: "assistant_actions", confidence: "high" },
     "un indicateur de streaming d'un ancien tour ne bloque pas la finalisation",
   );
 }
@@ -293,8 +310,8 @@ function recoverFencedCode(markdown) {
 {
   const { state } = loadExtension(page({ watchedStreaming: true }));
   assert.deepEqual(
-    state(`completionState(${WATCHED})`),
-    { finished: false, signal: "streaming", confidence: "high" },
+    state(finalizationOf()),
+    { state: "active", mode: null, signal: "streaming", confidence: "high" },
     "le streaming du tour surveillé, lui, interdit la finalisation",
   );
 }
@@ -303,8 +320,8 @@ function recoverFencedCode(markdown) {
 {
   const { state } = loadExtension(page({ strayStop: true, actions: true }));
   assert.deepEqual(
-    state(`completionState(${WATCHED})`),
-    { finished: true, signal: "assistant_actions", confidence: "high" },
+    state(finalizationOf()),
+    { state: "final", mode: "terminal_action", signal: "assistant_actions", confidence: "high" },
     "un bouton « Stop » hors composer ne maintient pas le tour en running",
   );
 }
@@ -312,8 +329,8 @@ function recoverFencedCode(markdown) {
 {
   const { state } = loadExtension(page({ strayStop: true }));
   assert.deepEqual(
-    state(`completionState(${WATCHED})`),
-    { finished: null, signal: "unknown", confidence: "low" },
+    state(finalizationOf()),
+    { state: "quiescent", mode: null, signal: "output_stable", confidence: "medium" },
     "un « Stop » hors composer n'est pas lu du tout",
   );
 }
@@ -321,8 +338,8 @@ function recoverFencedCode(markdown) {
 {
   const { state } = loadExtension(page({ composerStop: true }));
   assert.deepEqual(
-    state(`completionState(${WATCHED})`),
-    { finished: false, signal: "stop_button", confidence: "high" },
+    state(finalizationOf()),
+    { state: "active", mode: null, signal: "stop_button", confidence: "high" },
     "le Stop du composer reste un signal d'activité",
   );
 }
@@ -334,8 +351,8 @@ function recoverFencedCode(markdown) {
     page({ withComposer: false, strayStop: true }),
   );
   assert.deepEqual(
-    state(`completionState(${WATCHED})`),
-    { finished: null, signal: "unknown", confidence: "low" },
+    state(finalizationOf()),
+    { state: "quiescent", mode: null, signal: "output_stable", confidence: "medium" },
     "sans composer, aucun Stop n'est retenu",
   );
 }
@@ -426,7 +443,7 @@ function recoverFencedCode(markdown) {
   };
 
   window.testJob = { id: "stall", aborted: false };
-  const result = await run(`streamAnswer(testJob, "conversation-turn-3", 1)`);
+  const result = await run(`streamAnswer(testJob, { kind: "semantic_assistant", strategy: "semantic_assistant", turn_locator: "conversation-turn-3", baseline_count: 1 }, null)`);
 
   assert.equal(result.incomplete, true);
   assert.equal(result.incomplete_reason, "active_signal_stalled");
@@ -465,6 +482,41 @@ function recoverFencedCode(markdown) {
   process.exit(1);
 });
 
+// Régression réelle du 26/09 : 76 689 caractères visibles, Stop encore
+// présent, 300 131 ms de texte stable, puis ChatGPT a continué à répondre.
+(async () => {
+  const { window, run } = loadExtension(page({ composerStop: true }));
+  let clock = 1_000_000;
+  let completedAfter = null;
+  let observations = 0;
+  window.Date.now = () => clock;
+  window.setTimeout = (fn, ms) => {
+    clock += ms || 0;
+    observations += 1;
+    if (observations > 20_000) throw new Error("attente non bornée dans le test");
+    if (completedAfter === null && clock >= 1_360_000) {
+      completedAfter = clock;
+      window.document.querySelector("[data-testid='stop-button']").remove();
+      window.document.querySelector("[data-testid='conversation-turn-3']")
+        .insertAdjacentHTML("beforeend", copyButton);
+    }
+    queueMicrotask(fn);
+    return 0;
+  };
+  window.testJob = { id: "long-stop", aborted: false };
+  const result = await run(`streamAnswer(testJob, { kind: "semantic_assistant", strategy: "semantic_assistant", turn_locator: "conversation-turn-3", baseline_count: 1 }, null)`);
+  assert.ok(completedAfter >= 1_360_000);
+  assert.equal(result.incomplete, undefined);
+  assert.equal(result.text, "réponse finale");
+  assert.equal(result.completion_signal, "assistant_actions");
+  assert.equal(run(`activeSignalStallApplies("stop_button", [])`), false);
+  assert.equal(run(`activeSignalStallApplies("reasoning", [])`), false);
+  assert.equal(run(`activeSignalStallApplies("streaming", [])`), true);
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+
 // --------------------------------------------------------------------------- //
 // Temporary Chat : confirmation positive avant Send, jamais best-effort ; et
 // identité du tour précédent pour CONTINUE, jamais par index/comptage.
@@ -483,6 +535,438 @@ function useVirtualClock(window) {
 
 (async () => {
   const temporaryComposer = `<div id="prompt-textarea" contenteditable="true"></div>`;
+
+  // A. Les signatures historiques restent prioritaires et fonctionnelles.
+  {
+    const { window, run } = loadExtension(
+      `<form><div id="prompt-textarea" contenteditable="true"></div>
+        <button data-testid="send-button">Send</button></form>`,
+      "https://chatgpt.com/?temporary-chat=true",
+    );
+    useVirtualClock(window);
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    const form = window.document.querySelector("form");
+    const composer = form.querySelector("#prompt-textarea");
+    let submitEvents = 0;
+    composer.addEventListener("paste", (event) => {
+      event.preventDefault();
+      composer.textContent = event.clipboardData.getData("text/plain");
+    });
+    form.addEventListener("submit", (event) => {
+      submitEvents += 1;
+      event.preventDefault();
+      composer.textContent = "";
+      window.document.body.insertAdjacentHTML("beforeend", `
+        <article data-testid="conversation-turn-1">
+          <div data-message-author-role="assistant" data-message-id="msg-legacy-1">
+            <div class="markdown"><p>réponse historique</p></div>
+          </div>${copyButton}
+        </article>`);
+    });
+    await run(`handlePrompt({ id: "req-legacy", prompt: "bonjour historique", conversation: { id: "conv-legacy", mode: "fresh" } })`);
+    assert.equal(run("resolveComposer().selector"), "#prompt-textarea");
+    assert.equal(run("resolveSendButton(resolveComposer().element).selector"), "button[data-testid='send-button']");
+    assert.equal(submitEvents, 1, "le chemin historique doit encore envoyer une fois");
+    assert.ok(sent.some((message) => message.type === "done"));
+  }
+
+  // B. Le DOM actuel accepte le paste, résout le submit dans son formulaire
+  // et n'envoie le prompt qu'une fois. Aucun contenu n'entre dans le journal.
+  {
+    const { window, run } = loadExtension(
+      CURRENT_CHATGPT_COMPOSER_2026_09_24,
+      "https://chatgpt.com/?temporary-chat=true",
+    );
+    useVirtualClock(window);
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    const form = window.document.querySelector("form");
+    const composer = form.querySelector("[data-composer-markdown]");
+    const submit = form.querySelector("button[type='submit']");
+    let pasted = null;
+    let submitEvents = 0;
+    let outsideSubmitClicks = 0;
+    let contractLog = null;
+    window.console.log = (event, details) => {
+      if (event === "bridge_dom_contract") contractLog = details;
+    };
+    composer.addEventListener("paste", (event) => {
+      event.preventDefault();
+      pasted = event.clipboardData.getData("text/plain");
+      composer.textContent = pasted;
+    });
+    form.addEventListener("submit", (event) => {
+      submitEvents += 1;
+      event.preventDefault();
+      composer.textContent = "";
+      window.document.body.insertAdjacentHTML("beforeend", `
+        <article data-testid="conversation-turn-1">
+          <div data-message-author-role="assistant" data-message-id="msg-modern-1">
+            <div class="markdown"><p>réponse moderne</p></div>
+          </div>${copyButton}
+        </article>`);
+    });
+    const outside = window.document.createElement("button");
+    outside.type = "submit";
+    outside.addEventListener("click", () => { outsideSubmitClicks += 1; });
+    window.document.body.append(outside);
+
+    await run(`handlePrompt({ id: "req-modern", prompt: "bonjour moderne", conversation: { id: "conv-modern", mode: "fresh" } })`);
+    assert.equal(pasted, "bonjour moderne", "le prompt doit être injecté dans le ProseMirror moderne");
+    assert.equal(submitEvents, 1, "le form moderne doit être soumis exactement une fois");
+    assert.equal(outsideSubmitClicks, 0, "un submit hors form ne doit jamais être choisi");
+    assert.ok(sent.some((message) => message.type === "done"));
+    assert.equal(contractLog?.composer_strategy, "named_selector");
+    assert.equal(contractLog?.composer_selector, "[data-composer-markdown][contenteditable='true'][role='textbox']");
+    assert.equal(contractLog?.send_selector, "button[aria-label*='Send']");
+    assert.equal(contractLog?.content_script_version, "41");
+    assert.equal(JSON.stringify(contractLog).includes("bonjour moderne"), false);
+    assert.equal(submit, form.querySelector("button[type='submit']"));
+  }
+
+  // C. Les labels localisés ou absents ne participent pas à la détection.
+  {
+    const unlabelled = CURRENT_CHATGPT_COMPOSER_2026_09_24
+      .replace('aria-label="Ask ChatGPT"', "")
+      .replace('data-placeholder="Ask ChatGPT"', 'data-placeholder="Demander"')
+      .replace('aria-label="Send"', "");
+    const { run } = loadExtension(unlabelled);
+    assert.equal(run("resolveComposer().element.getAttribute('data-composer-markdown')"), "");
+    assert.equal(run("resolveSendButton(resolveComposer().element).element.type"), "submit");
+  }
+
+  // DOM health is read-only and reports known selectors/fallbacks without page text.
+  {
+    const { window, dispatch } = loadExtension(
+      CURRENT_CHATGPT_COMPOSER_2026_09_24,
+      "https://chatgpt.com/?temporary-chat=true",
+    );
+    const current = await dispatch({ type: "dom_health" });
+    assert.equal(current.ok, true);
+    assert.equal(current.content_script_version, "41");
+    assert.equal(current.surface.temporary_status, "ok");
+    assert.equal(current.composer.status, "ok");
+    assert.equal(current.send.status, "ok");
+
+    const old = await loadExtension(
+      `<form><textarea data-id="prompt"></textarea><button data-testid="send-button">Send</button></form>`,
+      "https://chatgpt.com/?temporary-chat=true",
+    ).dispatch({ type: "dom_health" });
+    assert.equal(old.composer.status, "ok", "un DOM historique garde un sélecteur connu");
+  }
+
+  // A unique structural composer and its unique form submit are DEGRADED, usable fallbacks.
+  {
+    const fallback = `<form>
+      <div contenteditable="true" role="textbox" aria-multiline="true" class="ProseMirror"></div>
+      <button type="submit">Send</button>
+    </form>`;
+    const { window, dispatch, run } = loadExtension(fallback, "https://chatgpt.com/?temporary-chat=true");
+    const health = await dispatch({ type: "dom_health" });
+    assert.equal(health.composer.status, "degraded");
+    assert.equal(health.composer.known_selector_candidates, 0);
+    assert.equal(health.composer.structural_candidates, 1);
+    assert.equal(health.send.status, "degraded");
+    assert.equal(health.send.same_form_as_composer, true);
+    assert.equal(run("resolveComposer().element !== null"), true);
+    assert.equal(run("resolveSendButton(resolveComposer().element).element !== null"), true);
+
+    useVirtualClock(window);
+    const sent = [];
+    const warnings = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    window.console.warn = (event, details) => warnings.push({ event, details: { ...details } });
+    const form = window.document.querySelector("form");
+    const composer = form.querySelector("[contenteditable='true']");
+    composer.addEventListener("paste", (event) => {
+      event.preventDefault();
+      composer.textContent = event.clipboardData.getData("text/plain");
+    });
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      composer.textContent = "";
+      window.document.body.insertAdjacentHTML("beforeend", `<article data-testid="conversation-turn-1">
+        <div data-message-author-role="assistant" data-message-id="fallback-turn">
+          <div class="markdown"><p>ok</p></div>
+        </div>${copyButton}</article>`);
+    });
+    await run(`handlePrompt({ id: "req-fallback", prompt: "hello fallback", conversation: { id: "conv-fallback", mode: "fresh" } })`);
+    assert.ok(sent.some((message) => message.type === "done"), "le fallback doit laisser le run réussir");
+    assert.equal(warnings.length, 2);
+    assert.deepEqual(warnings.map((warning) => warning.event), [
+      "bridge_dom_contract_degraded",
+      "bridge_dom_contract_degraded",
+    ]);
+    for (const warning of warnings) {
+      assert.deepEqual(Object.keys(warning.details).sort(), [
+        "candidate_count",
+        "component",
+        "content_script_version",
+        "selector",
+        "strategy",
+      ]);
+      assert.equal(warning.details.strategy, "structural_fallback");
+      assert.equal(JSON.stringify(warning).includes("hello fallback"), false);
+    }
+  }
+
+  // Multiple structural textboxes are explicitly ambiguous; missing Send is separate.
+  {
+    const ambiguous = `<div contenteditable="true" role="textbox" aria-multiline="true" class="ProseMirror"></div>
+      <div contenteditable="true" role="textbox" aria-multiline="true" class="ProseMirror"></div>`;
+    const ambiguousHealth = await loadExtension(ambiguous).dispatch({ type: "dom_health" });
+    assert.equal(ambiguousHealth.composer.status, "ambiguous");
+    assert.equal(ambiguousHealth.composer.visible_candidates, 2);
+
+    const noSend = `<form>${CURRENT_CHATGPT_COMPOSER_2026_09_24.match(/<div[\s\S]*?<\/div>/)[0]}</form>`;
+    const missingSend = await loadExtension(noSend).dispatch({ type: "dom_health" });
+    assert.equal(missingSend.composer.status, "ok");
+    assert.equal(missingSend.send.status, "not_rendered_idle");
+    assert.equal(missingSend.send.visible_candidates, 0);
+    assert.equal(missingSend.send.same_form_as_composer, null);
+  }
+
+  // An idle generic conversation and an idle Temporary Chat both keep a
+  // valid composer without reporting the absent Send button as a failure.
+  {
+    const markup = `<form><div id="prompt-textarea" contenteditable="true"></div></form>`;
+    const generic = await loadExtension(markup, "https://chatgpt.com/c/123").dispatch({ type: "dom_health" });
+    assert.equal(generic.ok, true);
+    assert.equal(generic.surface.temporary_status, "invalid");
+    assert.equal(generic.composer.status, "ok");
+    assert.equal(generic.send.status, "not_rendered_idle");
+    const temporary = await loadExtension(markup, "https://chatgpt.com/?temporary-chat=true").dispatch({ type: "dom_health" });
+    assert.equal(temporary.composer.status, "ok");
+    assert.equal(temporary.send.status, "not_rendered_idle");
+  }
+
+  // Diagnostic JSON excludes composer contents, credential names, and authorization fields.
+  {
+    const { window, dispatch } = loadExtension(
+      CURRENT_CHATGPT_COMPOSER_2026_09_24,
+      "https://chatgpt.com/?temporary-chat=true",
+    );
+    window.document.querySelector("[data-composer-markdown]").textContent = "TOP_SECRET_PROMPT_123";
+    window.chrome.storage.local.get = async () => ({ wsToken: "STORED_WS_TOKEN_SECRET" });
+    const diagnostics = await dispatch({ type: "dom_health" });
+    const json = JSON.stringify(diagnostics);
+    assert.equal(json.includes("TOP_SECRET_PROMPT_123"), false);
+    assert.equal(json.includes("STORED_WS_TOKEN_SECRET"), false);
+    // `response_locator` est un contrat de diagnostic (comptages, tags,
+    // stratégies) : ce qui est interdit ici, ce sont les clés porteuses de
+    // contenu et les secrets, pas le mot « response » lui-même.
+    for (const forbidden of [
+      "wsToken",
+      "Authorization",
+      "prompt",
+      "innerText",
+      "innerHTML",
+      "textContent",
+    ]) {
+      assert.equal(json.toLowerCase().includes(forbidden.toLowerCase()), false, forbidden);
+    }
+  }
+
+  // D. Plusieurs textboxes visibles sans signature unique sont ambigus :
+  // aucun choix arbitraire et aucun Send.
+  {
+    const body = `<div contenteditable="true" role="textbox" aria-multiline="true" class="ProseMirror"></div>
+      <div contenteditable="true" role="textbox" aria-multiline="true" class="ProseMirror"></div>
+      <button type="submit">Send</button>`;
+    const { window, run } = loadExtension(body, "https://chatgpt.com/?temporary-chat=true");
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    let clicks = 0;
+    window.document.querySelector("button[type='submit']").addEventListener("click", () => { clicks += 1; });
+    await run(`handlePrompt({ id: "req-ambiguous", prompt: "bonjour", conversation: { id: "conv-ambiguous", mode: "fresh" } })`);
+    const error = sent.find((message) => message.type === "error");
+    assert.equal(error?.code, "bridge_ui_timeout");
+    assert.equal(error?.phase, "pre_submission");
+    assert.equal(error?.submission_state, "pre_submission");
+    assert.equal(error?.diagnostics?.ui_contract_error, "ambiguous_composer");
+    assert.equal(clicks, 0);
+  }
+
+  // E. Les éléments masqués sont ignorés lorsqu'un composer visible existe.
+  {
+    const body = `<div contenteditable="true" role="textbox" aria-multiline="true" class="ProseMirror" data-test-offscreen></div>
+      <form><div contenteditable="true" role="textbox" aria-multiline="true" class="ProseMirror"></div></form>`;
+    const { run } = loadExtension(body);
+    assert.equal(run("resolveComposer().element.closest('form') !== null"), true);
+    assert.equal(run("resolveComposer().candidate_count"), 1);
+    assert.equal(run("resolveComposer().strategy"), "structural_fallback");
+  }
+
+  // F. Le bouton submit extérieur ne masque ni ne remplace celui du composer.
+  {
+    const { window, run } = loadExtension(
+      `<button type="submit" id="outside-send">Other</button>${CURRENT_CHATGPT_COMPOSER_2026_09_24}`,
+    );
+    assert.equal(
+      run("resolveSendButton(resolveComposer().element).element === document.querySelector('form button[type=submit]')"),
+      true,
+    );
+  }
+
+  // La fixture de production ne porte aucune ancienne signature artificielle :
+  // si elle passe, c'est grâce au contrat actuel, pas à un id historique.
+  {
+    const { window } = loadExtension(CURRENT_CHATGPT_COMPOSER_2026_09_24);
+    const doc = window.document;
+    assert.equal(doc.querySelector("[id]"), null, "aucun id dans la fixture de production");
+    assert.equal(doc.querySelector("[data-testid]"), null, "aucun data-testid dans la fixture de production");
+    const editor = doc.querySelector("[data-composer-markdown]");
+    assert.equal(editor.getAttribute("contenteditable"), "true");
+    assert.equal(editor.getAttribute("role"), "textbox");
+    assert.equal(editor.getAttribute("aria-multiline"), "true");
+    assert.equal(editor.classList.contains("ProseMirror"), true);
+    assert.equal(editor.getAttribute("aria-label"), "Ask ChatGPT");
+    const submit = doc.querySelector("button[type='submit']");
+    assert.equal(submit.getAttribute("aria-label"), "Send");
+  }
+
+  // E2E simulé sur la fixture de production : Temporary Chat frais →
+  // ensureTemporaryChat → composer → paste synthétique → Send prêt → une seule
+  // soumission → tour user → tour assistant → done. Aucun bridge_ui_timeout.
+  {
+    const { window, run } = loadExtension(
+      CURRENT_CHATGPT_COMPOSER_2026_09_24,
+      "https://chatgpt.com/?temporary-chat=true",
+    );
+    useVirtualClock(window);
+    const doc = window.document;
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    const form = doc.querySelector("form");
+    const editor = form.querySelector("[data-composer-markdown]");
+    const submit = form.querySelector("button[type='submit']");
+    // Comme en production, Send reste désactivé tant que le composer est vide.
+    submit.disabled = true;
+    let pastes = 0;
+    let submissions = 0;
+    editor.addEventListener("paste", (event) => {
+      pastes += 1;
+      event.preventDefault();
+      editor.textContent = event.clipboardData.getData("text/plain");
+      submit.disabled = false;
+    });
+    form.addEventListener("submit", (event) => {
+      submissions += 1;
+      event.preventDefault();
+      const prompt = editor.textContent;
+      editor.textContent = "";
+      submit.disabled = true;
+      doc.body.insertAdjacentHTML("beforeend", `
+        <article data-testid="conversation-turn-1">
+          <div data-message-author-role="user" data-message-id="e2e-user-1"><p></p></div>
+        </article>`);
+      doc.querySelector("[data-message-id='e2e-user-1'] p").textContent = prompt;
+      doc.body.insertAdjacentHTML("beforeend", `
+        <article data-testid="conversation-turn-2">
+          <div data-message-author-role="assistant" data-message-id="e2e-assistant-1">
+            <div class="markdown"><p>BRIDGE_OK</p></div>
+          </div>${copyButton}
+        </article>`);
+    });
+
+    await run(`handlePrompt({ id: "req-e2e-2026-09-24", prompt: "Reply exactly BRIDGE_OK", conversation: { id: "conv-e2e-2026-09-24", mode: "fresh" } })`);
+
+    assert.equal(pastes, 1, "un seul paste synthétique");
+    assert.equal(submissions, 1, "exactement une soumission");
+    assert.equal(sent.some((message) => message.type === "error"), false,
+      `aucune erreur attendue : ${JSON.stringify(sent.find((message) => message.type === "error"))}`);
+    assert.equal(JSON.stringify(sent).includes("bridge_ui_timeout"), false);
+    const done = sent.find((message) => message.type === "done");
+    assert.ok(done, "le run doit se terminer par done");
+    assert.equal(done.text.trim(), "BRIDGE_OK");
+    assert.equal(done.submission_state, "post_submission");
+    assert.equal(done.conversation?.id, "conv-e2e-2026-09-24");
+    assert.equal(done.conversation?.turn_id, "e2e-assistant-1");
+  }
+
+  // Matrice de dérive DOM : chaque variante connue de l'UI donne un statut
+  // explicite, et le runtime ne choisit jamais un élément hors contrat.
+  {
+    for (const testCase of DOM_DRIFT_MATRIX) {
+      const { run, dispatch } = loadExtension(testCase.body, "https://chatgpt.com/?temporary-chat=true");
+      const health = await dispatch({ type: "dom_health" });
+      assert.deepEqual(
+        [health.composer.status, health.composer.strategy, health.composer.selector],
+        testCase.composer,
+        `${testCase.name}: composer`,
+      );
+      assert.deepEqual(
+        [health.send.status, health.send.strategy, health.send.selector],
+        testCase.send,
+        `${testCase.name}: send`,
+      );
+      if (health.composer.status === "ambiguous") {
+        assert.throws(
+          () => run("resolveComposer()"),
+          (err) => err.code === "bridge_ui_timeout" &&
+            err.diagnostics.ui_contract_error === "ambiguous_composer",
+          `${testCase.name}: une ambiguïté n'est jamais résolue arbitrairement`,
+        );
+        // L'observation post-soumission n'en fait jamais une erreur de contrat.
+        assert.doesNotThrow(
+          () => run("finalizationSignals(turnSignalScope(document.body))"),
+          testCase.name,
+        );
+      } else if (["ok", "degraded"].includes(health.composer.status)) {
+        assert.equal(run("isVisibleElement(resolveComposer().element)"), true, `${testCase.name}: composer visible`);
+      }
+      if (["ok", "degraded"].includes(health.send.status)) {
+        assert.equal(
+          run("resolveSendButton(resolveComposer().element).element.closest('form') === resolveComposer().element.closest('form')"),
+          true,
+          `${testCase.name}: Send vit dans le formulaire du composer`,
+        );
+      }
+      if (testCase.sendInForm) assert.equal(health.send.same_form_as_composer, true);
+    }
+  }
+
+  // H. L'absence durable de composer conserve le timeout UI pré-submission.
+  {
+    const { window, run } = loadExtension("", "https://chatgpt.com/?temporary-chat=true");
+    useVirtualClock(window);
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    await run(`handlePrompt({ id: "req-no-composer", prompt: "bonjour", conversation: { id: "conv-no-composer", mode: "fresh" } })`);
+    const error = sent.find((message) => message.type === "error");
+    assert.equal(error?.code, "bridge_ui_timeout");
+    assert.equal(error?.phase, "pre_submission");
+    assert.equal(error?.submission_state, "pre_submission");
+    assert.equal(error?.diagnostics?.ui_contract_error, "composer_missing");
+    assert.equal(error?.diagnostics?.dom_health?.composer?.status, "missing");
+    assert.equal(error?.diagnostics?.dom_health?.content_script_version, "41");
+    assert.equal(sent.some((message) => message.type === "done"), false);
+  }
+
+  // Missing Send during a run returns the same safe DOM snapshot in BridgeError diagnostics.
+  {
+    const { window, run } = loadExtension(
+      `<form><textarea data-id="prompt"></textarea></form>`,
+      "https://chatgpt.com/?temporary-chat=true",
+    );
+    useVirtualClock(window);
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    await run(`handlePrompt({ id: "req-no-send", prompt: "hello", conversation: { id: "conv-no-send", mode: "fresh" } })`);
+    const error = sent.find((message) => message.type === "error");
+    assert.equal(error?.code, "bridge_ui_timeout");
+    assert.equal(error?.diagnostics?.ui_contract_error, "send_missing");
+    assert.equal(error?.diagnostics?.dom_health?.composer?.status, "ok");
+    assert.equal(error?.diagnostics?.dom_health?.send?.status, "missing");
+    assert.equal(error?.diagnostics?.prompt_injected, true);
+    assert.equal(error?.diagnostics?.composer_status, "ok");
+    assert.equal(error?.diagnostics?.send_status, "missing");
+    assert.equal(error?.diagnostics?.send_candidates, 0);
+    assert.equal(error?.diagnostics?.form_found, true);
+    assert.equal(error?.diagnostics?.content_script_version, "41");
+    assert.equal(JSON.stringify(error).includes("hello"), false);
+  }
 
   // 1. URL Temporary + composer, sans toggle : le markup de l'UI n'est pas
   // une preuve de confidentialité et n'est jamais requis.
@@ -781,40 +1265,8 @@ function useVirtualClock(window) {
     assert.equal(sent.find((message) => message.type === "error")?.submission_state, "pre_submission");
   }
 
-  // 10d. Une soumission confirmée puis une panne de génération est post_submission.
-  {
-    const body = `<form id="composer-form"><textarea data-id="prompt"></textarea>
-      <button aria-disabled="false" id="composer-submit-button" aria-label="Send prompt" data-testid="send-button">Send</button></form>`;
-    const { window, run } = loadExtension(body, "https://chatgpt.com/?temporary-chat=true");
-    useVirtualClock(window);
-    const sent = [];
-    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
-    let submitEvents = 0;
-    window.document.querySelector("#composer-form").addEventListener("submit", (event) => {
-      submitEvents += 1;
-      event.preventDefault();
-      window.document.querySelector("textarea[data-id='prompt']").value = "";
-    });
-    await run(`handlePrompt({ id: "req-post", prompt: "bonjour", conversation: { id: "conv-A", mode: "fresh" } })`);
-    assert.equal(submitEvents, 1);
-    const error = sent.find((message) => message.type === "error");
-    assert.equal(error?.code, "bridge_ui_timeout");
-    assert.equal(error?.phase, "generation");
-    assert.equal(error?.submission_state, "post_submission");
-    assert.equal(error?.diagnostics?.composer_has_text, false);
-    assert.equal(error?.diagnostics?.streaming_generation_signal_visible, false);
-    assert.equal(error?.diagnostics?.assistant_turns_before, 0);
-    assert.equal(error?.diagnostics?.assistant_turns_after, 0);
-    assert.equal(
-      JSON.stringify(error).includes("bonjour"),
-      false,
-      "les diagnostics de stall ne doivent pas contenir le prompt",
-    );
-  }
-
-  // 10e. Le premier tour peut apparaître après plus de 30 s : une activité de
-  // génération post-soumission garde l'attente en vie, les heartbeats restent
-  // sans contenu, puis le même envoi aboutit sans second trigger.
+  // 10e. Le premier tour peut apparaître après plus de 30 s : les heartbeats
+  // restent sans contenu, puis le même envoi aboutit sans second trigger.
   {
     const body = `<form id="composer-form"><textarea data-id="prompt"></textarea>
       <button aria-disabled="false" data-testid="send-button">Send</button></form>`;
@@ -879,46 +1331,8 @@ function useVirtualClock(window) {
     );
   }
 
-  // 10f. Les signaux Stop/reasoning/streaming déjà présents avant l'envoi ne
-  // prolongent pas artificiellement l'attente d'un nouveau tour assistant.
-  {
-    const body = `<article data-testid="conversation-turn-stale">
-        <div data-message-author-role="assistant" data-message-id="msg-stale">
-          <div class="markdown"><p>ancienne réponse</p></div>
-          <div class="result-streaming"></div>
-        </div>
-      </article>
-      <details data-testid="reasoning" open><summary>Reasoning</summary></details>
-      <form id="composer-form"><textarea data-id="prompt"></textarea>
-        <button data-testid="stop-button" aria-label="Stop streaming">Stop</button>
-        <button aria-disabled="false" data-testid="send-button">Send</button></form>`;
-    const { window, run } = loadExtension(body, "https://chatgpt.com/?temporary-chat=true");
-    useVirtualClock(window);
-    const sent = [];
-    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
-    let submitEvents = 0;
-    window.document.querySelector("#composer-form").addEventListener("submit", (event) => {
-      submitEvents += 1;
-      event.preventDefault();
-      window.document.querySelector("textarea[data-id='prompt']").value = "";
-    });
-
-    await run(`handlePrompt({ id: "req-stale-signals", prompt: "recherche", conversation: { id: "conv-stale", mode: "fresh" } })`);
-
-    const error = sent.find((message) => message.type === "error");
-    assert.equal(submitEvents, 1, "un signal DOM périmé ne doit jamais provoquer un second envoi");
-    assert.equal(error?.code, "bridge_ui_timeout");
-    assert.equal(error?.phase, "generation");
-    assert.equal(error?.submission_state, "post_submission");
-    assert.equal(error?.diagnostics?.assistant_turns_before, 1);
-    assert.equal(error?.diagnostics?.assistant_turns_after, 1);
-    assert.equal(error?.diagnostics?.stop_visible, true);
-    assert.equal(error?.diagnostics?.reasoning_visible, true);
-    assert.equal(error?.diagnostics?.streaming_generation_signal_visible, true);
-  }
-
   // 10g. `generationSignalTransition` distingue les six cas observables. Une
-  // persistance stricte n'est jamais de l'activité.
+  // persistance stricte n'est jamais une nouvelle preuve de soumission.
   {
     const { window, run } = loadExtension(
       `<div id="host"><div class="result-streaming" id="s1"></div></div>`,
@@ -963,71 +1377,73 @@ function useVirtualClock(window) {
     assert.equal(run(`generationSignalTransition(__g, __h)`), null);
   }
 
-  // 10h. Un signal de génération qui apparaît APRÈS Send puis reste
-  // parfaitement figé ne doit pas rafraîchir l'activité à chaque poll :
-  // l'attente doit finir en bridge_ui_timeout borné.
-  {
-    const body = `<form id="composer-form"><textarea data-id="prompt"></textarea>
+  // 10h. Une réflexion silencieuse de plus de 300 s, avec ou sans signal
+  // reconnu, doit attendre le premier vrai tour. Ce scénario échouait avec
+  // FIRST_ASSISTANT_ACTIVITY_STALL_MS : bridge_ui_timeout à 300 s.
+  for (const signal of ["none", "frozen", "stale"]) {
+    const stale = signal === "stale"
+      ? `<article data-testid="conversation-turn-stale">
+           <div data-message-author-role="assistant" data-message-id="msg-stale">
+             <div class="markdown"><p>ancienne réponse</p></div>
+             <div class="result-streaming"></div>
+           </div>
+         </article>`
+      : "";
+    const body = `${stale}<form id="composer-form"><textarea data-id="prompt"></textarea>
       <button aria-disabled="false" data-testid="send-button">Send</button></form>`;
     const { window, run } = loadExtension(body, "https://chatgpt.com/?temporary-chat=true");
     const sent = [];
     window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
     let clock = 0;
     let polls = 0;
+    let assistantAdded = false;
     window.Date.now = () => clock;
     window.setTimeout = (fn, ms) => {
       clock += ms || 0;
       polls += 1;
-      if (polls > 20_000) {
-        throw new Error(
-          "le watchdog n'a jamais conclu : un signal figé maintient l'attente en vie",
+      if (polls > 20_000) throw new Error("attente sans réponse non bornée dans le test");
+      if (!assistantAdded && clock >= 360_000) {
+        assistantAdded = true;
+        window.document.body.insertAdjacentHTML(
+          "beforeend",
+          `<article data-testid="conversation-turn-final">
+            <div data-message-author-role="assistant" data-message-id="msg-final">
+              <div class="markdown"><p>réponse après réflexion</p></div>
+            </div>${copyButton}
+          </article>`,
         );
       }
       queueMicrotask(fn);
       return 0;
     };
     let submitEvents = 0;
-    let sendClicks = 0;
-    window.document.querySelector("button[data-testid='send-button']").addEventListener("click", () => { sendClicks += 1; });
     window.document.querySelector("#composer-form").addEventListener("submit", (event) => {
       submitEvents += 1;
       event.preventDefault();
       window.document.querySelector("textarea[data-id='prompt']").value = "";
-      // Apparaît une fois, puis plus jamais aucune mutation.
-      window.document.body.insertAdjacentHTML(
-        "beforeend",
-        `<div class="result-streaming" data-frozen="true"></div>`,
-      );
+      if (signal === "frozen") {
+        window.document.body.insertAdjacentHTML(
+          "beforeend",
+          `<div class="result-streaming" data-frozen="true"></div>`,
+        );
+      }
     });
 
-    await run(`handlePrompt({ id: "req-frozen-signal", prompt: "recherche figée", conversation: { id: "conv-frozen", mode: "fresh" } })`);
+    await run(`handlePrompt({ id: "req-silent-${signal}", prompt: "recherche longue", conversation: { id: "conv-silent-${signal}", mode: "fresh" } })`);
 
-    const error = sent.find((message) => message.type === "error");
-    assert.equal(error?.code, "bridge_ui_timeout");
-    assert.equal(error?.phase, "generation");
-    assert.equal(error?.submission_state, "post_submission");
-    assert.equal(error?.diagnostics?.streaming_generation_signal_visible, true);
-    assert.equal(error?.diagnostics?.assistant_turns_after, 0);
-    assert.equal(submitEvents, 1, "aucune resoumission après un stall figé");
-    assert.equal(sendClicks, 0);
-    assert.ok(
-      clock >= 300_000,
-      `le stall ne doit pas être prématuré (clock=${clock})`,
-    );
-    assert.ok(
-      clock < 400_000,
-      `le stall doit rester borné par FIRST_ASSISTANT_ACTIVITY_STALL_MS (clock=${clock})`,
-    );
-    assert.equal(
-      JSON.stringify(sent).includes("recherche figée"),
-      false,
-      "ni heartbeat ni diagnostics ne doivent contenir le prompt",
-    );
+    assert.ok(clock >= 360_000, `${signal}: réponse attendue après 300 s`);
+    assert.equal(submitEvents, 1, `${signal}: un seul envoi`);
+    assert.equal(sent.filter((message) => message.type === "error").length, 0);
+    assert.equal(sent.find((message) => message.type === "done")?.text, "réponse après réflexion");
+    const heartbeats = sent.filter((message) => message.type === "heartbeat");
+    assert.ok(heartbeats.length >= 5, `${signal}: heartbeats pendant la réflexion`);
+    assert.ok(heartbeats.every((message) => message.progress?.output_chars === 0));
+    assert.equal(JSON.stringify(heartbeats).includes("recherche longue"), false);
+    assert.equal(JSON.stringify(heartbeats).includes("réponse après réflexion"), false);
   }
 
-  // 10i. Une vraie activité prolongée (signature qui change réellement) garde
-  // le watchdog vivant bien au-delà de FIRST_ASSISTANT_ACTIVITY_STALL_MS, puis le tour
-  // assistant arrive et la finalisation se poursuit normalement.
+  // 10i. Une vraie activité prolongée précède le tour assistant, puis la
+  // finalisation se poursuit normalement.
   {
     const body = `<form id="composer-form"><textarea data-id="prompt"></textarea>
       <button aria-disabled="false" data-testid="send-button">Send</button></form>`;
@@ -1374,7 +1790,7 @@ const PLACEHOLDER_ID =
       "l'identité doit venir du nœud courant, pas du placeholder détaché",
     );
     assert.equal(done.metadata?.initial_turn_id, "stable-assistant-42");
-    assert.equal(done.metadata?.content_script_version, "33");
+    assert.equal(done.metadata?.content_script_version, "41");
   }
 
   // Même remplacement, mais l'UI reste bloquée « en streaming » : le candidat
@@ -1466,7 +1882,7 @@ const PLACEHOLDER_ID =
       );
     });
 
-    await run(`handlePrompt({ id: "req-placeholder-forever", prompt: "bonjour", conversation: { id: "conv-placeholder", mode: "fresh" } })`);
+    await run(`handlePrompt({ id: "req-placeholder-forever", prompt: "bonjour", conversation: { id: "conv-placeholder", mode: "fresh" }, requires_continuation_identity: true })`);
 
     const incomplete = sent.find((message) => message.type === "incomplete");
     assert.equal(submitEvents, 1);
@@ -1674,7 +2090,7 @@ const RECHERCHE_FINALE = `# REFERENCES\n\n${RECHERCHE_FINALE_CORPS}`;
     };
 
     const result = await run(
-      `streamAnswer(testEndlessJob, "conversation-turn-endless", 0)`,
+      `streamAnswer(testEndlessJob, { kind: "semantic_assistant", strategy: "semantic_assistant", turn_locator: "conversation-turn-endless", baseline_count: 0 }, null)`,
     );
 
     assert.ok(
@@ -1723,8 +2139,8 @@ const RECHERCHE_FINALE = `# REFERENCES\n\n${RECHERCHE_FINALE_CORPS}`;
         </article>
       </main>`);
     assert.deepEqual(
-      state(`completionState(${WATCHED})`),
-      { finished: true, signal: "assistant_actions", confidence: "high" },
+      state(finalizationOf()),
+      { state: "final", mode: "terminal_action", signal: "assistant_actions", confidence: "high" },
       "assistant_actions reste le signal final le plus fort",
     );
   }
@@ -1764,7 +2180,7 @@ const RECHERCHE_FINALE = `# REFERENCES\n\n${RECHERCHE_FINALE_CORPS}`;
     };
     window.testScopedJob = { id: "scoped", aborted: false };
     const result = await run(
-      `streamAnswer(testScopedJob, "conversation-turn-3", 1)`,
+      `streamAnswer(testScopedJob, { kind: "semantic_assistant", strategy: "semantic_assistant", turn_locator: "conversation-turn-3", baseline_count: 1 }, null)`,
     );
 
     assert.equal(
@@ -1803,7 +2219,7 @@ const RECHERCHE_FINALE = `# REFERENCES\n\n${RECHERCHE_FINALE_CORPS}`;
       return 0;
     };
     window.testAttrJob = { id: "attr", aborted: false };
-    const result = await run(`streamAnswer(testAttrJob, "conversation-turn-3", 0)`);
+    const result = await run(`streamAnswer(testAttrJob, { kind: "semantic_assistant", strategy: "semantic_assistant", turn_locator: "conversation-turn-3", baseline_count: 0 }, null)`);
 
     assert.equal(result.incomplete_reason, "active_signal_stalled");
     assert.equal(result.text, "réponse finale");
@@ -1867,6 +2283,8 @@ function observeComposer(window, mode = "text") {
     // En mode "attachment" aucun texte n'est ajouté : ChatGPT a transformé le
     // collage en pièce jointe. Le composer reste légitimement vide.
     if (mode === "text") composer.textContent = observed.pastedText;
+    else composer.closest("form").insertAdjacentHTML("beforeend",
+      `<div data-testid="composer-attachment" data-state="ready"></div>`);
   });
   return { composer, observed };
 }
@@ -1896,6 +2314,10 @@ async function runPromptInjection({ id, prompt, files = null }) {
   fileInput.addEventListener("change", () => {
     attach.operations += 1;
     attach.files = [...(fileInput.files || [])];
+    for (const file of attach.files) {
+      fileInput.closest("form").insertAdjacentHTML("beforeend",
+        `<div data-testid="composer-attachment" data-state="ready"></div>`);
+    }
   });
 
   window.document
@@ -2106,7 +2528,7 @@ async function runPromptInjection({ id, prompt, files = null }) {
     })()`);
     assert.equal(diagnostics.composer_was_non_empty, true);
     assert.equal(diagnostics.composer_still_has_text, true);
-    assert.equal(diagnostics.content_script_version, "33");
+    assert.equal(diagnostics.content_script_version, "41");
 
     // Le snapshot ne transporte plus le texte du composer, seulement un booléen.
     const snapshot = run(`captureSubmissionSnapshot(${SEL})`);
@@ -2392,8 +2814,11 @@ async function runPromptInjection({ id, prompt, files = null }) {
     });
 
     const replacement = doc.createElement("div");
-    replacement.id = "prompt-textarea";
-    replacement.contentEditable = "true";
+    replacement.setAttribute("contenteditable", "true");
+    replacement.setAttribute("role", "textbox");
+    replacement.setAttribute("aria-multiline", "true");
+    replacement.className = "ProseMirror";
+    replacement.setAttribute("data-composer-markdown", "");
     let pastesOnReplacement = 0;
     let pastedOnReplacement = null;
     replacement.addEventListener("paste", (event) => {
@@ -2443,3 +2868,247 @@ async function runPromptInjection({ id, prompt, files = null }) {
   console.error(err);
   process.exit(1);
 });
+
+// Payload barrier regression: enabled Send is never upload completion proof.
+(async () => {
+  for (const scenario of [
+    { name: "auto-paste", prompt: "x".repeat(92_899), auto: true },
+    { name: "auto-spinner", prompt: "x".repeat(92_899), auto: true, spinner: true },
+    { name: "auto-preview-disabled", prompt: "x".repeat(92_899), auto: true, disabledPreview: true },
+    { name: "auto-rerender", prompt: "x".repeat(92_899), auto: true, rerender: true },
+    { name: "explicit-large", prompt: "x".repeat(200_001), count: 1 },
+    { name: "api-plus-large", prompt: "x".repeat(200_001), api: true, count: 2 },
+    { name: "api-plus-text", prompt: "bonjour", api: true, count: 1 },
+    { name: "api-only", prompt: "", api: true, count: 1 },
+    { name: "upload-error", prompt: "x".repeat(92_899), auto: true, error: true },
+    { name: "unknown-card", prompt: "x".repeat(92_899), auto: true, unknown: true },
+    { name: "text", prompt: "bonjour" },
+  ]) {
+    const { window, run } = loadExtension(INJECTION_PAGE, "https://chatgpt.com/?temporary-chat=true");
+    const doc = window.document;
+    forbidEditingCommand(window);
+    const sent = [], diagnostics = [], phases = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    window.console.log = (name, value) => {
+      if (name === "bridge_composer_payload") diagnostics.push({ ...value });
+      if (name === "bridge_run_phase") phases.push({ ...value });
+    };
+    window.console.warn = window.console.error = () => {};
+    let submitEvents = 0, clicks = 0, oldClicks = 0, pasted = 0, oldPastes = 0;
+    const oldComposer = doc.querySelector("#prompt-textarea");
+    const oldSend = doc.querySelector("[data-testid='send-button']");
+    oldSend.addEventListener("click", () => { clicks++; oldClicks++; });
+    const cards = [];
+    let readyReached = false;
+    const region = doc.createElement("div");
+    region.setAttribute("data-composer-attachments", "");
+    doc.querySelector("form").prepend(region);
+    const addCard = () => {
+      const template = doc.createElement("template");
+      template.innerHTML = CURRENT_CHATGPT_DOCUMENT_ATTACHMENT_2026_09_28;
+      const card = template.content.firstElementChild;
+      if (scenario.unknown) card.replaceChildren();
+      else if (scenario.disabledPreview) card.querySelector("button.composer-attachment-surface").disabled = true;
+      else card.insertAdjacentHTML("beforeend", scenario.spinner
+        ? `<svg class="animate-spin"></svg>` : `<span role="progressbar"></span>`);
+      region.append(card);
+      cards.push(card);
+    };
+    oldComposer.addEventListener("paste", (event) => {
+      event.preventDefault();
+      pasted++;
+      const text = event.clipboardData.getData("text/plain");
+      if (scenario.auto) addCard();
+      else oldComposer.textContent = text;
+      if (scenario.rerender) {
+        const replacement = oldComposer.cloneNode(false);
+        replacement.addEventListener("paste", () => { oldPastes++; });
+        oldComposer.replaceWith(replacement);
+        const send = oldSend.cloneNode(true);
+        send.addEventListener("click", () => { clicks++; });
+        oldSend.replaceWith(send);
+        // Access to a stale editable must never be required by readiness.
+        Object.defineProperty(oldComposer, "textContent", {
+          get() { throw new Error("stale composer read"); },
+        });
+      }
+    });
+    const input = doc.querySelector("input");
+    Object.defineProperty(input, "files", { writable: true, value: null });
+    let attached = [];
+    input.addEventListener("change", () => {
+      attached = [...input.files];
+      attached.forEach(addCard);
+    });
+    doc.querySelector("form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      submitEvents++;
+      assert.equal(run("currentJob.submissionState"), "submission_attempted");
+      assert.ok(cards.length === 0 || readyReached, "payload must be prepared before submit");
+      assert.equal(event.submitter, doc.querySelector("[data-testid='send-button']"));
+      doc.body.insertAdjacentHTML("beforeend", `
+        <article data-testid="conversation-turn-1"><div data-message-author-role="user" data-message-id="u1">user</div></article>
+        <article data-testid="conversation-turn-2"><div data-message-author-role="assistant" data-message-id="a1"><div class="markdown"><p>réponse finale</p></div></div>${copyButton}</article>`);
+    });
+    let clock = 0, checkedPending = false;
+    window.Date.now = () => clock;
+    window.setTimeout = (fn, ms) => {
+      clock += ms || 0;
+      if (cards.length && !checkedPending && clock >= 500) {
+        checkedPending = true;
+        assert.equal(submitEvents, 0, `${scenario.name}: no early submit`);
+        assert.equal(clicks, 0);
+        assert.equal(run("currentJob.submissionState"), "pre_submission");
+        const send = doc.querySelector("[data-testid='send-button']");
+        assert.equal(send.disabled, false);
+        assert.notEqual(send.getAttribute("aria-disabled"), "true");
+        if (!scenario.unknown) {
+          for (const [index, card] of cards.entries()) {
+            card.querySelector("[role='progressbar'], .animate-spin")?.remove();
+            card.querySelector("button.composer-attachment-surface").disabled = false;
+            if (scenario.error) card.insertAdjacentHTML("beforeend", `<span role="alert"></span>`);
+            if (scenario.rerender) {
+              const replacementCard = card.cloneNode(true);
+              card.replaceWith(replacementCard);
+              cards[index] = replacementCard;
+            }
+          }
+          readyReached = !scenario.error;
+        }
+      }
+      queueMicrotask(fn);
+      return 0;
+    };
+    window.__barrierPrompt = {
+      id: `barrier-${scenario.name}`, prompt: scenario.prompt,
+      files: scenario.api ? [{ name: "private.csv", data: "YQ==", mime: "text/csv" }] : [],
+      conversation: { id: `conv-${scenario.name}`, mode: "fresh" },
+    };
+    await run("handlePrompt(__barrierPrompt)");
+    assert.ok(submitEvents <= 1);
+    assert.equal(clicks, 0, "no fallback Send click");
+    assert.equal(oldClicks, 0);
+    assert.equal(oldPastes, 0);
+    if (scenario.prompt) assert.equal(pasted, 1);
+    if (scenario.count) assert.equal(attached.length, scenario.count);
+    if (scenario.prompt.length > 200_000) {
+      assert.match(attached.at(-1).name, /^bridge-prompt-/);
+      assert.equal(attached.at(-1).size, 200_001);
+      assert.ok(doc.querySelector("#prompt-textarea").textContent.length < 400);
+    }
+    const errors = sent.filter((message) => message.type === "error");
+    if (scenario.error || scenario.unknown) {
+      assert.equal(submitEvents, 0);
+      assert.equal(errors.length, 1);
+      assert.equal(errors[0].submission_state, "pre_submission");
+      assert.equal(errors[0].code, scenario.error ? "bridge_attachment_upload_error" : "bridge_composer_payload_not_ready");
+    } else {
+      assert.deepEqual(errors, []);
+      assert.equal(submitEvents, 1);
+      assert.equal(sent.filter((message) => message.type === "done").length, 1);
+      assert.equal(sent.find((message) => message.type === "done").text, "réponse finale");
+      assert.equal(phases.find((phase) => phase.phase === "submission_confirmed").signal, "user_turn");
+      assert.equal(phases.filter((phase) => phase.phase === "submission_attempted").length, 1);
+    }
+    if (cards.length) assert.ok(checkedPending);
+    assert.ok(diagnostics.length <= 14, "bounded diagnostics");
+    for (const diagnostic of diagnostics) {
+      assert.deepEqual(Object.keys(diagnostic).sort(), [
+        "payload_mode", "prompt_bytes", "paste_consumed", "expected_attachment_count",
+        "observed_attachment_count", "attachment_state", "attachment_pending",
+        "attachment_error", "send_present", "send_disabled", "send_aria_disabled", "payload_ready",
+      ].sort());
+      assert.equal(JSON.stringify(diagnostic).includes("private.csv"), false);
+      assert.equal(JSON.stringify(diagnostic).includes("PRIVATE_FILENAME"), false);
+    }
+  }
+  console.log("composer payload barrier: ok");
+})().catch((error) => { console.error(error); process.exit(1); });
+
+{
+  const { window, run } = loadExtension(INJECTION_PAGE);
+  const form = window.document.querySelector("form");
+  const state = (expected = 0) => run(`inspectComposerPayload(document.querySelector("#prompt-textarea"), ${expected}).state`);
+  assert.equal(state(), "EMPTY");
+  assert.equal(state(1), "UNKNOWN", "missing expected card blocks even enabled Send");
+  window.document.querySelector("#prompt-textarea").textContent = "text";
+  assert.equal(state(), "TEXT_READY");
+  form.insertAdjacentHTML("beforeend", `<div data-testid="composer-attachment"><span data-state="ready"></span></div>`);
+  assert.equal(state(), "UNKNOWN", "nested unrelated ready state is insufficient");
+  const card = form.querySelector("[data-testid='composer-attachment']");
+  card.dataset.state = "ready";
+  assert.equal(state(), "ATTACHMENT_READY");
+  card.setAttribute("data-test-offscreen", "");
+  assert.equal(state(1), "UNKNOWN", "hidden stale card cannot satisfy expected upload");
+  card.removeAttribute("data-test-offscreen");
+  assert.equal(state(2), "UNKNOWN", "all expected files must be present");
+  card.insertAdjacentHTML("beforeend", `<span role="progressbar"></span>`);
+  assert.equal(state(), "ATTACHMENT_PENDING", "pending overrides ready");
+  card.dataset.state = "error";
+  assert.equal(state(), "ATTACHMENT_ERROR", "error overrides pending");
+  card.remove();
+  form.insertAdjacentHTML("beforeend", `<div role="progressbar"></div>`);
+  assert.equal(state(), "ATTACHMENT_PENDING", "preparation outside the card still blocks");
+  console.log("composer payload conservative state contract: ok");
+}
+
+// Actual outer card structure from the user's 2026-09-28 recorder. That
+// recorder stopped before the card's contents: this establishes PRESENCE,
+// never invents a READY signal from the enabled Send or data-visible-attachments.
+{
+  const { window, run } = loadExtension(`<form data-chatgpt-composer>
+    <div class="ComposerLayoutAttachments-bG080e" data-composer-attachments data-visible-attachments="true">
+      <div class="flex flex-wrap items-end gap-3 p-1">
+        <span class="group/composer-attachment relative block h-30.5 w-40 shrink-0 select-none"></span>
+      </div>
+    </div>
+    <div id="prompt-textarea" contenteditable="true"></div>
+    <button type="submit" aria-label="Send"></button>
+  </form>`);
+  const inspect = () => run(`inspectComposerPayload(document.querySelector('#prompt-textarea'), 1)`);
+  assert.equal(inspect().observed_attachment_count, 1, "recognise actual card without invented data-testid");
+  assert.equal(inspect().state, "UNKNOWN", "outer card and enabled Send are not READY evidence");
+  const card = window.document.querySelector("[class~='group/composer-attachment']");
+  card.insertAdjacentHTML('beforeend', '<span role="progressbar"></span>');
+  assert.equal(inspect().state, "ATTACHMENT_PENDING");
+}
+
+// READY proof from the full user-recorded card, with NO data-state/testid.
+{
+  const { window, run } = loadExtension(`<form>
+    <div data-composer-attachments>${CURRENT_CHATGPT_DOCUMENT_ATTACHMENT_2026_09_28}</div>
+    <div id="prompt-textarea" contenteditable="true"></div>
+    <button type="submit" aria-label="Send"></button>
+  </form>`);
+  const card = window.document.querySelector("[class~='group/composer-attachment']");
+  const preview = card.querySelector("button.composer-attachment-surface");
+  const badge = card.querySelector(".text-file-document");
+  const state = () => run(`inspectComposerPayload(document.querySelector('#prompt-textarea'), 1).state`);
+  for (const node of [card, ...card.querySelectorAll('*')]) {
+    Object.defineProperty(node, 'textContent', { get() { throw new Error('filename/content read'); } });
+  }
+  assert.equal(state(), "ATTACHMENT_READY", "user-recorded completed preview proves READY");
+  preview.disabled = true;
+  assert.equal(state(), "UNKNOWN", "Send enabled cannot replace an unusable preview");
+  preview.disabled = false;
+  preview.setAttribute('aria-disabled', 'true');
+  assert.equal(state(), "UNKNOWN");
+  preview.removeAttribute('aria-disabled');
+  preview.style.pointerEvents = 'none';
+  assert.equal(state(), "UNKNOWN");
+  preview.style.pointerEvents = '';
+  preview.setAttribute('inert', '');
+  assert.equal(state(), "UNKNOWN");
+  preview.removeAttribute('inert');
+  badge.setAttribute('data-test-offscreen', '');
+  assert.equal(state(), "UNKNOWN", "a preview button alone is insufficient");
+  badge.removeAttribute('data-test-offscreen');
+  card.insertAdjacentHTML('beforeend', '<svg class="animate-spin"></svg>');
+  assert.equal(state(), "ATTACHMENT_PENDING", "pending overrides a fully rendered enabled preview");
+  card.querySelector('.animate-spin').remove();
+  card.insertAdjacentHTML('beforeend', '<span data-status="error"></span>');
+  assert.equal(state(), "ATTACHMENT_ERROR", "an upload error overrides completed-preview appearance");
+  card.querySelector('[data-status]').remove();
+  assert.equal(state(), "ATTACHMENT_READY");
+  console.log('recorded current attachment readiness contract: ok');
+}

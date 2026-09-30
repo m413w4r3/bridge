@@ -50,6 +50,16 @@ class DurableRunSpec:
     allow_unverified_model: bool
     hash_payload: Mapping[str, Any]
 
+    @property
+    def requires_continuation_identity(self) -> bool:
+        """Whether this normalized request asks Bridge to keep a reusable session.
+
+        Durable execution and conversation reuse are separate contracts. Every
+        facade with an explicit Bridge conversation target requires an external
+        turn identity; requests without that normalized target are stateless.
+        """
+        return requires_continuation_identity(self.response_request)
+
 
 @dataclass(frozen=True, slots=True)
 class RunSnapshot:
@@ -97,6 +107,16 @@ def request_hash(payload: Mapping[str, Any]) -> str:
             dict(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False
         ).encode()
     ).hexdigest()
+
+
+def requires_continuation_identity(response_request: ResponseRequest) -> bool:
+    """Derive reuse requirements from the normalized Bridge request.
+
+    The explicit `conversation` target is the only continuation contract this
+    project currently supports. Durable runs without it use a request-scoped
+    Temporary Chat and do not promise future reuse.
+    """
+    return response_request.conversation is not None
 
 
 def _browser_target_for_run(
@@ -417,6 +437,7 @@ class DurableRunService:
                         conversation=spec.response_request.conversation,
                         browser_target=target,
                         expected_tab_id=report.tab_id,
+                        requires_continuation_identity=spec.requires_continuation_identity,
                         conversation_result=conversation_result,
                         extension_metadata=extension_metadata,
                     )
@@ -444,9 +465,15 @@ class DurableRunService:
         except NeedsReviewError as exc:
             stored = self._store_incomplete_preview(spec, run_id, exc, target)
             exc.details["recovery_preview_available"] = stored
+            message = (
+                "La réponse finale existe, mais aucune identité externe vérifiée "
+                "ne permet de continuer cette conversation."
+                if exc.reason == "external_turn_identity_unavailable"
+                else "ChatGPT s'est arrêté sans réponse finale."
+            )
             detail = {
                 "code": exc.reason,
-                "message": "ChatGPT s'est arrêté sans réponse finale.",
+                "message": message,
                 "retryable": False,
                 "phase": "generation",
                 "submission_state": "post_submission",

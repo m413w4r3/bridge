@@ -39,7 +39,8 @@ make down                 # conserve le volume bridge_data
 Le volume Docker nommé `bridge_data` conserve le registre SQLite
 (`/data/bridge-runs.sqlite3`) entre `down` et le prochain `up`. `/health`
 indique que le serveur répond ; `/ready` indique que le Bridge est réellement
-utilisable, notamment lorsque l'extension est connectée.
+utilisable lorsque l’extension a terminé son handshake et répond encore aux
+keepalives.
 
 Le serveur ne consomme que ses variables `BRIDGE_*`. Chaque application cliente
 configure séparément son URL HTTP et envoie `Authorization: Bearer

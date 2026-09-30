@@ -39,11 +39,14 @@ jobs:
         run: |
           node --test \
             tests/completion.test.js \
+            tests/finalization-state.test.js \
             tests/content-dom.test.js \
+            tests/response-root.test.js \
             tests/final-output.test.js \
             tests/background-conversation.test.js \
             tests/content-background-tab.test.js \
-            tests/serializer.test.js
+            tests/serializer.test.js \
+            tests/dom-contract.test.js
       - name: JavaScript syntax
         run: |
           node --check extension/background.js
@@ -52,6 +55,7 @@ jobs:
           node --check extension/final-output.js
           node --check extension/popup.js
           node --check extension/serializer.js
+          node --check tools/diagnose.js
 
   compose:
     runs-on: ubuntu-latest

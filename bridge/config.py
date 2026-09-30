@@ -14,6 +14,19 @@ IDLE_TIMEOUT = float(os.getenv("BRIDGE_IDLE_TIMEOUT", "300"))
 # réellement bloquée, elle ne doit pas arbitrer la durée normale d'une recherche.
 TOTAL_TIMEOUT = float(os.getenv("BRIDGE_TOTAL_TIMEOUT", "3600"))
 KEEPALIVE_INTERVAL = 20.0  # garde le service worker MV3 en vie
+# Le premier hello doit arriver vite après l'acceptation du socket.
+EXTENSION_HELLO_TIMEOUT = float(os.getenv("BRIDGE_EXTENSION_HELLO_TIMEOUT", "5"))
+# Une connexion fraîche reste disponible pendant l'attente de son premier pong.
+EXTENSION_FIRST_PONG_GRACE = float(
+    os.getenv("BRIDGE_EXTENSION_FIRST_PONG_GRACE", str(KEEPALIVE_INTERVAL * 2))
+)
+EXTENSION_PONG_TIMEOUT = float(
+    os.getenv("BRIDGE_EXTENSION_PONG_TIMEOUT", str(KEEPALIVE_INTERVAL * 3))
+)
+# Un conflit récent est visible dans /ready afin de diagnostiquer deux owners.
+EXTENSION_CONFLICT_WINDOW = float(
+    os.getenv("BRIDGE_EXTENSION_CONFLICT_WINDOW", str(KEEPALIVE_INTERVAL * 2))
+)
 # Délai laissé à l'extension pour se reconnecter sans perdre la requête en cours.
 RECONNECT_GRACE = float(os.getenv("BRIDGE_RECONNECT_GRACE", "20"))
 # Délai max d'un aller-retour de lecture/pilotage de l'interface ChatGPT.

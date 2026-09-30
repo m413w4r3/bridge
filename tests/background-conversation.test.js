@@ -15,22 +15,57 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { webcrypto } = require("node:crypto");
 
 const EXTENSION = path.join(__dirname, "..", "extension");
 const BACKGROUND_SOURCE = fs.readFileSync(path.join(EXTENSION, "background.js"), "utf8");
 
-class FakeWebSocket {
-  constructor(url) {
-    this.url = url;
-    this.readyState = FakeWebSocket.CONNECTING;
+function createFakeWebSocket() {
+  class FakeWebSocket {
+    constructor(url) {
+      this.url = url;
+      this.readyState = FakeWebSocket.CONNECTING;
+      this.sent = [];
+      FakeWebSocket.instances.push(this);
+    }
+    send(data) {
+      this.sent.push(data);
+    }
+    close() {
+      this.closeCalls = (this.closeCalls || 0) + 1;
+    }
   }
-  send() {}
-  close() {}
+  FakeWebSocket.instances = [];
+  FakeWebSocket.CONNECTING = 0;
+  FakeWebSocket.OPEN = 1;
+  FakeWebSocket.CLOSING = 2;
+  FakeWebSocket.CLOSED = 3;
+  return FakeWebSocket;
 }
-FakeWebSocket.CONNECTING = 0;
-FakeWebSocket.OPEN = 1;
-FakeWebSocket.CLOSING = 2;
-FakeWebSocket.CLOSED = 3;
+
+function makeFakeTimers() {
+  let nextId = 1;
+  const pending = new Map();
+  const callbacks = new Map();
+  return {
+    setTimeout(callback, delay) {
+      const id = nextId++;
+      pending.set(id, { callback, delay });
+      callbacks.set(id, callback);
+      return id;
+    },
+    clearTimeout(id) {
+      pending.delete(id);
+    },
+    pending,
+    fire(id, { evenIfCleared = false } = {}) {
+      const timer = pending.get(id);
+      if (!timer && !evenIfCleared) throw new Error(`Timer ${id} is not pending`);
+      pending.delete(id);
+      callbacks.get(id)?.();
+    },
+  };
+}
 
 /** In-memory chrome.* mock: tabs are a real Map so tests can assert on them
  * directly, storage.session/local are plain objects a test can inspect. */
@@ -157,6 +192,7 @@ function makeChromeMock() {
     },
     scripting: { executeScript: async () => {} },
     runtime: {
+      getManifest: () => ({ version: "1.2.3" }),
       onMessage: { addListener: (fn) => messageListeners.push(fn) },
       onStartup: { addListener: () => {} },
       onInstalled: { addListener: () => {} },
@@ -182,11 +218,39 @@ function makeChromeMock() {
  * `chrome` mock (and therefore the same tabsById/sessionStore) across two
  * calls simulates a service-worker suspension/restart: browser-owned state
  * (tabs, chrome.storage.session) survives, in-memory module state doesn't. */
-function loadBackground(chrome) {
-  const sandbox = { chrome, console, URL, setTimeout, clearTimeout, WebSocket: FakeWebSocket };
+function loadBackground(chrome, timers = { setTimeout, clearTimeout }) {
+  const WebSocket = createFakeWebSocket();
+  const sandbox = {
+    chrome,
+    console,
+    URL,
+    setTimeout: timers.setTimeout,
+    clearTimeout: timers.clearTimeout,
+    WebSocket,
+    crypto: webcrypto,
+  };
   const context = vm.createContext(sandbox);
   vm.runInContext(BACKGROUND_SOURCE, context, { filename: "background.js" });
-  return { run: (expression) => vm.runInContext(expression, context) };
+  return {
+    run: (expression) => vm.runInContext(expression, context),
+    WebSocket,
+    webSockets: WebSocket.instances,
+  };
+}
+
+async function makeTransportHarness() {
+  const mock = makeChromeMock();
+  const timers = makeFakeTimers();
+  const loaded = loadBackground(mock.chrome, timers);
+  // background.js starts connect() at load; let its storage promises settle.
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(loaded.webSockets.length, 1, "startup creates one WebSocket");
+  return { ...loaded, mock, timers };
+}
+
+function openFakeSocket(socket, WebSocket) {
+  socket.readyState = WebSocket.OPEN;
+  socket.onopen();
 }
 
 async function main() {
@@ -195,6 +259,307 @@ async function main() {
     /chrome\.runtime\.onMessage\.addListener\(async/,
     "runtime.onMessage listener must remain synchronous",
   );
+
+  // WebSocket callbacks belong to the instance that registered them. A late
+  // 4000 close from A must not clear or mark a healthy current socket B down.
+  {
+    const { run, WebSocket, webSockets, timers } = await makeTransportHarness();
+    const socketA = webSockets[0];
+    openFakeSocket(socketA, WebSocket);
+    run("staleSocketForTest = socket");
+    socketA.readyState = WebSocket.CLOSING;
+
+    // Reproduce an overlap where another path has released A and installed B.
+    run("socket = null");
+    await run("connect()");
+    const socketB = run("socket");
+    assert.notEqual(socketB, socketA);
+    openFakeSocket(socketB, WebSocket);
+    const suppressBefore = run("suppressUntil");
+    const connectedBefore = run("status.connected");
+    const lastErrorBefore = run("status.lastError");
+    const timersBefore = timers.pending.size;
+
+    socketA.readyState = WebSocket.CLOSED;
+    socketA.onerror();
+    socketA.onclose({ code: 4000 });
+
+    assert.equal(run("socket"), socketB);
+    assert.equal(socketB.readyState, WebSocket.OPEN);
+    assert.equal(run("suppressUntil"), suppressBefore);
+    assert.equal(run("status.connected"), connectedBefore);
+    assert.equal(run("status.lastError"), lastErrorBefore);
+    assert.equal(timers.pending.size, timersBefore, "stale callbacks add no reconnect timer");
+    assert.equal(run("scheduleReconnect(staleSocketForTest, 'stale owner')"), false);
+    assert.equal(run("socket"), socketB, "scheduleReconnect enforces owner identity itself");
+    assert.equal(run("status.connected"), true);
+    assert.equal(timers.pending.size, timersBefore);
+  }
+
+  // Extension identity survives reconnects and worker restarts. The worker
+  // id is module-scoped, while each newly-created WebSocket gets a new id.
+  {
+    const mock = makeChromeMock();
+    mock.localStore.wsToken = "test-ws-secret";
+    const timers = makeFakeTimers();
+    const first = loadBackground(mock.chrome, timers);
+    await new Promise((resolve) => setImmediate(resolve));
+    const socketA = first.webSockets[0];
+    openFakeSocket(socketA, first.WebSocket);
+    const helloA = JSON.parse(socketA.sent.find((text) => JSON.parse(text).type === "hello"));
+    assert.equal(helloA.instance_id, mock.localStore.bridgeInstanceId);
+    assert.ok(helloA.worker_session_id);
+    assert.ok(helloA.connection_id);
+    assert.equal(helloA.extension_version, "1.2.3");
+    assert.equal(Object.hasOwn(helloA, "wsToken"), false);
+    assert.equal(JSON.stringify(helloA).includes("test-ws-secret"), false);
+
+    socketA.readyState = first.WebSocket.CLOSED;
+    socketA.onclose({ code: 1006 });
+    await first.run("connect()");
+    const socketB = first.run("socket");
+    openFakeSocket(socketB, first.WebSocket);
+    const helloB = JSON.parse(socketB.sent.find((text) => JSON.parse(text).type === "hello"));
+    assert.equal(helloB.instance_id, helloA.instance_id, "instance id is stable on reconnect");
+    assert.equal(helloB.worker_session_id, helloA.worker_session_id, "worker id is stable in one worker");
+    assert.notEqual(helloB.connection_id, helloA.connection_id, "connection id changes per socket");
+
+    const restarted = loadBackground(mock.chrome, makeFakeTimers());
+    await new Promise((resolve) => setImmediate(resolve));
+    const socketC = restarted.webSockets[0];
+    openFakeSocket(socketC, restarted.WebSocket);
+    const helloC = JSON.parse(socketC.sent.find((text) => JSON.parse(text).type === "hello"));
+    assert.equal(helloC.instance_id, helloA.instance_id, "instance id survives worker restart");
+    assert.notEqual(helloC.worker_session_id, helloA.worker_session_id, "worker id changes on restart");
+    assert.notEqual(helloC.connection_id, helloB.connection_id);
+  }
+
+  // send() queues during CLOSING and leaves reconnect ownership to A's close.
+  {
+    const { run, WebSocket, webSockets, timers } = await makeTransportHarness();
+    const socketA = webSockets[0];
+    openFakeSocket(socketA, WebSocket);
+    run("enAttente.length = 0");
+    socketA.readyState = WebSocket.CLOSING;
+
+    run("send({ type: 'pong' })");
+    await run("connect()");
+    assert.equal(webSockets.length, 1, "CLOSING does not create a second socket");
+    assert.equal(run("socket"), socketA);
+    assert.deepEqual(JSON.parse(JSON.stringify(run("enAttente"))), [{ type: "pong" }]);
+    assert.equal(timers.pending.size, 0);
+
+    socketA.readyState = WebSocket.CLOSED;
+    socketA.onclose({ code: 1006 });
+    socketA.onclose({ code: 1006 });
+    assert.equal(run("socket"), null);
+    assert.equal(timers.pending.size, 1, "current close schedules only one reconnect");
+  }
+
+  // A canceled timer may already be queued by the event loop. Its generation
+  // check must make it inert after B has become current and healthy.
+  {
+    const { run, WebSocket, webSockets, timers } = await makeTransportHarness();
+    const socketA = webSockets[0];
+    socketA.readyState = WebSocket.CLOSED;
+    socketA.onclose({ code: 1006 });
+    const [oldTimerId] = timers.pending.keys();
+    assert.ok(oldTimerId);
+
+    await run("connect()");
+    const socketB = run("socket");
+    openFakeSocket(socketB, WebSocket);
+    assert.equal(timers.pending.size, 0, "new connection cancels the old timer");
+
+    timers.fire(oldTimerId, { evenIfCleared: true });
+    assert.equal(webSockets.length, 2, "stale timer does not create socket C");
+    assert.equal(run("socket"), socketB);
+    assert.equal(run("status.connected"), true);
+  }
+
+  // A current 4000 close owns the 60-second suppression. Sends during that
+  // window queue without taking the connection back from the other client.
+  {
+    const { run, WebSocket, webSockets, timers } = await makeTransportHarness();
+    const socketA = webSockets[0];
+    openFakeSocket(socketA, WebSocket);
+    socketA.readyState = WebSocket.CLOSED;
+    socketA.onclose({ code: 4000 });
+    const [timerId, timer] = [...timers.pending.entries()][0];
+
+    assert.equal(run("socket"), null);
+    assert.equal(run("status.connected"), false);
+    const remaining = run("suppressUntil - Date.now()");
+    assert.ok(remaining > 59900 && remaining <= 60000);
+    assert.ok(timer.delay > 59900 && timer.delay <= 60000);
+    run("send({ type: 'queued-during-suppression' })");
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(run("enAttente"))),
+      [{ type: "queued-during-suppression" }],
+    );
+    assert.equal(webSockets.length, 1, "send during suppression does not reconnect early");
+    assert.deepEqual([...timers.pending.keys()], [timerId], "suppression timer remains the sole timer");
+  }
+
+  // A typed owner_active rejection uses the same backoff, avoiding connection
+  // ping-pong when another healthy extension owns the lease.
+  {
+    const { run, WebSocket, webSockets, timers } = await makeTransportHarness();
+    const socket = webSockets[0];
+    openFakeSocket(socket, WebSocket);
+    socket.readyState = WebSocket.CLOSED;
+    socket.onclose({ code: 4409, reason: "owner_active" });
+    const remaining = run("suppressUntil - Date.now()");
+    assert.ok(remaining > 59900 && remaining <= 60000);
+    const delay = [...timers.pending.values()][0].delay;
+    assert.ok(delay > 59900 && delay <= 60000);
+  }
+
+  // WebSocket race matrix, from the worker's point of view. Every state is
+  // reported by connectionDiagnostic() without content, and none of them
+  // produces a periodic replacement loop.
+  {
+    const connection = (run) => JSON.parse(JSON.stringify(run("connectionDiagnostic()")));
+
+    // OPEN stable: keepalive alarms and server pings never create or close a socket.
+    {
+      const { run, WebSocket, webSockets, timers } = await makeTransportHarness();
+      const socketA = webSockets[0];
+      openFakeSocket(socketA, WebSocket);
+      for (let tick = 0; tick < 20; tick += 1) {
+        await run("connect()"); // chrome.alarms "keepalive" listener
+        socketA.onmessage({ data: JSON.stringify({ type: "ping", t: tick }) });
+      }
+      assert.equal(webSockets.length, 1, "OPEN stable: no replacement socket");
+      assert.equal(socketA.closeCalls || 0, 0, "OPEN stable: never closed by the worker");
+      assert.equal(timers.pending.size, 0, "OPEN stable: no reconnect timer");
+      const state = connection(run);
+      assert.equal(state.state, "stable");
+      assert.equal(state.reconnections, 0);
+      assert.equal(state.seconds_since_ping, 0);
+      const hello = JSON.parse(socketA.sent.find((text) => JSON.parse(text).type === "hello"));
+      assert.equal(state.instance_id_prefix, hello.instance_id.slice(0, 8));
+      assert.equal(state.worker_session_prefix, hello.worker_session_id.slice(0, 8));
+      assert.equal(state.connection_id_prefix, hello.connection_id.slice(0, 8));
+      assert.equal(JSON.stringify(state).includes(hello.instance_id), false, "only id prefixes");
+      assert.equal(
+        socketA.sent.filter((text) => JSON.parse(text).type === "pong").length,
+        20,
+        "each ping gets exactly one pong",
+      );
+    }
+
+    // CONNECTING: alarms during the handshake do not open a second socket.
+    {
+      const { run, webSockets, timers } = await makeTransportHarness();
+      for (let tick = 0; tick < 5; tick += 1) await run("connect()");
+      assert.equal(webSockets.length, 1, "CONNECTING: one socket only");
+      assert.equal(timers.pending.size, 0);
+      assert.equal(connection(run).state, "connecting");
+    }
+
+    // Stale: an OPEN socket with no ping for more than 60 s is reported stale,
+    // but the worker does not tear it down itself (the server owns that verdict).
+    {
+      const { run, WebSocket, webSockets } = await makeTransportHarness();
+      const socketA = webSockets[0];
+      openFakeSocket(socketA, WebSocket);
+      run("globalThis.__realNow = Date.now; globalThis.__t0 = Date.now()");
+      socketA.onmessage({ data: JSON.stringify({ type: "ping" }) });
+      run("Date.now = () => __t0 + 61000");
+      const state = connection(run);
+      run("Date.now = __realNow");
+      assert.equal(state.state, "stale");
+      assert.ok(state.seconds_since_ping >= 61);
+      assert.equal(webSockets.length, 1);
+      assert.equal(socketA.closeCalls || 0, 0);
+    }
+
+    // 4000 on the current socket: conflict(replaced), and alarms during the
+    // suppression window never take the connection back.
+    {
+      const { run, WebSocket, webSockets } = await makeTransportHarness();
+      const socketA = webSockets[0];
+      openFakeSocket(socketA, WebSocket);
+      socketA.readyState = WebSocket.CLOSED;
+      socketA.onclose({ code: 4000 });
+      for (let tick = 0; tick < 5; tick += 1) await run("connect()");
+      assert.equal(webSockets.length, 1, "no reconnect during suppression");
+      const state = connection(run);
+      assert.equal(state.state, "conflict");
+      assert.equal(state.conflict_reason, "replaced");
+      assert.equal(state.connection_id_prefix, null);
+    }
+
+    // Two instances: owner_active is a typed conflict. Each retry waits the
+    // full backoff, so a contender makes at most one attempt per 60 s and
+    // never replaces anyone.
+    {
+      const { run, WebSocket, webSockets, timers } = await makeTransportHarness();
+      let rejected = 0;
+      for (let cycle = 0; cycle < 3; cycle += 1) {
+        const current = webSockets[webSockets.length - 1];
+        openFakeSocket(current, WebSocket);
+        current.readyState = WebSocket.CLOSED;
+        current.onclose({ code: 4409, reason: "owner_active" });
+        rejected += 1;
+        assert.equal(connection(run).state, "conflict");
+        assert.equal(connection(run).conflict_reason, "owner_active");
+        assert.equal(timers.pending.size, 1, "exactly one pending retry");
+        const [[timerId, timer]] = [...timers.pending.entries()];
+        assert.ok(
+          timer.delay > 59900 && timer.delay <= 60000,
+          "retry honours the owner_active backoff",
+        );
+        run("suppressUntil = 0"); // the 60 s have elapsed
+        timers.fire(timerId);
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      assert.equal(webSockets.length, rejected + 1, "one attempt per backoff window");
+      for (const old of webSockets.slice(0, -1)) {
+        assert.equal(old.closeCalls || 0, 0, "the contender never closes anyone");
+      }
+    }
+
+    // Reconnect after a plain drop: the counter and connection id move, the
+    // instance and worker session stay; the stale close of A changes nothing.
+    {
+      const { run, WebSocket, webSockets, timers } = await makeTransportHarness();
+      const socketA = webSockets[0];
+      openFakeSocket(socketA, WebSocket);
+      const before = connection(run);
+      socketA.readyState = WebSocket.CLOSED;
+      socketA.onclose({ code: 1006 });
+      assert.equal(connection(run).state, "disconnected");
+      const [timerId] = timers.pending.keys();
+      timers.fire(timerId);
+      await new Promise((resolve) => setImmediate(resolve));
+      const socketB = webSockets[1];
+      openFakeSocket(socketB, WebSocket);
+      socketA.onclose({ code: 1006 });
+      socketA.onerror();
+      const after = connection(run);
+      assert.equal(after.state, "stable");
+      assert.equal(after.reconnections, 1);
+      assert.equal(after.instance_id_prefix, before.instance_id_prefix);
+      assert.equal(after.worker_session_prefix, before.worker_session_prefix);
+      assert.notEqual(after.connection_id_prefix, before.connection_id_prefix);
+      assert.equal(webSockets.length, 2);
+      assert.equal(timers.pending.size, 0);
+    }
+
+    // The status message the popup polls carries the same safe connection block.
+    {
+      const { WebSocket, webSockets, mock } = await makeTransportHarness();
+      openFakeSocket(webSockets[0], WebSocket);
+      const response = await new Promise((resolve) => {
+        for (const listener of mock.messageListeners) listener({ type: "status" }, {}, resolve);
+      });
+      assert.equal(response.connected, true);
+      assert.equal(response.connection.state, "stable");
+      assert.equal(JSON.stringify(response).includes("token"), false);
+    }
+  }
 
   // 1. FRESH A creates exactly one inactive tab at the Temporary Chat URL.
   {
@@ -1225,7 +1590,334 @@ async function main() {
     assert.equal(gone.exists, false);
   }
 
-  // 27. Contrat « pas de vol de focus » sur la source elle-même.
+  // 27. UI diagnostics prefer an inflight ChatGPT tab and expose only the allow-listed snapshot.
+  {
+    const mock = makeChromeMock();
+    mock.localStore.wsToken = "STORED_WS_TOKEN_SECRET";
+    const { run } = loadBackground(mock.chrome);
+    const activeTab = await mock.chrome.tabs.create({
+      url: "https://chatgpt.com/c/active",
+      active: true,
+    });
+    const inflightTab = await mock.chrome.tabs.create({
+      url: "https://chatgpt.com/?temporary-chat=true",
+      active: false,
+    });
+    await run(`inflight.set("run-diagnostic", ${inflightTab.id})`);
+    const beforeActive = mock.tabsById.get(activeTab.id).active;
+    const beforeInflight = mock.tabsById.get(inflightTab.id).active;
+    let contentMessage = null;
+    mock.chrome.tabs.sendMessage = async (tabId, message) => {
+      contentMessage = { tabId, message };
+      return {
+        ok: true,
+        content_script_version: "39",
+        surface: {
+          origin_ok: true,
+          pathname: "/",
+          temporary_query: true,
+          temporary_status: "ok",
+          visibility_state: "hidden",
+          has_focus: false,
+        },
+        composer: {
+          status: "degraded",
+          strategy: "structural_fallback",
+          selector: "[contenteditable='true'][role='textbox']",
+          visible_candidates: 1,
+          known_selector_candidates: 0,
+          structural_candidates: 1,
+          tag: "DIV",
+          role: "textbox",
+          contenteditable: true,
+          data_composer_markdown: false,
+          form_found: true,
+        },
+        send: {
+          status: "degraded",
+          strategy: "structural_fallback",
+          selector: "button[type='submit']",
+          visible_candidates: 1,
+          type: "submit",
+          disabled: false,
+          aria_disabled: false,
+          same_form_as_composer: true,
+        },
+        prompt: "TOP_SECRET_PROMPT_123",
+        response: "PRIVATE_RESPONSE",
+        wsToken: "FORBIDDEN_TOKEN",
+        Authorization: "Bearer SECRET",
+      };
+    };
+
+    const diagnosticPromise = new Promise((resolve) => {
+      const handled = mock.messageListeners.some((listener) =>
+        listener({ type: "diagnose_ui" }, {}, resolve),
+      );
+      assert.equal(handled, true);
+    });
+    const diagnostics = await diagnosticPromise;
+    assert.equal(contentMessage.tabId, inflightTab.id);
+    assert.equal(contentMessage.message.type, "dom_health");
+    assert.equal(diagnostics.tab_id, inflightTab.id);
+    assert.equal(diagnostics.diagnostic_target.source, "inflight");
+    assert.equal(diagnostics.diagnostic_target.bridge_owned, true);
+    assert.equal(diagnostics.composer.status, "degraded");
+    assert.equal(diagnostics.send.status, "degraded");
+    assert.equal(diagnostics.websocket_state, "disconnected");
+    assert.equal(mock.tabsById.get(activeTab.id).active, beforeActive);
+    assert.equal(mock.tabsById.get(inflightTab.id).active, beforeInflight);
+    const json = JSON.stringify(diagnostics);
+    for (const forbidden of [
+      "STORED_WS_TOKEN_SECRET",
+      "TOP_SECRET_PROMPT_123",
+      "PRIVATE_RESPONSE",
+      "FORBIDDEN_TOKEN",
+      "Bearer SECRET",
+      "wsToken",
+      "Authorization",
+      "prompt",
+      "innerText",
+      "innerHTML",
+      "textContent",
+    ]) {
+      assert.equal(json.toLowerCase().includes(forbidden.toLowerCase()), false, forbidden);
+    }
+  }
+
+  // A live exact browser_target outranks every URL/active-tab candidate.
+  {
+    const mock = makeChromeMock();
+    const { run } = loadBackground(mock.chrome);
+    const active = await mock.chrome.tabs.create({ url: "https://chatgpt.com/c/user", active: true });
+    const targetTab = await mock.chrome.tabs.create({ url: "https://chatgpt.com/?temporary-chat=true", active: false });
+    const otherTemporary = await mock.chrome.tabs.create({ url: "https://chatgpt.com/?temporary-chat=true", active: false });
+    await run("browserTargetRegistryReady");
+    await run(`browserTargetRegistry.set("run-exact", { target_id: "run-exact", tab_id: ${targetTab.id}, bridge_owned_window: true, state: "recoverable" })`);
+    let diagnosedTab = null;
+    mock.chrome.tabs.sendMessage = async (tabId) => {
+      diagnosedTab = tabId;
+      return { ok: true, surface: {}, composer: { status: "ok" }, send: { status: "not_rendered_idle" } };
+    };
+    const result = await run("handleUiDiagnostic()");
+    assert.equal(diagnosedTab, targetTab.id);
+    assert.equal(result.diagnostic_target.source, "browser_target");
+    assert.equal(result.diagnostic_target.bridge_owned, true);
+    assert.notEqual(diagnosedTab, active.id);
+    assert.notEqual(diagnosedTab, otherTemporary.id);
+  }
+
+  // 27bis. Échelle de priorité du diagnostic, vérifiée de bout en bout : run
+  // inflight exact -> browser target exact -> conversation retenue -> onglet
+  // d'une fenêtre du bridge -> onglet ChatGPT quelconque, en dernier recours.
+  // « Plusieurs tabs ChatGPT ouverts, un run inflight utilise tab X » : le
+  // popup doit diagnostiquer X, jamais le tab actif quelconque.
+  {
+    const mock = makeChromeMock();
+    const { run } = loadBackground(mock.chrome);
+    // L'onglet visible de l'opérateur : actif, mais étranger au bridge.
+    const generic = await mock.chrome.tabs.create({
+      url: "https://chatgpt.com/c/user-visible",
+      active: true,
+    });
+    const inflightWindow = await mock.chrome.windows.create({
+      url: "https://chatgpt.com/?temporary-chat=true",
+      type: "normal",
+      focused: false,
+      state: "normal",
+    });
+    const inflightTab = inflightWindow.tabs[0];
+    const conversationWindow = await mock.chrome.windows.create({
+      url: "https://chatgpt.com/?temporary-chat=true",
+      type: "normal",
+      focused: false,
+      state: "normal",
+    });
+    const conversationTab = conversationWindow.tabs[0];
+    // Fenêtre du bridge dont la cible enregistrée a disparu : seul le repli
+    // `bridge_owned_tab` peut encore la retrouver, jamais l'onglet actif.
+    const recoveryWindow = await mock.chrome.windows.create({
+      url: "https://chatgpt.com/?temporary-chat=true",
+      type: "normal",
+      focused: false,
+      state: "normal",
+    });
+    const ownedTab = recoveryWindow.tabs[0];
+
+    await run("browserTargetRegistryReady");
+    await run("conversationRegistryReady");
+    await run(`inflight.set("run-inflight", ${inflightTab.id})`);
+    await run(
+      `browserTargetRegistry.set("run-inflight", { target_id: "run-inflight", tab_id: ${inflightTab.id}, bridge_owned_window: true, window_id: ${inflightWindow.id}, state: "live" })`,
+    );
+    await run(
+      `browserTargetRegistry.set("run-recovery", { target_id: "run-recovery", tab_id: 987654321, bridge_owned_window: true, window_id: ${recoveryWindow.id}, state: "recoverable" })`,
+    );
+    await run(
+      `conversationRegistry.set("conv-A", { id: "conv-A", tab_id: ${conversationTab.id}, bridge_owned_window: true, window_id: ${conversationWindow.id} })`,
+    );
+
+    // Le contenu réel d'un run : les trois secrets du contrat de diagnostic
+    // sont injectés à chaque niveau pour prouver qu'aucun ne traverse.
+    const runStatePayload = () => ({
+      active: true,
+      phase: "generation",
+      state: "active",
+      mode: "watched_turn",
+      confidence: "high",
+      signal: "streaming",
+      output_chars: 42,
+      stable_for_ms: 85000,
+      stable_threshold_ms: 300000,
+      stable_observations: 12,
+      signals: { actions: false, streaming: true, reasoning: false, stop: false },
+      serialization: {
+        root_found: true,
+        serializer: "chatgpt-dom-v3",
+        last_serialize: "ok",
+        ms: 3,
+      },
+      observation: {
+        last_wake: { mutation: 4, observe_tick: 2, timer: 1 },
+        ms_since_observation: 120,
+        ms_since_dom_mutation: 250,
+      },
+      prompt: "PROMPT_SECRET_123",
+      response_text: "RESPONSE_SECRET_456",
+      innerText: "RESPONSE_SECRET_456",
+      textContent: "RESPONSE_SECRET_456",
+      wsToken: "Bearer SECRET_789",
+      Authorization: "Bearer SECRET_789",
+      cookie: "PROMPT_SECRET_123",
+      localStorage: "RESPONSE_SECRET_456",
+    });
+    let sent = [];
+    mock.chrome.tabs.sendMessage = async (tabId, message) => {
+      sent.push({ tabId, type: message.type });
+      if (message.type === "run_state") return runStatePayload();
+      // Réponse de diagnostic empoisonnée : les secrets sont injectés à chaque
+      // niveau, y compris hors contrat, pour prouver qu'aucun ne traverse la
+      // liste blanche du service worker.
+      return {
+        ok: true,
+        content_script_version: "39",
+        prompt: "PROMPT_SECRET_123",
+        response: "RESPONSE_SECRET_456",
+        response_text: "RESPONSE_SECRET_456",
+        innerText: "RESPONSE_SECRET_456",
+        textContent: "RESPONSE_SECRET_456",
+        innerHTML: "RESPONSE_SECRET_456",
+        Authorization: "Bearer SECRET_789",
+        wsToken: "Bearer SECRET_789",
+        cookie: "PROMPT_SECRET_123",
+        surface: { title: "RESPONSE_SECRET_456" },
+        composer: { status: "ok", text: "PROMPT_SECRET_123" },
+        send: { status: "not_rendered_idle", label: "RESPONSE_SECRET_456" },
+        response_locator: { element: "RESPONSE_SECRET_456" },
+        run: runStatePayload(),
+      };
+    };
+    const diagnosticFor = async () => {
+      sent = [];
+      const result = await run("handleUiDiagnostic()");
+      return { result, calls: sent };
+    };
+    const runStateFor = async () => {
+      sent = [];
+      const result = await run("handleRunState()");
+      return { result, calls: sent };
+    };
+    const secrets = ["PROMPT_SECRET_123", "RESPONSE_SECRET_456", "SECRET_789"];
+    const assertClean = (label, value) => {
+      const json = JSON.stringify(value);
+      for (const secret of secrets) {
+        assert.equal(json.includes(secret), false, `${label}: ${secret}`);
+      }
+    };
+
+    // 1. Run inflight exact : il gagne sur l'onglet actif et sur tout le reste.
+    const first = await diagnosticFor();
+    assert.equal(first.result.diagnostic_target.source, "inflight");
+    assertClean("inflight", first.result);
+    assert.equal(first.result.diagnostic_target.bridge_owned, true);
+    assert.equal(first.result.tab_id, inflightTab.id);
+    assert.equal(first.calls.length, 1);
+    assert.equal(first.calls[0].tabId, inflightTab.id);
+    assert.equal(first.calls[0].type, "dom_health");
+    assert.notEqual(first.calls[0].tabId, generic.id);
+    assert.equal(mock.tabsById.get(generic.id).active, true);
+
+    // Le popup qui rafraîchit l'état vivant interroge exactement le même tab.
+    const liveRun = await runStateFor();
+    assert.equal(liveRun.calls[0].type, "run_state");
+    assert.equal(liveRun.calls[0].tabId, inflightTab.id);
+    assert.equal(liveRun.result.diagnostic_target.source, "inflight");
+    assert.equal(liveRun.result.run.state, "active");
+    assert.equal(liveRun.result.run.signal, "streaming");
+    assert.equal(liveRun.result.run.stable_threshold_ms, 300000);
+    assert.equal(liveRun.result.run.observation.last_wake.observe_tick, 2);
+    assert.equal(liveRun.result.run.serialization.serializer, "chatgpt-dom-v3");
+    assertClean("run_state", liveRun.result);
+    assert.equal(liveRun.result.run.active, true);
+    assert.equal(liveRun.result.run.state, "active");
+    for (const forbidden of ["prompt", "response_text", "innerText", "textContent", "wsToken", "Authorization"]) {
+      assert.equal(Object.hasOwn(liveRun.result.run, forbidden), false, forbidden);
+    }
+
+    // 2. Plus de run inflight : la browser target exacte prend le relais.
+    await run('inflight.delete("run-inflight")');
+    const second = await diagnosticFor();
+    assert.equal(second.result.diagnostic_target.source, "browser_target");
+    assertClean("browser_target", second.result);
+    assert.equal(second.result.tab_id, inflightTab.id);
+
+    // 3. La cible a disparu : la conversation retenue reste prioritaire sur
+    //    l'onglet actif de l'opérateur.
+    await mock.chrome.tabs.remove(inflightTab.id);
+    const third = await diagnosticFor();
+    assert.equal(third.result.diagnostic_target.source, "bridge_conversation");
+    assertClean("bridge_conversation", third.result);
+    assert.equal(third.result.tab_id, conversationTab.id);
+    assert.notEqual(third.result.tab_id, generic.id);
+
+    // 4. Plus aucune cible exacte : l'onglet de la fenêtre du bridge est
+    //    retrouvé par sa fenêtre, jamais par l'onglet actif.
+    await mock.chrome.tabs.remove(conversationTab.id);
+    const fourth = await diagnosticFor();
+    assert.equal(fourth.result.diagnostic_target.source, "bridge_owned_tab");
+    assertClean("bridge_owned_tab", fourth.result);
+    assert.equal(fourth.result.diagnostic_target.bridge_owned, true);
+    assert.equal(fourth.result.tab_id, ownedTab.id);
+    assert.notEqual(fourth.result.tab_id, generic.id);
+
+    // 5. Dernier recours seulement : l'onglet ChatGPT de l'opérateur, annoncé
+    //    comme non possédé pour que le popup n'affiche aucun faux état de run.
+    await mock.chrome.windows.remove(recoveryWindow.id);
+    const fifth = await diagnosticFor();
+    assert.equal(fifth.result.diagnostic_target.source, "generic_chatgpt_tab");
+    assertClean("generic_chatgpt_tab", fifth.result);
+    assert.equal(fifth.result.diagnostic_target.bridge_owned, false);
+    assert.equal(fifth.result.tab_id, generic.id);
+    assertClean("generic tab", fifth.result);
+  }
+
+  // Without a bridge binding or Temporary Chat, fallback is explicit.
+  {
+    const mock = makeChromeMock();
+    const { run } = loadBackground(mock.chrome);
+    const generic = await mock.chrome.tabs.create({ url: "https://chatgpt.com/c/generic", active: true });
+    mock.chrome.tabs.sendMessage = async (tabId) => {
+      assert.equal(tabId, generic.id);
+      return { ok: true, surface: { temporary_status: "invalid" }, composer: { status: "ok" }, send: { status: "not_rendered_idle" } };
+    };
+    const result = await run("handleUiDiagnostic()");
+    assert.equal(result.diagnostic_target.source, "generic_chatgpt_tab");
+    assert.equal(result.diagnostic_target.bridge_owned, false);
+    assert.equal(result.surface.temporary_status, "invalid");
+    assert.equal(result.ok, true);
+  }
+
+  // 28. Contrat « pas de vol de focus » sur la source elle-même.
   {
     assert.doesNotMatch(BACKGROUND_SOURCE, /focused:\s*true/);
     assert.doesNotMatch(BACKGROUND_SOURCE, /chrome\.windows\.update/);
